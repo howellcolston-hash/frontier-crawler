@@ -121,7 +121,7 @@ async def _judge(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             await engine.start()
             days = [start + dt.timedelta(days=n) for n in range((end - start).days + 1)]
             try:
-                await (engine.ocr_days(days) if args.command == "ocr" else engine.judge_days(days))
+                await (engine.ocr_days(days, args.max_minutes) if args.command == "ocr" else engine.judge_days(days))
             finally:
                 stats = await engine.finish()
     _report(ctx, stats)
@@ -218,6 +218,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         later = sub.add_parser(name, help=text)
         later.add_argument("--start")
         later.add_argument("--end")
+        later.add_argument("--max-minutes", type=float, default=None, help="ocr only: stop starting new scans after this many minutes")
         later.add_argument("--concurrency", type=int, default=4)
     capturer = sub.add_parser("capture", help="record the data requests a page makes")
     capturer.add_argument("url")

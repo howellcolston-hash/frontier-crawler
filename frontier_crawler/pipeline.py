@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 
 import pyarrow.parquet as pq
 
-from frontier_crawler.harvester.cascade import ScrapeResult, Target
+from frontier_crawler.harvester.cascade import MIN_WORDS as THIN_HTML_WORDS, ScrapeResult, Target
 from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
@@ -131,6 +131,7 @@ class Engine:
             "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
             "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
             "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
+            "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {},
         }
 
     async def start(self) -> None:
@@ -260,6 +261,12 @@ class Engine:
         )
         if outcome == "stored":
             row["body"] = body
+            self.stats["stored_bytes"] += len(body)
+            tier = scraped.tier_used
+            self.stats["stored_by_tier"][tier] = self.stats["stored_by_tier"].get(tier, 0) + 1
+            # Pages the browser rule left alone although they carry little text: evidence for tuning MIN_LINKS.
+            if tier == "DOM_TRAFILATURA" and scraped.word_count < THIN_HTML_WORDS:
+                self.stats["thin_html"] += 1
             row["text"] = text or None
         return row
 
@@ -352,8 +359,12 @@ class Engine:
 
         await asyncio.gather(*(one(row) for row in rows))
 
-    async def ocr_days(self, days: Sequence[dt.date]) -> None:
-        """Read the scanned PDFs of the given fetch days with Tesseract, one at a time, and judge what was read."""
+    async def ocr_days(self, days: Sequence[dt.date], max_minutes: Optional[float] = None) -> None:
+        """Read the scanned PDFs of the given fetch days with Tesseract, one at a time, and judge what was read.
+
+        Stops starting new scans after max_minutes; scans already read are skipped by the next run.
+        """
+        deadline = None if max_minutes is None else time.monotonic() + max_minutes * 60
         for day in days:
             done = {row["fetch_id"] for row in await self._read_day("ocr_text", day, ["fetch_id"])}
             columns = ["fetch_id", "sha256", "outcome", "tier_used", "word_count", "body"]
@@ -362,6 +373,9 @@ class Engine:
                     continue
                 if (row["word_count"] or 0) >= ocr.SCAN_MAX_WORDS:
                     continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.stats["stopped_by"] = "max_minutes"
+                    return
                 try:
                     text, pages_read, pages_total, langs = await asyncio.to_thread(ocr.read_scan, row["body"])
                 except Exception as exc:
