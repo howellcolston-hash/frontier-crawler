@@ -19,6 +19,7 @@ The fetcher is any object with `async fetch(url) -> ScrapeResult`.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import datetime as dt
 import hashlib
 import json
@@ -109,13 +110,15 @@ class Engine:
         self._fetcher = fetcher
         self._workdir = Path(workdir)
         self._jev = jev
-        # A safety ceiling against a runaway, not a tuned limit. Spend is counted from the tokens Jev reports.
-        self._ceiling_tokens = int(monthly_usd / PRICE_PER_MTOK_USD * 1_000_000)
         self._questions = questions or judging.active()
         self._max_words = max_excerpt_words
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._now = now
         started = now()
+        # The month's Jev budget is spread over its days: by day d, at most d/days of it may be spent,
+        # so judging never stops for the rest of a month. Spend is counted from the tokens Jev reports.
+        share = started.day / calendar.monthrange(started.year, started.month)[1]
+        self._ceiling_tokens = int(monthly_usd * share / PRICE_PER_MTOK_USD * 1_000_000)
         self.run_id = run_id or f"{started.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
         self._day = started.date()
         self._month = started.strftime("%Y-%m")

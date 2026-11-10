@@ -363,8 +363,9 @@ def test_ceiling_leaves_documents_pending_and_the_backlog_picks_them_up(tmp_path
 def test_the_ceiling_stops_calls_once_the_month_has_spent_it(tmp_path: Path) -> None:
     pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(4)}
     jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
-    # 1,000 tokens a month at the list price. Each call reports 700, so the second call passes the ceiling.
-    stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev, monthly_usd=0.000042, concurrency=1).run([_job(url) for url in pages]))
+    # 3,333 tokens a month at the list price, and NOW is day 9 of 30, so 1,000 may be spent by now.
+    # Each call reports 700, so the second call passes the ceiling.
+    stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev, monthly_usd=0.00014, concurrency=1).run([_job(url) for url in pages]))
     assert stats["stored"] == 4 and stats["judged"] == 2 and stats["pending"] == 2
 
 
