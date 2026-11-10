@@ -1,0 +1,60 @@
+# Runs the crawler against the store named by the repository's secrets. Started by hand only
+# (a schedule comes later); nothing here runs for pull requests. The log carries counts only.
+name: crawl
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        type: choice
+        options: [crawl, judge, ocr, derived]
+        default: crawl
+      max_minutes:
+        description: "crawl only: stop starting new rounds after this many minutes"
+        default: "85"
+permissions:
+  contents: read
+concurrency:
+  group: crawl   # one run at a time: runs share the crawl state in the store
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CRAWLER_HF_REPO: ${{ secrets.HF_REPO }}
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      COMMAND: ${{ inputs.command || 'crawl' }}
+      MAX_MINUTES: ${{ inputs.max_minutes || '85' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Install the browser
+        if: ${{ env.COMMAND == 'crawl' }}
+        run: |
+          # The headless shell alone; the full system packages only if it won't start.
+          python -m playwright install --only-shell chromium
+          python -c "from playwright.sync_api import sync_playwright as p; b = p().start().chromium.launch(); b.close()" \
+            || python -m playwright install-deps chromium
+      - name: Install Tesseract
+        if: ${{ env.COMMAND == 'ocr' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-osd tesseract-ocr-fra tesseract-ocr-spa tesseract-ocr-por tesseract-ocr-ind tesseract-ocr-ara tesseract-ocr-rus tesseract-ocr-chi-sim
+      - name: Run
+        run: |
+          # Without the store the tables would be written to the runner and lost.
+          [ -n "$HF_TOKEN" ] && [ -n "$CRAWLER_HF_REPO" ] || { echo "error: the HF_TOKEN and HF_REPO secrets are required" >&2; exit 2; }
+          if [ "$COMMAND" = "crawl" ]; then
+            case "$MAX_MINUTES" in ''|*[!0-9.]*) echo "error: max_minutes must be a number" >&2; exit 2;; esac
+            python -m frontier_crawler crawl --max-fetches 1000000 --max-minutes "$MAX_MINUTES"
+          else
+            python -m frontier_crawler "$COMMAND"
+          fi

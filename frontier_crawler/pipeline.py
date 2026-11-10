@@ -1,0 +1,375 @@
+"""Fetch and store, then judge.
+
+Fetching (Engine.run): fetch each target and write one row per attempt to the fetches table,
+with where it came from and the bytes served. Nothing here waits on a model: a document is
+stored before anything judges it.
+Judging (inside run when a Jev client is given, or later through Engine.judge_days): ask Jev
+the configured questions (judge/questions.py) about each new document and store every answer.
+A document Jev was not asked about (no key, the monthly ceiling reached, Jev unavailable)
+stays pending. Judging can be re-run; fetching is never repeated for it.
+
+Input contract:
+    engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
+    await engine.start()
+    await engine.run(targets, observer)      # any number of batches
+    stats = await engine.finish(extra_files) # final upload: tables, state and extra files in one commit
+The fetcher is any object with `async fetch(url) -> ScrapeResult`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import hashlib
+import json
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+
+import pyarrow.parquet as pq
+
+from frontier_crawler.harvester.cascade import ScrapeResult, Target
+from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
+from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
+from frontier_crawler.judge import questions as judging
+from frontier_crawler.judge.questions import Question, relevance
+from frontier_crawler import ocr
+from frontier_crawler.storage.shards import ANSWER_SCHEMA, CALL_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, OCR_SCHEMA, ShardWriter, day_folder
+from frontier_crawler.storage.state import UrlState, load_spend, save_spend
+from frontier_crawler.storage.store import Store
+
+logger = logging.getLogger("frontier_crawler.pipeline")
+
+# PROVISIONAL: phrases that mark a page as a block or error page when the page is short.
+_BLOCK_PHRASES = ("access denied", "cloudflare ray id", "attention required", "captcha", "enable javascript", "404 not found")
+_BLOCK_PHRASE_MAX_WORDS = 400
+# PROVISIONAL: a non-200 response with fewer words than this is an error page: the attempt is
+# recorded and its bytes are dropped. With more, it is kept, since some servers send real
+# content under an error status.
+_ERROR_PAGE_MAX_WORDS = 150
+# PROVISIONAL: a page with fewer words than this has nothing for Jev to read.
+_MIN_JUDGE_WORDS = 20
+# PROVISIONAL: stop calling Jev for the rest of a run after this many refusals in a row (a bad key, a changed API).
+_MAX_REJECTIONS = 3
+# Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
+_UPLOAD_EVERY_S = 600.0
+
+Observer = Callable[[Target, Dict[str, Any], Optional[JevResult]], None]
+
+
+class Fetcher(Protocol):
+    async def fetch(self, url: str) -> ScrapeResult: ...
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def block_marker(status: int, text: str) -> Optional[str]:
+    """Why a served page is not content, or None. A flagged page is never judged."""
+    if status != 200:
+        return f"http {status}"
+    if len(text.split()) <= _BLOCK_PHRASE_MAX_WORDS:
+        lowered = text.lower()
+        for phrase in _BLOCK_PHRASES:
+            if phrase in lowered:
+                return phrase
+    return None
+
+
+def judgeable(row: Dict[str, Any]) -> bool:
+    """New content that reads as a document. JSON from an API is structured data and is not sent to Jev."""
+    return (
+        row.get("outcome") == "stored"
+        and row.get("block_marker") is None
+        and row.get("tier_used") != "API"
+        and (row.get("word_count") or 0) >= _MIN_JUDGE_WORDS
+        and bool(row.get("text"))
+    )
+
+
+class Engine:
+    def __init__(
+        self,
+        store: Store,
+        fetcher: Optional[Fetcher] = None,
+        *,
+        workdir: Path,
+        jev: Optional[JevClient] = None,
+        monthly_usd: float = 0.0,
+        questions: Optional[Sequence[Question]] = None,
+        max_excerpt_words: int = DEFAULT_MAX_WORDS,
+        concurrency: int = 4,
+        now: Callable[[], dt.datetime] = utc_now,
+        run_id: Optional[str] = None,
+    ) -> None:
+        self._store = store
+        self._fetcher = fetcher
+        self._workdir = Path(workdir)
+        self._jev = jev
+        # A safety ceiling against a runaway, not a tuned limit. Spend is counted from the tokens Jev reports.
+        self._ceiling_tokens = int(monthly_usd / PRICE_PER_MTOK_USD * 1_000_000)
+        self._questions = questions or judging.active()
+        self._max_words = max_excerpt_words
+        self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._now = now
+        started = now()
+        self.run_id = run_id or f"{started.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+        self._day = started.date()
+        self._month = started.strftime("%Y-%m")
+        self._writers: Dict[Tuple[str, dt.date], ShardWriter] = {}
+        self._flush_lock = asyncio.Lock()
+        self._last_upload = time.monotonic()
+        self._seen: Dict[str, str] = {}
+        self._rejections = 0
+        self.stats: Dict[str, Any] = {
+            "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
+            "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
+            "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
+        }
+
+    async def start(self) -> None:
+        self._state = await asyncio.to_thread(UrlState.load, self._store, self._workdir)
+        self._spend = await asyncio.to_thread(load_spend, self._store, self._workdir)
+        month = self._spend.setdefault(self._month, {"input_tokens": 0, "calls": 0})
+        self.stats["jev_usd_month"] = round(month["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 4)
+
+    # ------------------------------------------------------------ writing
+
+    def _writer(self, table: str, day: dt.date) -> ShardWriter:
+        key = (table, day)
+        if key not in self._writers:
+            schema = {"fetches": FETCH_SCHEMA, "judgement_calls": CALL_SCHEMA, "judgements": ANSWER_SCHEMA, "ocr_text": OCR_SCHEMA}[table]
+            self._writers[key] = ShardWriter(table, schema, self.run_id, day, self._workdir)
+        return self._writers[key]
+
+    async def flush(self, force: bool = False, extra: Sequence[Tuple[Path, str]] = ()) -> None:
+        """Upload full buffers (all of them when forced or when the last upload is old), with any extra files, in one commit."""
+        async with self._flush_lock:
+            force = force or time.monotonic() - self._last_upload >= _UPLOAD_EVERY_S
+            files: List[Tuple[Path, str]] = []
+            for writer in list(self._writers.values()):
+                batch = writer.take(force)
+                if batch is not None:
+                    files.append(await asyncio.to_thread(writer.write, batch))
+            if not files and not extra:
+                return
+            await asyncio.to_thread(self._store.put_many, files + list(extra), f"engine {self.run_id}: {len(files) + len(extra)} file(s)")
+            self.stats["shards"] += [remote for _, remote in files]
+            self._last_upload = time.monotonic()
+
+    async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
+        """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
+        state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir)]
+        await self.flush(force=True, extra=state_files + list(extra))
+        logger.info("engine %s", {key: value for key, value in self.stats.items() if key != "shards"})
+        return self.stats
+
+    # ------------------------------------------------------------ fetching
+
+    async def run(self, targets: Sequence[Target], observer: Optional[Observer] = None) -> None:
+        """Fetch a batch. observer(target, row, answers) is called once per fetch row, after judging."""
+
+        async def one(target: Target) -> None:
+            async with self._semaphore:
+                row = await self._fetch_row(target)
+                # The row is buffered before judging starts, so a judging fault cannot drop it.
+                self._writer("fetches", self._day).add(row)
+                self.stats["total"] += 1
+                counted = {"stored": "stored", "unchanged": "unchanged", "duplicate": "duplicate",
+                           "error_page": "error_pages", "too_large": "too_large"}
+                self.stats[counted.get(row["outcome"], "errors")] += 1
+                if row["block_marker"] is not None and row["outcome"] == "stored":
+                    self.stats["blocked"] += 1
+                answers: Optional[JevResult] = None
+                if judgeable(row):
+                    answers = await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+                if observer is not None:
+                    try:
+                        observer(target, row, answers)
+                    except Exception:
+                        # The row is stored. A fault in what follows it must not stop the batch.
+                        logger.exception("observer failed for %s", target.url)
+                await self.flush()
+
+        await asyncio.gather(*(one(target) for target in targets))
+
+    async def _fetch_row(self, target: Target) -> Dict[str, Any]:
+        row: Dict[str, Any] = {
+            "fetch_id": str(uuid.uuid4()),
+            "run_id": self.run_id,
+            "seed_id": target.seed_id or None,
+            "line_id": target.line_id or None,
+            "hops": target.hops,
+            "parent_fetch_id": target.parent_fetch_id,
+            "entity": target.entity or None,
+            "url_requested": target.url,
+            "url_final": target.url,
+            "http_status": 0,
+            "outcome": "error",
+            "block_marker": None,
+            "engine_version": ENGINE_VERSION,
+        }
+        try:
+            scraped = await self._fetcher.fetch(target.url)
+        except Exception as exc:
+            logger.warning("fetch failed for %s: %s: %s", target.url, type(exc).__name__, exc)
+            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}
+        when = self._now()
+        body = scraped.raw_payload or b""
+        row.update(
+            {
+                "fetched_at": when,
+                "url_final": scraped.url or target.url,
+                "http_status": scraped.http_status,
+                "tier_used": scraped.tier_used,
+                "content_type": scraped.content_type or None,
+            }
+        )
+        if scraped.too_large_bytes is not None:
+            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}
+        if not body:
+            return {**row, "error": scraped.error_message or "nothing was served"}
+        text = scraped.markdown_content or ""
+        digest = hashlib.sha256(body).hexdigest()
+        key = row["url_final"]
+        if scraped.http_status != 200 and scraped.word_count < _ERROR_PAGE_MAX_WORDS:
+            outcome = "error_page"
+        elif self._state.last_hash(key) == digest:
+            outcome = "unchanged"
+        elif digest in self._seen and self._seen[digest] != key:
+            outcome = "duplicate"
+        else:
+            outcome = "stored"
+        self._seen.setdefault(digest, key)
+        self._state.record(key, digest, when, scraped.http_status)
+        row.update(
+            {
+                "outcome": outcome,
+                "sha256": digest,
+                "size_bytes": len(body),
+                "word_count": scraped.word_count,
+                "block_marker": block_marker(scraped.http_status, text),
+                "tier_note": scraped.error_message,
+            }
+        )
+        if outcome == "stored":
+            row["body"] = body
+            row["text"] = text or None
+        return row
+
+    # ------------------------------------------------------------ judging
+
+    async def _judge(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str) -> Optional[JevResult]:
+        """Ask Jev about one document and write the call and its answers. None when it stays pending."""
+        month = self._spend[self._month]
+        if self._jev is None or self.stats["jev_stopped"] or month["input_tokens"] >= self._ceiling_tokens:
+            self.stats["pending"] += 1
+            return None
+        excerpt, method, words = build_excerpt(text, self._max_words)
+        call: Dict[str, Any] = {
+            "call_id": str(uuid.uuid4()), "fetch_id": fetch_id, "sha256": sha256, "run_id": self.run_id,
+            "asked_at": self._now(), "reason": reason, "excerpt_method": method, "excerpt_words": words,
+            "relevance_version": judging.relevance_version(),
+        }
+        calls = self._writer("judgement_calls", day)
+        try:
+            result = await self._jev.ask(excerpt, self._questions)
+        except (JevUnavailable, JevRejected) as exc:
+            refused = isinstance(exc, JevRejected)
+            calls.add({**call, "status": "rejected" if refused else "unavailable", "error": str(exc)})
+            self.stats["pending"] += 1
+            self._rejections = self._rejections + 1 if refused else 0
+            if self._rejections >= _MAX_REJECTIONS:
+                self.stats["jev_stopped"] = f"Jev refused {self._rejections} calls in a row ({exc}); judging stopped for this run"
+                logger.error(self.stats["jev_stopped"])
+            return None
+        self._rejections = 0
+        month["input_tokens"] += result.input_tokens
+        month["calls"] += 1
+        self.stats["judged"] += 1
+        self.stats["jev_input_tokens"] += result.input_tokens
+        self.stats["jev_usd_month"] = round(month["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 4)
+        calls.add({**call, "status": "ok", "jev_model": result.model, "input_tokens": result.input_tokens,
+                   "relevance": relevance(result.nouls())})
+        answers = self._writer("judgements", day)
+        for answer in result.answers.values():
+            answers.add(
+                {
+                    "call_id": call["call_id"], "fetch_id": fetch_id, "sha256": sha256,
+                    "question_id": answer.question.id, "question_version": answer.question.version,
+                    "type": answer.question.type, "value_number": answer.value_number, "value_text": answer.value_text,
+                    "probabilities": json.dumps(answer.probabilities, sort_keys=True) if answer.probabilities else None,
+                    "confidence": answer.confidence,
+                }
+            )
+        return result
+
+    async def judge_days(self, days: Sequence[dt.date]) -> None:
+        """Judge the documents of the given fetch days that have no successful Jev call yet.
+
+        shortcut: each day's fetch files are downloaded whole to read their text; read only the
+        needed columns over the network once a day's files run to gigabytes.
+        """
+        columns = ["fetch_id", "sha256", "outcome", "block_marker", "tier_used", "word_count", "text"]
+        for day in days:
+            judged = set()
+            for remote in await asyncio.to_thread(self._store.list, day_folder("judgement_calls", day)):
+                local = self._workdir / "in" / remote
+                if await asyncio.to_thread(self._store.get, remote, local):
+                    judged |= {call["fetch_id"] for call in pq.read_table(local, columns=["fetch_id", "status"]).to_pylist() if call["status"] == "ok"}
+            for remote in await asyncio.to_thread(self._store.list, day_folder("fetches", day)):
+                local = self._workdir / "in" / remote
+                if not await asyncio.to_thread(self._store.get, remote, local):
+                    continue
+                todo = [row for row in pq.read_table(local, columns=columns).to_pylist() if judgeable(row) and row["fetch_id"] not in judged]
+                local.unlink(missing_ok=True)
+                await self._judge_rows(todo, day, "backlog")
+            # Scanned PDFs have their text in the ocr_text table.
+            for row in await self._read_day("ocr_text", day, ["fetch_id", "sha256", "text", "word_count"]):
+                if row["word_count"] >= _MIN_JUDGE_WORDS and row["fetch_id"] not in judged:
+                    await self._judge_rows([row], day, "ocr")
+
+    async def _read_day(self, table: str, day: dt.date, columns: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for remote in await asyncio.to_thread(self._store.list, day_folder(table, day)):
+            local = self._workdir / "in" / remote
+            if await asyncio.to_thread(self._store.get, remote, local):
+                rows += pq.read_table(local, columns=columns).to_pylist()
+                local.unlink(missing_ok=True)
+        return rows
+
+    async def _judge_rows(self, rows: List[Dict[str, Any]], day: dt.date, reason: str) -> None:
+        async def one(row: Dict[str, Any]) -> None:
+            async with self._semaphore:
+                await self._judge(row["fetch_id"], row["sha256"], row["text"], day, reason)
+                await self.flush()
+
+        await asyncio.gather(*(one(row) for row in rows))
+
+    async def ocr_days(self, days: Sequence[dt.date]) -> None:
+        """Read the scanned PDFs of the given fetch days with Tesseract, one at a time, and judge what was read."""
+        for day in days:
+            done = {row["fetch_id"] for row in await self._read_day("ocr_text", day, ["fetch_id"])}
+            columns = ["fetch_id", "sha256", "outcome", "tier_used", "word_count", "body"]
+            for row in await self._read_day("fetches", day, columns):
+                if row["outcome"] != "stored" or row["tier_used"] != "PDF" or row["fetch_id"] in done:
+                    continue
+                if (row["word_count"] or 0) >= ocr.SCAN_MAX_WORDS:
+                    continue
+                try:
+                    text, pages_read, pages_total, langs = await asyncio.to_thread(ocr.read_scan, row["body"])
+                except Exception as exc:
+                    logger.warning("scan not read for %s: %s: %s", row["fetch_id"], type(exc).__name__, exc)
+                    continue
+                words = len(text.split())
+                self._writer("ocr_text", day).add(
+                    {"fetch_id": row["fetch_id"], "sha256": row["sha256"], "run_id": self.run_id, "read_at": self._now(),
+                     "langs": langs, "pages_read": pages_read, "pages_total": pages_total, "text": text, "word_count": words}
+                )
+                self.stats["scans_read"] += 1
+                if words >= _MIN_JUDGE_WORDS:
+                    await self._judge(row["fetch_id"], row["sha256"], text, day, "ocr")
+                await self.flush()
