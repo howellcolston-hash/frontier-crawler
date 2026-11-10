@@ -101,6 +101,7 @@ def test_fetch_row_carries_provenance_and_bytes(tmp_path: Path) -> None:
     assert row["url_final"] == "https://a.test/x?session=1"
     assert row["fetched_at"] == NOW and row["http_status"] == 200 and row["tier_used"] == "DOM_TRAFILATURA"
     assert row["body"].startswith(b"<html>") and row["size_bytes"] == len(row["body"])
+    assert stats["stored_bytes"] == len(row["body"]) and stats["stored_by_tier"] == {"DOM_TRAFILATURA": 1}
     assert len(row["sha256"]) == 64 and row["text"] == DOC and row["outcome"] == "stored"
     assert row["entity"] == "Example port" and row["run_id"] == "r1"
     assert (row["seed_id"], row["line_id"], row["hops"], row["parent_fetch_id"]) == ("example-port", "example-port:a.test", 2, "parent-fetch")
@@ -447,17 +448,19 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(ocr, "read_scan", fake_read)
 
-    def later(run: str, method: str) -> Dict[str, Any]:
+    def later(run: str, method: str, *limit: float) -> Dict[str, Any]:
         jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
         engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / f"work-{run}", jev=jev, monthly_usd=8, now=lambda: NOW, run_id=run)
 
         async def go() -> Dict[str, Any]:
             await engine.start()
-            await getattr(engine, method)([DAY])
+            await getattr(engine, method)([DAY], *limit)
             return await engine.finish()
 
         return asyncio.run(go())
 
+    out_of_time = later("o0", "ocr_days", 0)
+    assert read == [] and out_of_time["scans_read"] == 0 and out_of_time["stopped_by"] == "max_minutes"
     first = later("o1", "ocr_days")
     (row,) = _rows(tmp_path / "store", "ocr_text")
     assert read == [b"%PDF scan"] and first["scans_read"] == 1 and first["judged"] == 1    # the PDF that had text is left alone

@@ -1,9 +1,11 @@
-# Runs the crawler against the store named by the repository's secrets: four times a day for
-# 85 minutes, or by hand. Nothing here runs for pull requests. The log carries counts only.
+# Runs the crawler against the store named by the repository's secrets: a crawl four times a day
+# for 85 minutes, scanned PDFs read once a day, or either by hand. Nothing here runs for pull
+# requests. The log carries counts only.
 name: crawl
 on:
   schedule:
     - cron: "17 0,6,12,18 * * *"
+    - cron: "47 3 * * *"   # ocr, between two crawls
   workflow_dispatch:
     inputs:
       command:
@@ -27,7 +29,7 @@ jobs:
       CRAWLER_HF_REPO: ${{ secrets.HF_REPO }}
       JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
-      COMMAND: ${{ inputs.command || 'crawl' }}
+      COMMAND: ${{ inputs.command || (github.event.schedule == '47 3 * * *' && 'ocr') || 'crawl' }}
       MAX_MINUTES: ${{ inputs.max_minutes || '85' }}
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +59,9 @@ jobs:
           if [ "$COMMAND" = "crawl" ]; then
             case "$MAX_MINUTES" in ''|*[!0-9.]*) echo "error: max_minutes must be a number" >&2; exit 2;; esac
             python -m frontier_crawler crawl --max-fetches 1000000 --max-minutes "$MAX_MINUTES"
+          elif [ "$COMMAND" = "ocr" ]; then
+            # Yesterday and today: each day's pages are downloaded whole to find its scans.
+            python -m frontier_crawler ocr --start "$(date -u -d yesterday +%F)" --max-minutes 85
           else
             python -m frontier_crawler "$COMMAND"
           fi
