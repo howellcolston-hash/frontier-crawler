@@ -1,0 +1,1 @@
+"""Deterministic fetch cascade."""

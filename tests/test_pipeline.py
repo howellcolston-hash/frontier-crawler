@@ -1,0 +1,466 @@
+"""Checks for the engine: fetch rows, state, stores, the Jev client, the ceiling and the backlog. No live network."""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import httpx
+import pyarrow.parquet as pq
+import pytest
+
+from frontier_crawler.harvester.cascade import ScrapeResult, Target
+from frontier_crawler.harvester.throttle import HostThrottle
+from frontier_crawler.judge.excerpt import build_excerpt
+from frontier_crawler.judge.jev import JevClient, JevRejected, JevUnavailable
+from frontier_crawler.judge import questions as judging
+from frontier_crawler.judge.questions import relevance
+
+QUESTIONS_V1 = judging.active()  # the built-in example set
+from frontier_crawler.pipeline import Engine, block_marker
+from frontier_crawler.storage.shards import day_folder
+from frontier_crawler.storage.store import HubStore, LocalStore
+
+NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
+DAY = NOW.date()
+DOC = "The port authority published the berth schedule and the tariff for bulk cargo. " * 10
+
+
+def _job(url: str) -> Target:
+    return Target(url, "Example port", "example-port", "example-port:a.test", 2, "parent-fetch")
+
+
+class FakeCascade:
+    """Serves canned results by URL. A missing URL raises, like a bug inside one fetch."""
+
+    def __init__(self, pages: Dict[str, ScrapeResult]) -> None:
+        self.pages = pages
+
+    async def fetch(self, url: str) -> ScrapeResult:
+        return self.pages[url]
+
+
+def _page(url: str, text: str = DOC, status: int = 200, tier: str = "DOM_TRAFILATURA", body: Optional[bytes] = None) -> ScrapeResult:
+    raw = body if body is not None else f"<html>{text}</html>".encode()
+    return ScrapeResult(url, status, raw, text or None, len(text.split()), tier, None, "text/html")  # type: ignore[arg-type]
+
+
+def _rows(store_root: Path, table: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for path in sorted((store_root / day_folder(table, DAY)).glob("*.parquet")):
+        out += pq.read_table(path).to_pylist()
+    return out
+
+
+def _jev_body(questions: Any = QUESTIONS_V1, noul: float = 0.9) -> Dict[str, Any]:
+    answers: Dict[str, Any] = {}
+    for q in questions:
+        if q.type == "noul":
+            answers[q.key] = {"type": "noul", "noul": 0.05 if q.id == "junk_page" else noul}
+        else:
+            answers[q.key] = {"type": "choice", "choice": "record", "confidence": 0.8,
+                              "probabilities": {"record": 0.8, "other": 0.2}}
+    return {"model": "jev-1.13.0", "answers": answers, "usage": {"input_tokens": 700, "output_tokens": 90}}
+
+
+def _jev(handler: Any, **kwargs: Any) -> JevClient:
+    async def no_sleep(_: float) -> None:
+        return None
+
+    return JevClient("test-key", httpx.AsyncClient(transport=httpx.MockTransport(handler)), sleep=no_sleep, **kwargs)
+
+
+class _Run:
+    """Start, one batch, finish."""
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+
+    async def run(self, targets: Any) -> Dict[str, Any]:
+        await self.engine.start()
+        await self.engine.run(targets)
+        return await self.engine.finish()
+
+
+def _engine(tmp_path: Path, cascade: Any, run: str, store: Any = None, **kwargs: Any) -> _Run:
+    store = store or LocalStore(tmp_path / "store")
+    return _Run(Engine(store, cascade, workdir=tmp_path / f"work-{run}", now=lambda: NOW, run_id=run, **kwargs))
+
+
+# ---------------------------------------------------------------- fetch and store
+
+def test_fetch_row_carries_provenance_and_bytes(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x?session=1")})
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1").run([_job("https://a.test/x")]))
+    (row,) = _rows(tmp_path / "store", "fetches")
+    assert stats["stored"] == 1 and stats["pending"] == 1 and stats["judged"] == 0
+    assert row["url_requested"] == "https://a.test/x"
+    assert row["url_final"] == "https://a.test/x?session=1"
+    assert row["fetched_at"] == NOW and row["http_status"] == 200 and row["tier_used"] == "DOM_TRAFILATURA"
+    assert row["body"].startswith(b"<html>") and row["size_bytes"] == len(row["body"])
+    assert len(row["sha256"]) == 64 and row["text"] == DOC and row["outcome"] == "stored"
+    assert row["entity"] == "Example port" and row["run_id"] == "r1"
+    assert (row["seed_id"], row["line_id"], row["hops"], row["parent_fetch_id"]) == ("example-port", "example-port:a.test", 2, "parent-fetch")
+
+
+def test_second_run_marks_unchanged_and_keeps_no_second_copy(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
+    asyncio.run(_engine(tmp_path, cascade, "r1").run([_job("https://a.test/x")]))
+    stats = asyncio.run(_engine(tmp_path, cascade, "r2").run([_job("https://a.test/x")]))
+    second = [row for row in _rows(tmp_path / "store", "fetches") if row["run_id"] == "r2"]
+    assert stats["unchanged"] == 1 and stats["stored"] == 0
+    assert second[0]["outcome"] == "unchanged" and second[0]["body"] is None and second[0]["sha256"]
+
+
+def test_same_bytes_at_two_urls_is_a_duplicate(tmp_path: Path) -> None:
+    cascade = FakeCascade({
+        "https://a.test/x": _page("https://a.test/x", body=b"same"),
+        "https://a.test/y": _page("https://a.test/y", body=b"same"),
+    })
+    engine = _engine(tmp_path, cascade, "r1", concurrency=1)
+    stats = asyncio.run(engine.run([_job("https://a.test/x"), _job("https://a.test/y")]))
+    assert stats["stored"] == 1 and stats["duplicate"] == 1
+
+
+def test_one_failed_job_does_not_stop_the_rest(tmp_path: Path) -> None:
+    cascade = FakeCascade({
+        "https://a.test/ok": _page("https://a.test/ok"),
+        "https://a.test/empty": ScrapeResult("https://a.test/empty", 0, b"", None, 0, "HEADLESS_PLAYWRIGHT", "timed out"),
+    })
+    jobs = [_job("https://a.test/missing"), _job("https://a.test/empty"), _job("https://a.test/ok")]
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1").run(jobs))
+    rows = {row["url_requested"]: row for row in _rows(tmp_path / "store", "fetches")}
+    assert stats["errors"] == 2 and stats["stored"] == 1 and len(rows) == 3
+    assert "KeyError" in rows["https://a.test/missing"]["error"]
+    assert rows["https://a.test/empty"]["error"] == "timed out"
+
+
+def test_blocked_page_is_stored_but_not_judged(tmp_path: Path) -> None:
+    calls: List[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json=_jev_body())
+
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x", text=DOC * 2, status=403)})
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=_jev(handler), monthly_usd=8).run([_job("https://a.test/x")]))
+    (row,) = _rows(tmp_path / "store", "fetches")
+    assert row["outcome"] == "stored" and row["body"] and row["block_marker"] == "http 403"
+    assert stats["blocked"] == 1 and stats["judged"] == 0 and not calls
+
+
+def test_error_page_is_recorded_without_its_bytes(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/gone": _page("https://a.test/gone", text="Page not found", status=404)})
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1").run([_job("https://a.test/gone")]))
+    (row,) = _rows(tmp_path / "store", "fetches")
+    assert stats["error_pages"] == 1 and stats["stored"] == 0 and stats["errors"] == 0
+    assert row["outcome"] == "error_page" and row["http_status"] == 404 and row["block_marker"] == "http 404"
+    assert row["body"] is None and row["text"] is None and row["sha256"] and row["size_bytes"] > 0
+
+
+def test_block_marker_only_reads_short_pages() -> None:
+    assert block_marker(200, "Access denied") == "access denied"
+    assert block_marker(200, "the minister said access denied to the port " + "word " * 500) is None
+    assert block_marker(404, "anything") == "http 404"
+
+
+def test_throttle_spaces_requests_per_host() -> None:
+    clock = [0.0]
+    slept: List[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock[0] += seconds
+
+    async def run() -> None:
+        throttle = HostThrottle(2.0, clock=lambda: clock[0], sleep=sleep)
+        await throttle.wait("https://a.test/1")
+        await throttle.wait("https://b.test/1")
+        await throttle.wait("https://a.test/2")
+
+    asyncio.run(run())
+    assert slept == [2.0]
+
+
+# ---------------------------------------------------------------- stores
+
+def test_local_store_lists_and_rejects_escapes(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path / "s")
+    source = tmp_path / "f.txt"
+    source.write_text("x", encoding="utf-8")
+    store.put_many([(source, "a/b/f.txt")], "m")
+    assert store.list("a") == ["a/b/f.txt"] and store.list("nothing") == []
+    assert not store.get("a/b/missing.txt", tmp_path / "out.txt")
+    with pytest.raises(ValueError):
+        store.put_many([(source, "../f.txt")], "m")
+
+
+def test_hub_store_sends_one_commit_for_many_files(tmp_path: Path) -> None:
+    class FakeApi:
+        def __init__(self) -> None:
+            self.commits: List[Dict[str, Any]] = []
+
+        def create_commit(self, **kwargs: Any) -> None:
+            self.commits.append(kwargs)
+
+    api = FakeApi()
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("1", encoding="utf-8")
+    b.write_text("2", encoding="utf-8")
+    HubStore("owner/repo", "token", api=api).put_many([(a, "x/a"), (b, "x/b")], "engine r1")
+    (commit,) = api.commits
+    assert commit["repo_id"] == "owner/repo" and commit["repo_type"] == "dataset"
+    assert [op.path_in_repo for op in commit["operations"]] == ["x/a", "x/b"]
+
+
+# ---------------------------------------------------------------- Jev
+
+def test_jev_request_and_reply_follow_the_documented_shape() -> None:
+    sent: Dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["auth"] = request.headers["authorization"]
+        sent["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_jev_body())
+
+    result = asyncio.run(_jev(handler).ask("some text", QUESTIONS_V1))
+    assert sent["auth"] == "Bearer test-key"
+    assert set(sent["body"]) == {"model", "state", "questions"} and sent["body"]["state"] == "some text"
+    assert sent["body"]["questions"]["has_specifics_v1"]["type"] == "noul"
+    assert set(sent["body"]["questions"]["has_specifics_v1"]["criteria"]) == {"true", "false"}
+    assert result.model == "jev-1.13.0" and result.input_tokens == 700
+    assert result.answers["has_specifics"].value_number == 0.9
+    assert result.answers["doc_type"].value_text == "record"
+    assert result.answers["doc_type"].confidence == 0.8
+
+
+def test_jev_retries_rate_limits_then_answers() -> None:
+    statuses = [429, 529, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses.pop(0)
+        return httpx.Response(status, json=_jev_body() if status == 200 else {"error": "busy"})
+
+    result = asyncio.run(_jev(handler).ask("text", QUESTIONS_V1))
+    assert result.input_tokens == 700 and not statuses
+
+
+def test_jev_outage_and_refusal_are_different_errors() -> None:
+    attempts: List[int] = []
+
+    def down(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(503)
+
+    with pytest.raises(JevUnavailable):
+        asyncio.run(_jev(down, retries=2).ask("text", QUESTIONS_V1))
+    assert len(attempts) == 3
+
+    refused: List[int] = []
+
+    def unauthorised(request: httpx.Request) -> httpx.Response:
+        refused.append(1)
+        return httpx.Response(401, json={"error": "bad key test-key"})
+
+    with pytest.raises(JevRejected) as caught:
+        asyncio.run(_jev(unauthorised).ask("text", QUESTIONS_V1))
+    assert len(refused) == 1 and "test-key" not in str(caught.value)
+
+
+def test_jev_rejects_a_boolean_noul() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _jev_body()
+        body["answers"]["junk_page_v1"] = {"type": "noul", "noul": True}
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(JevRejected):
+        asyncio.run(_jev(handler).ask("text", QUESTIONS_V1))
+
+
+def test_relevance_and_threshold() -> None:
+    assert relevance({"has_specifics": 0.5, "junk_page": 0.1}) == pytest.approx(0.5 * 0.9)
+    assert relevance({"has_specifics": 0.8}) is None
+    assert judging.keep_threshold() == pytest.approx(1 / 11)
+
+
+def test_questions_come_from_configuration() -> None:
+    config = {"questions": [{"id": q, "version": 2, "type": "noul", "instructions": q} for q in ("a", "b", "c", "d")],
+              "relevance": {"version": "r2", "all": ["a"], "any": ["b", "c"], "none": ["d"], "miss_to_junk_cost": 4}}
+    try:
+        judging.configure(config)
+        assert [q.key for q in judging.active()] == ["a_v2", "b_v2", "c_v2", "d_v2"] and judging.relevance_version() == "r2"
+        assert relevance({"a": 0.8, "b": 0.2, "c": 0.5, "d": 0.1}) == pytest.approx(0.8 * 0.5 * 0.9)
+        assert judging.keep_threshold() == pytest.approx(1 / 5)
+        with pytest.raises(ValueError):
+            judging.configure({**config, "relevance": {**config["relevance"], "all": ["missing"]}})
+    finally:
+        judging.configure(judging.EXAMPLE)
+
+
+def test_excerpt_is_full_when_short_and_sampled_across_a_long_text() -> None:
+    assert build_excerpt("a b c", 10) == ("a b c", "full", 3)
+    body = " ".join(f"w{i}" for i in range(10_000))
+    text = "# Title\n" + body[: len(body) // 2] + "\n## Annex B tariffs\n" + body[len(body) // 2 :]
+    excerpt, method, words = build_excerpt(text, 1000)
+    assert method == "sampled" and words <= 1010
+    assert excerpt.startswith("# Title w0 w1 ") and excerpt.endswith("w9999")
+    assert "## Annex B tariffs" in excerpt and excerpt.count("# Title") == 1
+    middle = [int(word[1:]) for word in excerpt.split() if word[1:].isdigit() and 1000 < int(word[1:]) < 9000]
+    assert min(middle) < 3500 and max(middle) > 6500
+
+
+# ---------------------------------------------------------------- judging in the pipeline
+
+def test_new_document_is_judged_and_every_answer_is_stored(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run([_job("https://a.test/x")]))
+    (fetch,) = _rows(tmp_path / "store", "fetches")
+    (call,) = _rows(tmp_path / "store", "judgement_calls")
+    answers = _rows(tmp_path / "store", "judgements")
+    assert stats["judged"] == 1 and stats["pending"] == 0 and stats["jev_input_tokens"] == 700
+    assert call["fetch_id"] == fetch["fetch_id"] and call["status"] == "ok" and call["jev_model"] == "jev-1.13.0"
+    assert call["relevance"] == pytest.approx(0.9 * 0.95) and call["excerpt_method"] == "full"
+    assert {a["question_id"] for a in answers} == {q.id for q in QUESTIONS_V1}
+    assert all(a["question_version"] == 1 and a["call_id"] == call["call_id"] for a in answers)
+    spend = json.loads((tmp_path / "store" / "state" / "jev_spend.json").read_text(encoding="utf-8"))
+    assert spend == {"2026-11": {"calls": 1, "input_tokens": 700}}
+
+
+def test_api_json_is_not_sent_to_jev(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/api": _page("https://a.test/api", tier="API", body=b'{"rate": 12.0}')})
+    jev = _jev(lambda request: pytest.fail("Jev was called for structured data"))
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run([_job("https://a.test/api")]))
+    assert stats["stored"] == 1 and stats["judged"] == 0 and stats["pending"] == 0
+
+
+def test_ceiling_leaves_documents_pending_and_the_backlog_picks_them_up(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(3)}
+    jobs = [_job(url) for url in pages]
+    answering = lambda request: httpx.Response(200, json=_jev_body())  # noqa: E731
+
+    # No money: nothing is asked, everything is stored.
+    stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=_jev(answering), monthly_usd=0).run(jobs))
+    assert stats["stored"] == 3 and stats["judged"] == 0 and stats["pending"] == 3
+
+    def backlog(run: str) -> Dict[str, Any]:
+        engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / f"work-{run}", jev=_jev(answering), monthly_usd=8, now=lambda: NOW, run_id=run)
+
+        async def go() -> Dict[str, Any]:
+            await engine.start()
+            await engine.judge_days([DAY])
+            return await engine.finish()
+
+        return asyncio.run(go())
+
+    assert backlog("j1")["judged"] == 3 and len(_rows(tmp_path / "store", "judgement_calls")) == 3
+    assert backlog("j2")["judged"] == 0          # nothing is asked twice
+
+
+def test_the_ceiling_stops_calls_once_the_month_has_spent_it(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(4)}
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    # 1,000 tokens a month at the list price. Each call reports 700, so the second call passes the ceiling.
+    stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev, monthly_usd=0.000042, concurrency=1).run([_job(url) for url in pages]))
+    assert stats["stored"] == 4 and stats["judged"] == 2 and stats["pending"] == 2
+
+
+def test_jev_outage_keeps_the_document_and_marks_it_for_later(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
+    jev = _jev(lambda request: httpx.Response(503), retries=0)
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run([_job("https://a.test/x")]))
+    (call,) = _rows(tmp_path / "store", "judgement_calls")
+    assert stats["stored"] == 1 and stats["pending"] == 1 and call["status"] == "unavailable"
+    assert _rows(tmp_path / "store", "judgements") == []
+
+
+def test_repeated_refusals_stop_judging_for_the_run(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(6)}
+    hits: List[int] = []
+
+    def unauthorised(request: httpx.Request) -> httpx.Response:
+        hits.append(1)
+        return httpx.Response(401)
+
+    engine = _engine(tmp_path, FakeCascade(pages), "r1", jev=_jev(unauthorised), monthly_usd=8, concurrency=1)
+    stats = asyncio.run(engine.run([_job(url) for url in pages]))
+    assert stats["stored"] == 6 and len(hits) == 3 and "refused 3 calls" in stats["jev_stopped"]
+
+
+def test_a_run_uploads_its_tables_and_state_in_one_commit(tmp_path: Path) -> None:
+    class CountingStore(LocalStore):
+        commits: List[List[str]] = []
+
+        def put_many(self, files: Any, message: str = "") -> None:
+            self.commits.append(sorted(remote for _, remote in files))
+            super().put_many(files, message)
+
+    store = CountingStore(tmp_path / "store")
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", store=store, jev=jev, monthly_usd=8).run([_job("https://a.test/x")]))
+    (commit,) = store.commits
+    assert [path.split("/")[0] for path in commit] == ["fetches", "judgement_calls", "judgements", "state", "state"]
+    assert len(stats["shards"]) == 3
+
+
+def test_a_file_over_the_size_cap_is_a_row_without_bytes(tmp_path: Path) -> None:
+    big = ScrapeResult("https://a.test/dump.csv", 200, b"", None, 0, "DOM_TRAFILATURA", "too large", "text/csv", too_large_bytes=900_000_000)
+    stats = asyncio.run(_engine(tmp_path, FakeCascade({"https://a.test/dump.csv": big}), "r1").run([_job("https://a.test/dump.csv")]))
+    (row,) = _rows(tmp_path / "store", "fetches")
+    assert stats["too_large"] == 1 and stats["errors"] == 0
+    assert row["outcome"] == "too_large" and row["size_bytes"] == 900_000_000 and row["content_type"] == "text/csv" and row["body"] is None
+
+
+def test_a_fault_after_a_row_is_stored_does_not_stop_the_batch(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(3)}
+    engine = Engine(LocalStore(tmp_path / "store"), FakeCascade(pages), workdir=tmp_path / "work", now=lambda: NOW, run_id="r1")
+
+    def faulty(target: Target, row: Dict[str, Any], answers: Any) -> None:
+        raise ValueError("Invalid IPv6 URL")
+
+    async def go() -> Dict[str, Any]:
+        await engine.start()
+        await engine.run([_job(url) for url in pages], faulty)
+        return await engine.finish()
+
+    assert asyncio.run(go())["stored"] == 3 and len(_rows(tmp_path / "store", "fetches")) == 3
+
+
+def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch: Any) -> None:
+    from frontier_crawler import ocr
+
+    scan = ScrapeResult("https://a.test/scan.pdf", 200, b"%PDF scan", None, 0, "PDF", None, "application/pdf")
+    texty = ScrapeResult("https://a.test/text.pdf", 200, b"%PDF text", DOC, len(DOC.split()), "PDF", None, "application/pdf")
+    pages = {"https://a.test/scan.pdf": scan, "https://a.test/text.pdf": texty}
+    asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1").run([_job(url) for url in pages]))
+
+    read: List[bytes] = []
+
+    def fake_read(body: bytes) -> Any:
+        read.append(body)
+        return DOC, 4, 9, "ara+eng"
+
+    monkeypatch.setattr(ocr, "read_scan", fake_read)
+
+    def later(run: str, method: str) -> Dict[str, Any]:
+        jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+        engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / f"work-{run}", jev=jev, monthly_usd=8, now=lambda: NOW, run_id=run)
+
+        async def go() -> Dict[str, Any]:
+            await engine.start()
+            await getattr(engine, method)([DAY])
+            return await engine.finish()
+
+        return asyncio.run(go())
+
+    first = later("o1", "ocr_days")
+    (row,) = _rows(tmp_path / "store", "ocr_text")
+    assert read == [b"%PDF scan"] and first["scans_read"] == 1 and first["judged"] == 1    # the PDF that had text is left alone
+    assert (row["langs"], row["pages_read"], row["pages_total"], row["text"]) == ("ara+eng", 4, 9, DOC)
+    assert later("o2", "ocr_days")["scans_read"] == 0                                      # not read twice
+    assert later("j1", "judge_days")["judged"] == 1                                        # only the text PDF was still unjudged
+    assert later("j2", "judge_days")["judged"] == 0

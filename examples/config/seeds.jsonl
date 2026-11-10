@@ -1,0 +1,3 @@
+# One seed per line: id, entity (what the pages are about), urls, and optionally weight, until, note.
+{"id": "python-peps", "entity": "Python Enhancement Proposals", "urls": ["https://peps.python.org/"]}
+{"id": "ietf-rfcs", "entity": "IETF RFC index", "urls": ["https://www.rfc-editor.org/rfc-index.html"], "weight": 0.5}
