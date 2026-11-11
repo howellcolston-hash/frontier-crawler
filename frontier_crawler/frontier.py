@@ -244,11 +244,11 @@ def extract_links(body: bytes, base_url: str, limit: int = MAX_LINKS_PER_PAGE) -
     return list(found.items()), unparseable
 
 
-def _looks_like_html(row: Dict[str, Any]) -> bool:
-    content_type = (row.get("content_type") or "").lower()
+def looks_like_html(content_type: Optional[str], body: bytes) -> bool:
+    content_type = (content_type or "").lower()
     if "html" in content_type:
         return True
-    return not content_type and (row.get("body") or b"").lstrip()[:1] == b"<"
+    return not content_type and body.lstrip()[:1] == b"<"
 
 
 def link_base(answers: Optional[JevResult]) -> float:
@@ -547,14 +547,14 @@ class Frontier:
         return added
 
     def add_links(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> int:
-        """Queue the links of a stored HTML page. Returns how many were new."""
-        if row.get("outcome") != "stored" or row.get("block_marker") or not _looks_like_html(row):
+        """Queue the links of a stored HTML page, row["links"] as the engine extracted them. Returns how many were new."""
+        if row.get("outcome") != "stored" or row.get("block_marker") or not row.get("links"):
             return 0
         base = link_base(answers)
         own_line = entry["line_id"]
         added = 0
         awaited = self._judging.get(row.get("fetch_id") or "")
-        links, unparseable = extract_links(row["body"], row.get("url_final") or entry["url"])
+        links, unparseable = row["links"]
         for href in unparseable:
             # Kept as written, with the page it came from, so it can be looked at and repaired later.
             if href not in self._entries:
@@ -1111,7 +1111,7 @@ async def crawl(
                 counts["retries"] += 1
                 counts["retry_recovered"] += row["outcome"] in ("stored", "unchanged", "duplicate")
             if fetch_id is not None:
-                task = asyncio.create_task(judge({**row, "body": None}, kind(entry["url"])))  # the body is not needed to judge; free it with its shard
+                task = asyncio.create_task(judge({**row, "links": None}, kind(entry["url"])))  # the links are not needed to judge
                 judging.add(task)
                 task.add_done_callback(judging.discard)
         except Exception:

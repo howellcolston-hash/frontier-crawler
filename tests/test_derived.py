@@ -125,7 +125,9 @@ def test_a_client_stores_each_page_until_one_is_empty(tmp_path: Path) -> None:
     first = rows[0]
     assert first["url_requested"] == "https://port.test/api/vessels?status=expected&page=1" and first["tier_used"] == "API"
     assert (first["seed_id"], first["line_id"], first["entity"]) == ("example-port", "derived:port-vessels", "Example port vessel calls")
-    assert json.loads(first["body"])["data"]["items"][0]["vessel"] == "MV A"
+    (body,) = [row["body"] for path in (tmp_path / "store" / "bodies").rglob("*.parquet") for row in pq.read_table(path).to_pylist()
+               if row["sha256"] == first["sha256"]]
+    assert first["body"] is None and json.loads(body)["data"]["items"][0]["vessel"] == "MV A"
 
 
 def test_a_second_run_keeps_no_second_copy_of_unchanged_pages(tmp_path: Path) -> None:

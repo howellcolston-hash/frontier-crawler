@@ -22,7 +22,8 @@ from frontier_crawler.judge.questions import relevance
 
 QUESTIONS_V1 = judging.active()  # the built-in example set
 from frontier_crawler.pipeline import FORECAST_KEY, Engine, _spread, block_marker
-from frontier_crawler.storage.shards import day_folder
+from frontier_crawler.storage.shards import FETCH_SCHEMA, ShardWriter, bodies_of, day_folder
+from frontier_crawler.storage.state import BODY_HASHES_PATH
 from frontier_crawler.storage.store import HubStore, LocalStore
 
 NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
@@ -93,16 +94,20 @@ def _engine(tmp_path: Path, cascade: Any, run: str, store: Any = None, **kwargs:
 
 # ---------------------------------------------------------------- fetch and store
 
-def test_fetch_row_carries_provenance_and_bytes(tmp_path: Path) -> None:
+def test_fetch_row_carries_provenance_and_its_bytes_go_to_bodies(tmp_path: Path) -> None:
     cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x?session=1")})
     stats = asyncio.run(_engine(tmp_path, cascade, "r1").run([_job("https://a.test/x")]))
     (row,) = _rows(tmp_path / "store", "fetches")
+    (body,) = _rows(tmp_path / "store", "bodies")
     assert stats["stored"] == 1 and stats["pending"] == 1 and stats["judged"] == 0
     assert row["url_requested"] == "https://a.test/x"
     assert row["url_final"] == "https://a.test/x?session=1"
     assert row["fetched_at"] == NOW and row["http_status"] == 200 and row["tier_used"] == "DOM_TRAFILATURA"
-    assert row["body"].startswith(b"<html>") and row["size_bytes"] == len(row["body"])
-    assert stats["stored_bytes"] == len(row["body"]) and stats["stored_by_tier"] == {"DOM_TRAFILATURA": 1}
+    assert row["body"] is None and body["body"].startswith(b"<html>") and row["size_bytes"] == body["size_bytes"] == len(body["body"])
+    assert (body["sha256"], body["first_fetch_id"], body["stored_at"]) == (row["sha256"], row["fetch_id"], NOW)
+    assert (body["content_type"], body["tier_used"]) == ("text/html", "DOM_TRAFILATURA")
+    assert stats["stored_bytes"] == stats["bodies_written_bytes"] == len(body["body"]) and stats["stored_by_tier"] == {"DOM_TRAFILATURA": 1}
+    assert stats["bodies_written"] == 1 and stats["bodies_already_stored"] == 0
     assert len(row["sha256"]) == 64 and row["text"] == DOC and row["outcome"] == "stored"
     assert row["entity"] == "Example port" and row["run_id"] == "r1"
     assert (row["seed_id"], row["line_id"], row["hops"], row["parent_fetch_id"]) == ("example-port", "example-port:a.test", 2, "parent-fetch")
@@ -125,6 +130,107 @@ def test_same_bytes_at_two_urls_is_a_duplicate(tmp_path: Path) -> None:
     engine = _engine(tmp_path, cascade, "r1", concurrency=1)
     stats = asyncio.run(engine.run([_job("https://a.test/x"), _job("https://a.test/y")]))
     assert stats["stored"] == 1 and stats["duplicate"] == 1
+
+
+def _bodies(store_root: Path) -> List[Dict[str, Any]]:
+    return [row for path in sorted((store_root / "bodies").rglob("*.parquet")) for row in pq.read_table(path).to_pylist()]
+
+
+def _day_engine(tmp_path: Path, pages: Dict[str, ScrapeResult], run: str, day: int = 0) -> Engine:
+    when = NOW + dt.timedelta(days=day)
+    return Engine(LocalStore(tmp_path / "store"), FakeCascade(pages), workdir=tmp_path / f"work-{run}", now=lambda: when, run_id=run, concurrency=1)
+
+
+def _stored_body_counts_add_up(stats: Dict[str, Any]) -> None:
+    assert stats["bodies_written"] + stats["bodies_already_stored"] == stats["stored"]
+    assert stats["bodies_written_bytes"] + stats["bodies_already_stored_bytes"] == stats["stored_bytes"]
+
+
+def test_the_same_bytes_are_stored_once_in_a_run_and_across_runs(tmp_path: Path) -> None:
+    same = {url: _page(url, body=b"<html>same bytes</html>") for url in ("https://a.test/x", "https://a.test/y")}
+    first = asyncio.run(_Run(_day_engine(tmp_path, same, "r1")).run([_job(url) for url in same]))
+    assert (first["stored"], first["duplicate"], first["bodies_written"]) == (1, 1, 1)
+    later = {"https://b.test/z": _page("https://b.test/z", body=b"<html>same bytes</html>"), "https://b.test/new": _page("https://b.test/new", body=b"<html>new</html>")}
+    second = asyncio.run(_Run(_day_engine(tmp_path, later, "r2", day=1)).run([_job(url) for url in later]))
+    # A new URL serving bytes an earlier run stored: stored for its URL, with its text, and no second body.
+    assert (second["stored"], second["bodies_written"], second["bodies_already_stored"]) == (2, 1, 1)
+    assert second["bodies_already_stored_bytes"] == len(b"<html>same bytes</html>")
+    rows = [row for day in (DAY, DAY + dt.timedelta(days=1)) for path in (tmp_path / "store" / day_folder("fetches", day)).glob("*.parquet")
+            for row in pq.read_table(path).to_pylist()]
+    assert len(rows) == 4 and all(row["body"] is None for row in rows)
+    assert sorted(row["sha256"] for row in _bodies(tmp_path / "store")) == sorted({row["sha256"] for row in rows})
+    for stats in (first, second):
+        _stored_body_counts_add_up(stats)
+
+
+def test_a_run_killed_before_its_final_commit_leaves_the_hash_set_alone_and_the_next_run_stores_again(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"<html>doc {i}</html>".encode()) for i in range(2)}
+    killed = _day_engine(tmp_path, pages, "killed")
+
+    async def die() -> None:
+        await killed.start()
+        await killed.fetch(_job("https://a.test/0"))
+        await killed.flush(force=True)            # the periodic upload: the first body goes up
+        await killed.fetch(_job("https://a.test/1"))   # buffered, then the run dies
+
+    asyncio.run(die())
+    assert len(_bodies(tmp_path / "store")) == 1 and not (tmp_path / "store" / BODY_HASHES_PATH).exists()
+    stats = asyncio.run(_Run(_day_engine(tmp_path, pages, "next")).run([_job(url) for url in pages]))
+    # Both are stored again: the uploaded one twice (harmless), the lost one now.
+    assert stats["bodies_written"] == 2 and len(_bodies(tmp_path / "store")) == 3
+    again = asyncio.run(_Run(_day_engine(tmp_path, {"https://c.test/": _page("https://c.test/", body=b"<html>doc 1</html>")}, "again")).run([_job("https://c.test/")]))
+    assert (again["bodies_written"], again["bodies_already_stored"]) == (0, 1)
+
+
+def test_fetch_rows_never_go_up_without_their_bodies(tmp_path: Path) -> None:
+    pages = {"https://a.test/x": _page("https://a.test/x")}
+    engine = _day_engine(tmp_path, pages, "r1")
+
+    async def go() -> None:
+        await engine.start()
+        await engine.fetch(_job("https://a.test/x"))
+        engine._writer("fetches", DAY)._max_bytes = 1   # the fetch rows' shard is full; the bodies' is not
+        await engine.flush()
+
+    asyncio.run(go())
+    assert len(_rows(tmp_path / "store", "fetches")) == len(_bodies(tmp_path / "store")) == 1
+
+
+def _old_format_shard(tmp_path: Path, rows: List[Dict[str, Any]], day: dt.date) -> None:
+    """Fetch rows as engine 0.2.0 wrote them, with the bytes inline."""
+    writer = ShardWriter("fetches", FETCH_SCHEMA, "old", day, tmp_path / "work-old")
+    for row in rows:
+        writer.add(row)
+    LocalStore(tmp_path / "store").put_many([writer.write(writer.take(force=True))])
+
+
+def test_the_body_reader_finds_inline_bodies_and_bodies_stored_on_earlier_days(tmp_path: Path) -> None:
+    earlier, today = DAY - dt.timedelta(days=3), DAY
+    _old_format_shard(tmp_path, [{"fetch_id": "old-1", "outcome": "stored", "sha256": "ab" * 32, "body": b"inline bytes"}], earlier)
+    asyncio.run(_Run(_day_engine(tmp_path, {"https://a.test/x": _page("https://a.test/x", body=b"<html>kept</html>")}, "r1", day=-2)).run([_job("https://a.test/x")]))
+    pages = {"https://b.test/x": _page("https://b.test/x", body=b"<html>kept</html>"), "https://b.test/y": _page("https://b.test/y", body=b"<html>today</html>")}
+    asyncio.run(_Run(_day_engine(tmp_path, pages, "r2")).run([_job(url) for url in pages]))
+    old = pq.read_table(tmp_path / "store" / day_folder("fetches", earlier) / "old-000.parquet").to_pylist()
+    new = _rows(tmp_path / "store", "fetches")
+    found = {row["fetch_id"]: body for row, body in bodies_of(LocalStore(tmp_path / "store"), tmp_path / "read", old + new, today)}
+    by_url = {row["url_final"]: found[row["fetch_id"]] for row in new}
+    assert found["old-1"] == b"inline bytes"
+    assert by_url == {"https://b.test/x": b"<html>kept</html>", "https://b.test/y": b"<html>today</html>"}
+    assert list(bodies_of(LocalStore(tmp_path / "store"), tmp_path / "read", [{"sha256": "cd" * 32}])) == [({"sha256": "cd" * 32}, None)]
+
+
+def test_the_body_command_writes_one_stored_body(tmp_path: Path, monkeypatch: Any) -> None:
+    from frontier_crawler import __main__ as cli
+
+    asyncio.run(_engine(tmp_path, FakeCascade({"https://a.test/x": _page("https://a.test/x", body=b"<html>wanted</html>")}), "r1").run([_job("https://a.test/x")]))
+    (row,) = _rows(tmp_path / "store", "fetches")
+    monkeypatch.setattr(cli, "open_store", lambda: LocalStore(tmp_path / "store"))
+    cli.main(["body", row["sha256"].upper(), "--out", str(tmp_path / "out.html")])
+    assert (tmp_path / "out.html").read_bytes() == b"<html>wanted</html>"
+    with pytest.raises(SystemExit, match="no stored body"):
+        cli.main(["body", "0" * 64])
+    with pytest.raises(SystemExit, match="64 hex"):
+        cli.main(["body", "../../etc"])
 
 
 def test_one_failed_job_does_not_stop_the_rest(tmp_path: Path) -> None:
@@ -150,7 +256,7 @@ def test_blocked_page_is_stored_but_not_judged(tmp_path: Path) -> None:
     cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x", text=DOC * 2, status=403)})
     stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=_jev(handler), monthly_usd=8).run([_job("https://a.test/x")]))
     (row,) = _rows(tmp_path / "store", "fetches")
-    assert row["outcome"] == "stored" and row["body"] and row["block_marker"] == "http 403"
+    assert row["outcome"] == "stored" and row["block_marker"] == "http 403" and stats["bodies_written"] == 1
     assert stats["blocked"] == 1 and stats["judged"] == 0 and not calls
 
 
@@ -161,6 +267,7 @@ def test_error_page_is_recorded_without_its_bytes(tmp_path: Path) -> None:
     assert stats["error_pages"] == 1 and stats["stored"] == 0 and stats["errors"] == 0
     assert row["outcome"] == "error_page" and row["http_status"] == 404 and row["block_marker"] == "http 404"
     assert row["body"] is None and row["text"] is None and row["sha256"] and row["size_bytes"] > 0
+    assert stats["bodies_written"] == 0 and _rows(tmp_path / "store", "bodies") == []
 
 
 def test_block_marker_only_reads_short_pages() -> None:
@@ -406,8 +513,8 @@ def test_a_run_uploads_its_tables_and_state_in_one_commit(tmp_path: Path) -> Non
     jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
     stats = asyncio.run(_engine(tmp_path, cascade, "r1", store=store, jev=jev, monthly_usd=8).run([_job("https://a.test/x")]))
     (commit,) = store.commits
-    assert [path.split("/")[0] for path in commit] == ["fetches", "judgement_calls", "judgements", "state", "state"]
-    assert len(stats["shards"]) == 3
+    assert [path.split("/")[0] for path in commit] == ["bodies", "fetches", "judgement_calls", "judgements", "state", "state", "state"]
+    assert "state/body_hashes.parquet" in commit and len(stats["shards"]) == 4
 
 
 def test_a_file_over_the_size_cap_is_a_row_without_bytes(tmp_path: Path) -> None:
@@ -469,6 +576,26 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
     assert later("o2", "ocr_days")["scans_read"] == 0                                      # not read twice
     assert later("j1", "judge_days")["judged"] == 1                                        # only the text PDF was still unjudged
     assert later("j2", "judge_days")["judged"] == 0
+
+
+def test_scans_are_read_from_inline_bodies_and_from_bodies_stored_on_an_earlier_day(tmp_path: Path, monkeypatch: Any) -> None:
+    from frontier_crawler import ocr
+
+    _old_format_shard(tmp_path, [{"fetch_id": "old-scan", "outcome": "stored", "tier_used": "PDF", "word_count": 0,
+                                  "sha256": "ab" * 32, "body": b"%PDF old"}], DAY)
+    scan = lambda url: ScrapeResult(url, 200, b"%PDF moved", None, 0, "PDF", None, "application/pdf")  # noqa: E731
+    asyncio.run(_Run(_day_engine(tmp_path, {"https://a.test/s.pdf": scan("https://a.test/s.pdf")}, "r0", day=-1)).run([_job("https://a.test/s.pdf")]))
+    asyncio.run(_Run(_day_engine(tmp_path, {"https://b.test/s.pdf": scan("https://b.test/s.pdf")}, "r1")).run([_job("https://b.test/s.pdf")]))
+    read: List[bytes] = []
+    monkeypatch.setattr(ocr, "read_scan", lambda body: read.append(body) or (DOC, 1, 1, "eng"))
+    engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / "work-ocr", now=lambda: NOW, run_id="o1")
+
+    async def go() -> Dict[str, Any]:
+        await engine.start()
+        await engine.ocr_days([DAY])
+        return await engine.finish()
+
+    assert asyncio.run(go())["scans_read"] == 2 and sorted(read) == [b"%PDF moved", b"%PDF old"]
 
 
 # ---------------------------------------------------------------- measurements

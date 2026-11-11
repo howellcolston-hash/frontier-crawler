@@ -5,6 +5,7 @@
     python -m frontier_crawler ocr [--start D --end D]      read stored scanned PDFs with Tesseract, then judge them (default: last 7 days)
     python -m frontier_crawler capture URL [--click TEXT]   record the data requests a page makes, to write a derived client from
     python -m frontier_crawler derived [--check ID]         run the derived API clients, or test one without storing
+    python -m frontier_crawler body SHA256 [--out FILE]     write one stored body from the bodies table (to stdout without --out)
 
 Environment:
     HF_TOKEN, CRAWLER_HF_REPO    Hugging Face dataset repo that holds everything: tables, crawl state, configuration, run records.
@@ -26,6 +27,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -41,6 +43,7 @@ from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
 from frontier_crawler.pipeline import Engine
+from frontier_crawler.storage.shards import bodies_of
 from frontier_crawler.storage.store import HubStore, LocalStore, Store
 
 # PROVISIONAL. A stop against a runaway, set well above expected use, not a tuned budget.
@@ -174,6 +177,22 @@ async def _derived(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         ctx["status"] = "partial"  # each one needs deriving again
 
 
+def _body(args: argparse.Namespace) -> None:
+    """A local tool, like capture: the bytes are page content, so in a public log use --out."""
+    sha256 = args.sha256.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SystemExit("SHA256 must be 64 hex digits")
+    with tempfile.TemporaryDirectory(prefix="crawler-body-") as workdir:
+        ((_, body),) = bodies_of(open_store(), Path(workdir), [{"sha256": sha256}])
+    if body is None:
+        # Bodies stored before the bodies table are inline in their fetch rows.
+        raise SystemExit("no stored body has that hash in the bodies table")
+    if args.out:
+        Path(args.out).write_bytes(body)
+    else:
+        sys.stdout.buffer.write(body)
+
+
 def _run(args: argparse.Namespace, params: Dict[str, Any], job: Any) -> None:
     """Run one command, then write what happened to the store as runs/<run id>.json and print counts only."""
     started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
@@ -228,12 +247,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     clients.add_argument("--check", metavar="ID", help="call one client for real and describe the reply, storing nothing")
     clients.add_argument("--clients", metavar="DIR", help="read client specs from this folder instead of the store")
     clients.add_argument("--min-interval", type=float, default=1.0)
+    reader = sub.add_parser("body", help="write one stored body, by content hash")
+    reader.add_argument("sha256")
+    reader.add_argument("--out", metavar="FILE", help="write it here instead of to stdout")
     args = parser.parse_args(argv)
     # Log lines name the pages they are about, so they are off unless asked for.
     logging.basicConfig(level=logging.INFO if os.environ.get("CRAWLER_VERBOSE") else logging.CRITICAL, format="%(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.command == "capture":
         asyncio.run(_capture(args))
+    elif args.command == "body":
+        _body(args)
     elif args.command == "derived" and args.check:
         asyncio.run(_derived(args, {"store": open_store()}))
     elif args.command == "crawl":

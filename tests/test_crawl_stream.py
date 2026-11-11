@@ -232,7 +232,7 @@ def test_a_failed_periodic_upload_loses_no_rows(tmp_path: Path, monkeypatch: pyt
     stats = _crawl(tmp_path, Site(30, delay=0.003), store=store, concurrency=2)
     rows = _rows(tmp_path, "fetches")
     assert store.calls > 3 and stats["total"] == 31 == len(rows) == len({row["fetch_id"] for row in rows})
-    assert len(stats["shards"]) == len(list((tmp_path / "store" / "fetches").rglob("*.parquet")))
+    assert len(stats["shards"]) == sum(len(list((tmp_path / "store" / table).rglob("*.parquet"))) for table in ("fetches", "bodies", "links"))
 
 
 def test_a_timed_out_page_is_retried_once_with_the_long_limit(tmp_path: Path) -> None:
@@ -325,3 +325,34 @@ def test_a_crawl_reports_cooled_hosts_and_its_queue_by_seed_in_the_record_only(t
     cli._run(type("Args", (), {"command": "crawl"})(), {}, job)
     printed = capsys.readouterr().out
     assert "queued_by_seed" not in printed and "top_priority_by_seed" not in printed and "stored_by_seed" not in printed
+
+
+def test_every_link_of_a_stored_page_is_written_once_in_page_order_including_those_the_queue_declined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(frontier_module, "MAX_HOPS", 0)   # a link within a.test is past the hop limit
+    pages = {
+        ROOT: '<a href="https://h0.test/">new site</a> <a href="/deep">too deep</a> <a href="https://h0.test/#top">again</a>',
+        "https://h0.test/": f'<a href="{ROOT}">known</a> <a href="https://h1.test/x">  next   site </a> <a href="https://h1.test/y"></a>',
+    }
+
+    class Linked:
+        async def fetch(self, url: str, timeout: Any = None, connect: Any = None) -> ScrapeResult:
+            body = f"<html><body>{pages.get(url, '')}<p>{url} {TEXT}</p></body></html>".encode()
+            return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html")
+
+    calls: List[str] = []
+    extract = frontier_module.extract_links
+    monkeypatch.setattr(frontier_module, "extract_links", lambda body, base: calls.append(base) or extract(body, base))
+    stats = _crawl(tmp_path, Linked())
+    fetches = {row["fetch_id"]: row["url_final"] for row in _rows(tmp_path, "fetches")}
+    links: Dict[str, List[tuple]] = {}
+    for row in sorted(_rows(tmp_path, "links"), key=lambda row: row["position"]):
+        links.setdefault(fetches[row["fetch_id"]], []).append((row["position"], row["url"], row["anchor"]))
+    assert links == {
+        ROOT: [(0, "https://h0.test/", "new site"), (1, "https://a.test/deep", "too deep")],
+        "https://h0.test/": [(0, ROOT, "known"), (1, "https://h1.test/x", "next site"), (2, "https://h1.test/y", None)],
+    }
+    frontier = _frontier(tmp_path)
+    assert frontier.entry("https://a.test/deep") is None and stats["skipped"]["hop_limit"] == 1   # declined, still written
+    assert stats["links_written"] == 5 and stats["shard_bytes"]["links"] > 0 and stats["shard_bytes"]["bodies"] > 0
+    # Extracted once per stored page, by the engine; the queue used that result.
+    assert sorted(calls) == sorted(fetches.values()) and len(calls) == stats["stored"] == 4

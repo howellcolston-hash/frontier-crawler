@@ -54,7 +54,8 @@ DEAD = {"outcome": "error_page", "http_status": 404, "block_marker": "http 404"}
 
 
 def _page_row(url: str, links: str) -> Dict[str, Any]:
-    return {**_content(url), "fetch_id": "f-" + url, "content_type": "text/html", "body": f"<html><body>{links}</body></html>".encode()}
+    """A stored HTML page as Engine.fetch returns it, with its links extracted."""
+    return {**_content(url), "fetch_id": "f-" + url, "content_type": "text/html", "links": extract_links(f"<html><body>{links}</body></html>".encode(), url)}
 
 
 def test_a_round_spreads_across_hosts_and_lines() -> None:

@@ -1,24 +1,28 @@
-"""Small state the engine carries between runs: what each URL last served, and Jev spend per month.
+"""Small state the engine carries between runs: what each URL last served, which bodies are stored, and Jev spend per month.
 
-Both are single files in the store, read at the start of a run and rewritten at the end.
+Each is a single file in the store, read at the start of a run and rewritten at the end.
 A run that dies before the end leaves the previous state in place: the next run then stores
 those documents again, which costs space but loses nothing.
 """
 
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 import json
+from array import array
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from frontier_crawler.storage.store import Store
 
 URL_STATE_PATH = "state/url_state.parquet"
 JEV_SPEND_PATH = "state/jev_spend.json"
+BODY_HASHES_PATH = "state/body_hashes.parquet"
 
 _URL_SCHEMA = pa.schema(
     [
@@ -60,6 +64,57 @@ class UrlState:
         columns = {name: [row.get(name) for row in rows] for name in _URL_SCHEMA.names}
         pq.write_table(pa.Table.from_pydict(columns, schema=_URL_SCHEMA), local, compression="zstd")
         return local, URL_STATE_PATH
+
+
+class BodyHashes:
+    """The content hashes the bodies table holds, so a body is stored once across runs.
+
+    Each is kept as its first 8 bytes, an unsigned 64-bit integer: 8 MB per million in memory (a sorted array, searched by
+    bisection) and about 6 MB per million on disk (one sorted, delta-encoded Parquet column). Two different bodies share
+    those 8 bytes with probability n / 2^64 for n stored, about 5e-12 per new body at 100 million; a false match means
+    one body is not stored. The file grows only in the commit that uploads the shards holding those bodies, so it never
+    names a body the store lacks; a run that dies leaves its uploaded bodies unnamed, and they are stored again later.
+    shortcut: the array is read and written in this machine's byte order, little-endian on every runner used.
+    """
+
+    def __init__(self, known: Optional[array] = None) -> None:
+        self._known = known if known is not None else array("Q")
+        self._new: set = set()
+
+    @staticmethod
+    def _key(sha256: str) -> int:
+        return int(sha256[:16], 16)
+
+    @classmethod
+    def load(cls, store: Store, workdir: Path) -> "BodyHashes":
+        local = Path(workdir) / "state-in" / "body_hashes.parquet"
+        known = array("Q")
+        if store.get(BODY_HASHES_PATH, local):
+            column = pq.read_table(local).column("h").combine_chunks()
+            if len(column):
+                known.frombytes(column.buffers()[1].slice(column.offset * 8, len(column) * 8))
+        return cls(known)
+
+    def __contains__(self, sha256: str) -> bool:
+        key = self._key(sha256)
+        at = bisect.bisect_left(self._known, key)
+        return key in self._new or (at < len(self._known) and self._known[at] == key)
+
+    def add(self, hashes: Iterable[str]) -> None:
+        self._new.update(map(self._key, hashes))
+
+    def save(self, workdir: Path, pending: Iterable[str] = ()) -> List[Tuple[Path, str]]:
+        """The file to upload, naming also the pending hashes (bodies in the same commit); none when nothing is new."""
+        new = self._new | set(map(self._key, pending))
+        if not new:
+            return []
+        known = pa.Array.from_buffers(pa.uint64(), len(self._known), [None, pa.py_buffer(self._known)])
+        keys = pa.concat_arrays([known, pa.array(sorted(new), pa.uint64())])
+        local = Path(workdir) / "state-out" / "body_hashes.parquet"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"h": keys.take(pc.sort_indices(keys))}), local, compression="zstd",
+                       use_dictionary=False, column_encoding={"h": "DELTA_BINARY_PACKED"})
+        return [(local, BODY_HASHES_PATH)]
 
 
 def load_spend(store: Store, workdir: Path) -> Dict[str, Any]:
