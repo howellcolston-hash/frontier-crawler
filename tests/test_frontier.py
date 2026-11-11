@@ -125,10 +125,33 @@ def test_a_new_site_with_content_becomes_its_own_line() -> None:
     assert frontier.spawned == 1 and bx["line_id"] == "s:b.test" and bx["hops"] == 0
     assert frontier.line("s:b.test")["parent_line"] == "s" and frontier.line("s:b.test")["seed_id"] == "s"
     assert frontier.entry("https://b.test/y")["line_id"] == "s:b.test"   # the other queued link to that site moved with it
-    assert frontier.line("s")["fetches"] == 2                  # the find is credited to the line that made it
+    # A line's record is its own pages: the find is the new line's first fetch, not the finder's.
+    assert frontier.line("s")["fetches"] == frontier.line("s")["content"] == 1
+    assert frontier.line("s:b.test")["fetches"] == frontier.line("s:b.test")["content"] == 1
 
     frontier.mark(frontier.entry("https://c.test/"), DEAD, None, NOW)
     assert frontier.spawned == 1 and frontier.line("s:c.test") is None   # a dead site starts nothing
+    assert frontier.line("s")["fetches"] == 1 and frontier.line("s")["yield"] == 1.0   # and counts toward no line
+    assert frontier._hosts["c.test"]["fetches"] == 1 and frontier._hosts["c.test"]["error_pages"] == 1   # only its host
+
+
+def test_a_crossing_out_or_awaited_is_not_held_against_the_line_that_found_it() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    root = frontier.take(seeds, NOW.date())
+    row = _page_row(root["url"], '<a href="https://b.test/">b</a> <a href="https://c.test/">c</a>')
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    b, c = frontier.take(seeds, NOW.date()), frontier.take(seeds, NOW.date())
+    assert {b["host"], c["host"]} == {"b.test", "c.test"}
+    assert frontier._flight_line.get("s", 0) == 0 and frontier._flight_host["b.test"] == 1   # held against its host only
+    frontier.expect_judgement("f-c", "s")
+    frontier.mark(c, {**DEAD, "fetch_id": "f-c"}, None, NOW)
+    frontier.judged("f-c", _Answers(0.0))  # type: ignore[arg-type]   # a dead find: nothing for its judgement to move
+    assert frontier.line("s")["yield"] == 1.0 and frontier.line("s")["fetches"] == 1 and frontier._judging == {}
+    frontier.mark(b, _content(), None, NOW)
+    assert set(frontier._flight_host.values()) == {0} and set(frontier._flight_line.values()) == {0}
 
 
 def test_a_line_that_stops_paying_sinks_but_is_never_skipped_for_it() -> None:
@@ -264,7 +287,7 @@ def test_lines_and_their_state_survive_a_save_and_load(tmp_path: Path) -> None:
     frontier.mark(frontier.entry("https://b.test/x"), _content("https://b.test/x"), None, NOW)
     store.put_many(frontier.save(tmp_path / "w"), "state")
     again = Frontier.load(store, tmp_path / "w2")
-    assert again.line("s:b.test")["root_url"] == "https://b.test/x" and again.line("s")["fetches"] == 2
+    assert again.line("s:b.test")["root_url"] == "https://b.test/x" and again.line("s")["fetches"] == again.line("s:b.test")["fetches"] == 1
     assert again.count("fetched") == 2
     assert again._host_line == {"a.test": "s", "b.test": "s:b.test"}
 
@@ -279,7 +302,7 @@ def test_a_starting_url_is_retried_on_its_own_record_not_its_seeds(tmp_path: Pat
     frontier.add_links(first, row, None, NOW)
     frontier.mark(frontier.entry("https://b.test/"), _content(), None, NOW)          # another site's first page: content
     frontier.mark(frontier.entry("https://a.test/main"), DEAD, None, NOW)
-    assert frontier.line("s")["content"] == 2                       # the seed line has content; its main URL does not
+    assert frontier.line("s")["content"] == 1 and frontier.line("s:b.test")["content"] == 1   # each line its own pages; the main URL none
     store = LocalStore(tmp_path / "store")
     store.put_many(frontier.save(tmp_path / "w"), "state")
     again = Frontier.load(store, tmp_path / "w2")
@@ -426,11 +449,12 @@ def test_a_new_line_starts_one_generation_below_its_parent_and_the_step_lasts() 
     frontier.mark(frontier.entry("https://b.test/x"), _content("https://b.test/x"), None, NOW)
     parent_after = frontier.line("s")["yield"]
     child = frontier.line("s:b.test")
-    assert child["yield"] == parent_after and child["generation"] == 1 and frontier.line("s")["generation"] == 0
-    # At the moment of spawning the line's factor is what it was (parent's yield x HOP_DECAY), now carried by the generation.
-    assert child["yield"] * GENERATION_DECAY ** child["generation"] == parent_after * HOP_DECAY
+    assert parent_after == 0.6 and frontier.line("s")["fetches"] == 1   # the find is not the parent's fetch
+    # The child starts at its parent's yield and relevance (1), and its first fetch, the find, is its own.
+    assert child["yield"] == 0.85 * 0.6 + 0.15 and child["generation"] == 1 and frontier.line("s")["generation"] == 0
+    first = child["yield"]
     frontier.mark(y, _content("https://b.test/y"), None, NOW)
-    assert child["yield"] == 0.85 * parent_after + 0.15             # it moves with its own fetches
+    assert child["yield"] == 0.85 * first + 0.15                    # it moves with its own fetches
     # The step does not wear off: however well the child's own pages pay, its pages rank GENERATION_DECAY below.
     child["yield"] = 1.0
     z = frontier.entry("https://b.test/z")
@@ -503,14 +527,17 @@ def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_
     x = _readable({**_content("https://b.test/x"), "fetch_id": "f-x"})
     frontier.expect_judgement(x["fetch_id"], "s")
     frontier.mark(frontier.entry("https://b.test/x"), x, None, NOW)
-    assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2
-    assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6
+    child = frontier.line("s:b.test")
+    assert line["yield"] == 0.6 and line["fetches"] == 1 and line["content"] == 1
+    assert frontier.spawned == 1 and child["yield"] == 0.6 and child["fetches"] == child["content"] == 1
     frontier.judged(row["fetch_id"], None)                       # no judgement came: the line's relevance stands in
     assert line["yield"] == 0.85 * 0.6 + 0.15 * 0.8 and line["relevance"] == 0.8
     answers = _Answers(0.4)
     judged = judging.relevance(answers.nouls())  # type: ignore[arg-type]
     frontier.judged(x["fetch_id"], answers)  # type: ignore[arg-type]
-    assert line["relevance"] == 0.85 * 0.8 + 0.15 * judged
+    # The find's judgement moves the line it started, not the one that found it.
+    assert child["relevance"] == 0.85 * 0.8 + 0.15 * judged and child["yield"] == 0.85 * 0.6 + 0.15 * judged
+    assert line["relevance"] == 0.8 and line["yield"] == 0.85 * 0.6 + 0.15 * 0.8
     # A page Jev will not read, marked at once, counts the same way.
     frontier._add("https://a.test/n", "s", "s", 1, 1.0, NOW)
     before = line["yield"]
@@ -583,7 +610,8 @@ def test_under_sampling_a_line_settles_near_its_live_share_times_its_relevance()
 
 # ---------------------------------------------------------------- the ranked queue against scoring every entry
 
-# select() as it was before the queue was grouped, kept verbatim as the reference the grouped version must match.
+# select() as it was before the queue was grouped, kept as the reference the grouped version must match. Changed since
+# only where the rules changed: crossings are not held against their line.
 def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> List[Dict[str, Any]]:
     """Up to n queued entries for the next round, from active lines, spread across hosts and lines."""
     weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
@@ -604,7 +632,8 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
         picked.append(entry)
         taken.add(entry["url"])
         in_host[entry["host"]] = in_host.get(entry["host"], 0) + 1
-        in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
+        if not entry.get("crossing"):   # a crossing's fetch will not count toward the line that found it
+            in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
     # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
     best_new: Dict[str, Dict[str, Any]] = {}

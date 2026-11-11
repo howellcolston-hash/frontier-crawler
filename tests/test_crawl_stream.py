@@ -303,12 +303,17 @@ def test_a_crawl_fails_retries_that_waited_too_long(tmp_path: Path) -> None:
     assert stats["retries_expired"] == 1 and stats["retries"] == 0 and _frontier(tmp_path).entry("https://h0.test/")["status"] == "failed"
 
 
-def test_with_no_jev_a_line_of_good_pages_keeps_a_high_yield(tmp_path: Path) -> None:
-    # Four dead links are taken first (their hosts sort first), then twelve good pages Jev cannot read: those count
-    # at the line's relevance, so the yield climbs back. Left out, as before, they would leave it at 0.85^4 = 0.52.
+def test_with_no_jev_good_pages_keep_their_lines_high_and_dead_crossings_count_toward_none(tmp_path: Path) -> None:
+    # Four dead links to other sites are taken first (their hosts sort first), then twelve good pages there that Jev
+    # cannot read. The dead ones count toward no line; each good one starts a line, and its first fetch counts at the
+    # relevance that line inherits, so nothing drags a yield toward zero.
     stats = _crawl(tmp_path, Site(12, dead=4), concurrency=1)
-    line = _frontier(tmp_path).line("a")
-    assert stats["pending"] == 13 and stats["error_pages"] == 4 and line["fetches"] == 17 and line["yield"] > 0.85
+    frontier = _frontier(tmp_path)
+    root = frontier.line("a")
+    assert stats["pending"] == 13 and stats["error_pages"] == 4 and root["fetches"] == root["content"] == 1 and root["yield"] > 0.99
+    spawned = [frontier.line(f"a:h{i}.test") for i in range(12)]
+    assert all(line["fetches"] == line["content"] == 1 and line["yield"] > 0.99 for line in spawned)
+    assert frontier.line("a:d0.test") is None and stats["lines_spawned"] == 12
 
 
 def test_re_tests_and_ordinary_takes_are_reported_apart_and_add_up(tmp_path: Path) -> None:

@@ -5,11 +5,14 @@ organised into lines. A line is one direction of research: it starts at a seed, 
 site that another line reached and found content on. Lines multiply as the crawl finds
 new sites, each with its own counters, and each one ends when it stops paying.
 
-Branching. A link to a site that no line covers is queued under the line that found it.
-If fetching it yields content, that site becomes a new line and the parent line carries on.
-A new line is one generation below the line that found it (a seed line is generation 0). It
-starts at its parent's yield and earns its own yield from there; the generation factor in
-priority keeps the step down for good, so a line many sites from its seed stays discounted
+Branching. A link to a site that no line covers (a crossing) is queued under the line that found
+it. If fetching it yields content, that site becomes a new line and the parent line carries on.
+A line's record (fetches, content, yield) is its own pages: that first fetch is the new line's,
+and a crossing that yields nothing counts toward no line, only its host. What a page is worth as
+a route to other sites lives in its links' base, not in its line's yield. A new line is one
+generation below the line that found it (a seed line is generation 0). It starts at its parent's
+yield and earns its own yield from there; the generation factor in priority keeps the step down
+for good, so a line many sites from its seed stays discounted
 however well its own pages pay.
 
 Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 0 for
@@ -296,7 +299,7 @@ class Frontier:
         self._version = 0
         self._crossing: Dict[str, List[Dict[str, Any]]] = {}  # host -> its entries still marked crossing, any status
         self._statuses = Counter(entry["status"] for entry in self._entries.values())
-        self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line) of each entry out with take()
+        self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line, "" for a crossing) of each entry out with take()
         self._flight_host: Dict[str, int] = {}
         self._flight_line: Dict[str, int] = {}
         self._takes = 0
@@ -563,8 +566,7 @@ class Frontier:
     def mark(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> None:
         flight = self._in_flight.pop(entry["url"], None)
         if flight is not None:
-            self._flight_host[flight[0]] -= 1
-            self._flight_line[flight[1]] -= 1
+            self._unhold(flight)
             self._retry_flight -= entry["status"] == "retry"
         elif entry["status"] == "queued":
             self._dequeue(entry)
@@ -599,18 +601,23 @@ class Frontier:
             counts["content"] += 1
             if row.get("tier_used") in _HEAVY_TIERS:
                 counts["heavy"] += 1
-        # The fetch counts toward the line that found it, so a line is credited for reaching new ground.
-        line = self._lines[entry["line_id"]]
+        # A line's record is its own pages. A crossing that brings content is the first fetch of the line its site
+        # becomes; one that brings nothing counts toward no line, only its host.
         value = fetch_yield(row, answers)
-        if value is None and row.get("fetch_id") not in self._judging:
-            value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
-        elif answers is not None and value is not None:
-            self._note_relevance(line, value)
-        self._record_yield(line, value)
-        if flight is not None and flight[1] != entry["line_id"]:
-            self._push_all(self._groups_by_line.get(flight[1], ()))   # the line it was taken from has one fewer in flight
         if entry.get("crossing") and (value is None or value > 0):
             self._spawn(entry, now)
+        fetch_id = row.get("fetch_id")
+        if entry.get("crossing"):
+            self._judging.pop(fetch_id, None)
+        else:
+            line = self._lines[entry["line_id"]]
+            if value is None and fetch_id not in self._judging:
+                value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
+            elif answers is not None and value is not None:
+                self._note_relevance(line, value)
+            self._record_yield(line, value)
+            if fetch_id in self._judging:   # a crossing's judgement moves the line it started, not the one that found it
+                self._judging[fetch_id] = (line["line_id"], self._judging[fetch_id][1])
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")
         if final and final not in self._entries:
@@ -620,7 +627,8 @@ class Frontier:
 
     def expect_judgement(self, fetch_id: str, line_id: str) -> None:
         """Call before mark() for a page that will be judged later. Its fetch counts now, its yield when judged() is
-        called, and the links add_links() queues from it are remembered until then, to be re-scored."""
+        called, and the links add_links() queues from it are remembered until then, to be re-scored. mark() moves
+        the record of a crossing to the line it starts, or drops it when it starts none."""
         self._judging[fetch_id] = (line_id, [])
 
     def judged(self, fetch_id: str, answers: Optional[JevResult]) -> None:
@@ -794,7 +802,8 @@ class Frontier:
         def take(entry: Dict[str, Any]) -> None:
             picked.append(entry)
             in_host[entry["host"]] = in_host.get(entry["host"], 0) + 1
-            in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
+            if not entry.get("crossing"):   # held against its line only if its fetch will count toward it, as in take()
+                in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
         # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
         for entry in self._new_host_picks(math.ceil(n * NEW_HOST_SHARE)):
@@ -968,15 +977,22 @@ class Frontier:
         return len(old)
 
     def _hold(self, entry: Dict[str, Any]) -> None:
-        self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
+        # A crossing in flight is held against its host only: its fetch will not count toward the line that found it.
+        line = "" if entry.get("crossing") else entry["line_id"]
+        self._in_flight[entry["url"]] = (entry["host"], line)
         self._flight_host[entry["host"]] = self._flight_host.get(entry["host"], 0) + 1
-        self._flight_line[entry["line_id"]] = self._flight_line.get(entry["line_id"], 0) + 1
+        if line:
+            self._flight_line[line] = self._flight_line.get(line, 0) + 1
+
+    def _unhold(self, flight: Tuple[str, str]) -> None:
+        self._flight_host[flight[0]] -= 1
+        if flight[1]:
+            self._flight_line[flight[1]] -= 1
 
     def release(self, entry: Dict[str, Any]) -> None:
         """Return an entry from take() that was not fetched to the queue (or to the retry lane)."""
-        host, line = self._in_flight.pop(entry["url"])
-        self._flight_host[host] -= 1
-        self._flight_line[line] -= 1
+        host, line = flight = self._in_flight.pop(entry["url"])
+        self._unhold(flight)
         if entry["status"] == "retry":
             self._retry_flight -= 1
             self._retry[entry["url"]] = entry
