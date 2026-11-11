@@ -251,3 +251,30 @@ def test_example_seed_file_loads_with_unique_ids() -> None:
     seeds = load_seeds(Path(__file__).resolve().parent.parent / "examples" / "config" / "seeds.jsonl")
     assert len({seed.id for seed in seeds}) == len(seeds) >= 2
     assert all(url.startswith("https://") for seed in seeds for url in seed.urls)
+
+
+def test_a_new_line_starts_one_step_below_its_parent_and_earns_its_own_yield() -> None:
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    root = frontier.entry("https://a.test/")
+    row = _page_row("https://a.test/", "<a href=\"https://b.test/x\">b</a> <a href=\"https://b.test/y\">b2</a>")
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    frontier.line("s")["yield"] = 0.6
+    frontier.mark(frontier.entry("https://b.test/x"), _content("https://b.test/x"), None, NOW)
+    parent_after = frontier.line("s")["yield"]
+    assert frontier.line("s:b.test")["yield"] == parent_after * 0.7
+    frontier.mark(frontier.entry("https://b.test/y"), _content("https://b.test/y"), None, NOW)
+    assert frontier.line("s:b.test")["yield"] == 0.85 * parent_after * 0.7 + 0.15   # and moves with its own fetches
+
+
+def test_lines_spawned_at_full_strength_before_the_change_are_caught_up_on_load() -> None:
+    lines = [
+        {"line_id": "s", "parent_line": None, "created_at": NOW, "since_thaw": 5, "yield": 0.8},
+        {"line_id": "s:b", "parent_line": "s", "created_at": NOW + dt.timedelta(1), "since_thaw": 0, "yield": 1.0},
+        {"line_id": "s:c", "parent_line": "s:b", "created_at": NOW + dt.timedelta(2), "since_thaw": 0, "yield": 1.0},
+        {"line_id": "s:d", "parent_line": "s", "created_at": NOW, "since_thaw": 3, "yield": 1.0},
+    ]
+    frontier = Frontier(lines=[{**line, "seed_id": "s", "status": "active"} for line in lines])
+    assert abs(frontier.line("s:b")["yield"] - 0.56) < 1e-9 and abs(frontier.line("s:c")["yield"] - 0.392) < 1e-9
+    assert frontier.line("s:d")["yield"] == 1.0                 # fetched since it started: its yield is its own

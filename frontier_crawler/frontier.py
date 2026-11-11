@@ -7,6 +7,8 @@ new sites, each with its own counters, and each one ends when it stops paying.
 
 Branching. A link to a site that no line covers is queued under the line that found it.
 If fetching it yields content, that site becomes a new line and the parent line carries on.
+A new line starts at its parent's yield x HOP_DECAY, one step from the line that found it,
+and earns its own yield from there: a branch is not handed full strength for being new.
 
 Freezing. Every line keeps a running yield: 1 for a fetch that brought new content (Jev's
 relevance for it once judged), 0 for a dead link, a duplicate, an unchanged page or a
@@ -255,6 +257,12 @@ class Frontier:
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
         }
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
+        # One-time catch-up for lines spawned before 2026-11-11 at full strength and not fetched since:
+        # they start one hop below their parent, as new lines do now. Oldest first, so parents settle first.
+        for line in sorted(self._lines.values(), key=lambda l: l["created_at"]):
+            parent = self._lines.get(line.get("parent_line") or "")
+            if parent is not None and line["since_thaw"] == 0 and line["yield"] == 1.0:
+                line["yield"] = parent["yield"] * HOP_DECAY
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
         for entry in self._entries.values():
@@ -322,10 +330,12 @@ class Frontier:
 
     # ------------------------------------------------------------ lines
 
-    def _new_line(self, line_id: str, seed_id: str, parent: Optional[str], root_url: str, now: dt.datetime) -> Dict[str, Any]:
+    def _new_line(
+        self, line_id: str, seed_id: str, parent: Optional[str], root_url: str, now: dt.datetime, start_yield: float = 1.0,
+    ) -> Dict[str, Any]:
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": root_url, "created_at": now,
-            "fetches": 0, "content": 0, "since_thaw": 0, "yield": 1.0, "status": "active", "frozen_at": None, "inbound": 0,
+            "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "status": "active", "frozen_at": None, "inbound": 0,
         }
         self._lines[line_id] = line
         return line
@@ -358,7 +368,7 @@ class Frontier:
         line_id = self._host_line.get(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
-            self._new_line(line_id, entry["seed_id"], parent, entry["url"], now)
+            self._new_line(line_id, entry["seed_id"], parent, entry["url"], now, self._lines[parent]["yield"] * HOP_DECAY)
             self._host_line[host] = line_id
             self.spawned += 1
         entry.update({"line_id": line_id, "crossing": False, "hops": 0})
