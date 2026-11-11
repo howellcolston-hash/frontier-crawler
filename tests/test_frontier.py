@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from frontier_crawler.frontier import (
-    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
+    GENERATION_DECAY, HOP_DECAY, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
 )
 from frontier_crawler.harvester.readers import extract_links, normalise
 from frontier_crawler.judge import questions as judging
@@ -155,8 +155,8 @@ def test_lines_saved_frozen_load_active_and_save_without_the_old_columns(tmp_pat
     import pyarrow.parquet as pq
     (local, _), = [f for f in frontier.save(tmp_path) if f[1] == "state/lines.parquet"]
     (row,) = pq.read_table(local).to_pylist()
-    assert set(row) == {"line_id", "seed_id", "parent_line", "root_url", "created_at", "fetches", "content", "yield", "relevance", "inbound"}
-    assert row["inbound"] == 2
+    assert set(row) == {"line_id", "seed_id", "parent_line", "root_url", "created_at", "fetches", "content", "yield", "relevance", "inbound", "generation"}
+    assert row["inbound"] == 2 and row["generation"] == 0
 
 
 def _two_lines(yields: Dict[str, float]) -> Frontier:
@@ -311,6 +311,20 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert deep["parent_fetch_id"] == rows["https://a.test/one"]["fetch_id"]        # every row says which fetch led to it
 
 
+def test_a_crawl_counts_fetches_by_the_generation_of_their_line(tmp_path: Path) -> None:
+    site = FakeSite({
+        "https://a.test/": '<a href="https://b.test/">b</a>',
+        "https://b.test/": '<a href="/x">x</a> <a href="https://c.test/">c</a>',
+        "https://b.test/x": "",
+        "https://c.test/": "",
+    })
+    store = LocalStore(tmp_path / "store")
+    engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW))
+    # a.test/ and the find b.test/ count toward the seed line; b.test/x and the find c.test/ toward the line b.test started.
+    assert stats["fetches_by_generation"] == {"0": 2, "1": 2, "2": 0, "3": 0, "4-7": 0, "8+": 0}
+
+
 def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
     class CountingStore(LocalStore):
         queue_uploads = 0
@@ -355,31 +369,54 @@ def test_example_seed_file_loads_with_unique_ids() -> None:
     assert all(url.startswith("https://") for seed in seeds for url in seed.urls)
 
 
-def test_a_new_line_starts_one_step_below_its_parent_and_earns_its_own_yield() -> None:
+def test_a_new_line_starts_one_generation_below_its_parent_and_the_step_lasts() -> None:
     frontier = Frontier()
     frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
     root = frontier.entry("https://a.test/")
-    row = _page_row("https://a.test/", "<a href=\"https://b.test/x\">b</a> <a href=\"https://b.test/y\">b2</a>")
+    row = _page_row("https://a.test/", "<a href=\"https://b.test/x\">b</a> <a href=\"https://b.test/y\">b2</a> <a href=\"https://b.test/z\">b3</a>")
     frontier.mark(root, row, None, NOW)
     frontier.add_links(root, row, None, NOW)
     frontier.line("s")["yield"] = 0.6
+    y = frontier.entry("https://b.test/y")
     frontier.mark(frontier.entry("https://b.test/x"), _content("https://b.test/x"), None, NOW)
     parent_after = frontier.line("s")["yield"]
-    assert frontier.line("s:b.test")["yield"] == parent_after * 0.7
-    frontier.mark(frontier.entry("https://b.test/y"), _content("https://b.test/y"), None, NOW)
-    assert frontier.line("s:b.test")["yield"] == 0.85 * parent_after * 0.7 + 0.15   # and moves with its own fetches
+    child = frontier.line("s:b.test")
+    assert child["yield"] == parent_after and child["generation"] == 1 and frontier.line("s")["generation"] == 0
+    # At the moment of spawning the line's factor is what it was (parent's yield x HOP_DECAY), now carried by the generation.
+    assert child["yield"] * GENERATION_DECAY ** child["generation"] == parent_after * HOP_DECAY
+    frontier.mark(y, _content("https://b.test/y"), None, NOW)
+    assert child["yield"] == 0.85 * parent_after + 0.15             # it moves with its own fetches
+    # The step does not wear off: however well the child's own pages pay, its pages rank GENERATION_DECAY below.
+    child["yield"] = 1.0
+    z = frontier.entry("https://b.test/z")
+    held = frontier.priority(z, 1.0)
+    child["generation"] = 0
+    assert abs(held - frontier.priority(z, 1.0) * GENERATION_DECAY) < 1e-15
 
 
-def test_lines_spawned_at_full_strength_before_the_change_are_caught_up_on_load() -> None:
-    lines = [
-        {"line_id": "s", "parent_line": None, "created_at": NOW, "fetches": 5, "yield": 0.8},
-        {"line_id": "s:b", "parent_line": "s", "created_at": NOW + dt.timedelta(1), "fetches": 0, "yield": 1.0},
-        {"line_id": "s:c", "parent_line": "s:b", "created_at": NOW + dt.timedelta(2), "fetches": 0, "yield": 1.0},
-        {"line_id": "s:d", "parent_line": "s", "created_at": NOW, "fetches": 3, "yield": 1.0},
+def test_lines_saved_without_a_generation_get_it_from_their_parent_chain() -> None:
+    def line(line_id: str, parent: Optional[str], fetches: int = 3, value: float = 0.5, day: int = 0, **extra: Any) -> Dict[str, Any]:
+        return {"line_id": line_id, "seed_id": "s", "parent_line": parent, "created_at": NOW + dt.timedelta(day),
+                "fetches": fetches, "yield": value, **extra}
+
+    chain = [line("c0", None)] + [line(f"c{i}", f"c{i - 1}") for i in range(1, 150)]   # past any recursion limit
+    lines = chain + [
+        line("orphan", "gone"), line("o1", "orphan"),                                  # a missing parent
+        line("x", "z"), line("y", "x"), line("z", "y"), line("w", "z"),                 # a loop, and a line hanging off it
+        line("k", None, generation=0), line("k1", "k", generation=4), line("k2", "k1"),  # a saved generation is kept
+        # Not fetched since spawning (at parent's yield x HOP_DECAY then): they restart at their parent's yield.
+        line("s", None, value=0.8), line("s:b", "s", fetches=0, value=0.56, day=1), line("s:c", "s:b", fetches=0, value=0.392, day=2),
+        line("s:d", "s", value=1.0),
     ]
-    frontier = Frontier(lines=[{**line, "seed_id": "s"} for line in lines])
-    assert abs(frontier.line("s:b")["yield"] - 0.56) < 1e-9 and abs(frontier.line("s:c")["yield"] - 0.392) < 1e-9
+    frontier = Frontier(lines=lines)
+    generation = {line_id: frontier.line(line_id)["generation"] for line_id in frontier._lines}
+    assert [generation[f"c{i}"] for i in range(150)] == list(range(150))
+    assert generation["orphan"] == 0 and generation["o1"] == 1
+    assert sorted(generation[i] for i in "xyz") == [0, 1, 2] and generation["w"] == generation["z"] + 1
+    assert generation["k1"] == 4 and generation["k2"] == 5
+    assert frontier.line("s:b")["yield"] == frontier.line("s:c")["yield"] == 0.8
     assert frontier.line("s:d")["yield"] == 1.0                 # fetched since it started: its yield is its own
+    assert frontier.line("c1")["yield"] == 0.5
 
 
 class _Answers:
@@ -420,7 +457,7 @@ def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_
     frontier.expect_judgement(x["fetch_id"], "s")
     frontier.mark(frontier.entry("https://b.test/x"), x, None, NOW)
     assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2
-    assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6 * 0.7
+    assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6
     frontier.judged(row["fetch_id"], None)                       # no judgement came: the line's relevance stands in
     assert line["yield"] == 0.85 * 0.6 + 0.15 * 0.8 and line["relevance"] == 0.8
     answers = _Answers(0.4)
@@ -579,9 +616,11 @@ def _random_frontier(rng: random.Random) -> tuple:
         }
 
     lines = [line(sid, sid, None) for sid in seed_ids]
-    for i in range(rng.randint(0, 8)):
-        sid = rng.choice(seed_ids)
-        lines.append(line(f"{sid}:x{i}", sid, sid))
+    for i in range(rng.randint(0, 8)):   # chains of lines, so generations differ: from the parent chain, saved, or orphaned
+        parent = rng.choice(lines)
+        lines.append(line(f"{parent['seed_id']}:x{i}", parent["seed_id"], rng.choice([parent["line_id"]] * 4 + ["gone"])))
+        if rng.random() < 0.3:
+            lines[-1]["generation"] = rng.randint(0, 9)
     hosts = [f"h{i}.test" for i in range(rng.randint(1, 60))]
     host_rows = [
         {"host": host, "fetches": rng.choice([0, 1, 1, 2, 5, 25]), "content": 0, "heavy": 0, "refused": 0, "errors": 0, "error_pages": 0}

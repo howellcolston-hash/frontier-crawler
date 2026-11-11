@@ -7,8 +7,10 @@ new sites, each with its own counters, and each one ends when it stops paying.
 
 Branching. A link to a site that no line covers is queued under the line that found it.
 If fetching it yields content, that site becomes a new line and the parent line carries on.
-A new line starts at its parent's yield x HOP_DECAY, one step from the line that found it,
-and earns its own yield from there: a branch is not handed full strength for being new.
+A new line is one generation below the line that found it (a seed line is generation 0). It
+starts at its parent's yield and earns its own yield from there; the generation factor in
+priority keeps the step down for good, so a line many sites from its seed stays discounted
+however well its own pages pay.
 
 Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
 new content Jev does not read (structured data, a scan with no text, a very short page), 0 for
@@ -20,16 +22,16 @@ page whose judgement is still coming leaves the yield until it arrives. Priority
 line that stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
 data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT of the way
 toward that line's (only upward, and only on the first link from that line into it in a run), and every 1/RETEST_SHARE-th take() fetches the
-best entry of a group drawn at random, so cold groups are tried again. Growth is bounded by the fetches per
+best entry of a group drawn at random, so cold groups are tried again (the draw ignores priority, generation included). Growth is bounded by the fetches per
 run, so lines compete for a fixed capacity.
 
-    priority = seed weight x base x HOP_DECAY^hops x line yield
+    priority = seed weight x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
                / (1 + fetched from this host / HOST_HALF)
                / (1 + fetched in this line / LINE_HALF)
 
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
-not been judged. hops count from the start of the line. There are no source tiers: any
+not been judged. hops count from the start of the line, generation from the seed. There are no source tiers: any
 http(s) link can be followed.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
@@ -79,6 +81,7 @@ from frontier_crawler.storage.store import Store
 
 MAX_HOPS = 5                    # links this many steps from the start of a line are the last ones queued
 HOP_DECAY = 0.7
+GENERATION_DECAY = 0.7          # PROVISIONAL: priority factor per line between a line and its seed; it does not wear off
 DEFAULT_LINK_BASE = 0.3         # for links from a page Jev has not judged
 MIN_LINK_BASE = 0.05
 HOST_HALF = 25.0                # fetches from one host at which its priority halves
@@ -142,6 +145,7 @@ _LINES_SCHEMA = pa.schema(
         ("yield", pa.float64()),
         ("relevance", pa.float64()),  # running mean of Jev's relevance for its judged pages, at YIELD_ALPHA
         ("inbound", pa.int64()),  # lifts received from links in other lines
+        ("generation", pa.int64()),  # 0 for a seed line, its parent's + 1 for a spawned line
     ]
 )
 
@@ -253,12 +257,27 @@ class Frontier:
         }
         # Lines saved before 2026-11-11 may carry status "frozen", since_thaw and frozen_at: every line is active, and those are dropped on save.
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
-        # One-time catch-up for lines spawned before 2026-11-11 at full strength and not fetched since:
-        # they start one hop below their parent, as new lines do now. Oldest first, so parents settle first.
-        for line in sorted(self._lines.values(), key=lambda l: l["created_at"]):
+        # Lines saved before generations existed get theirs from the parent chain. Chains run past 100 lines, so walk
+        # them without recursion; a missing parent or a loop makes the line where the walk stops generation 0.
+        legacy = [line for line in self._lines.values() if line.get("generation") is None]
+        for line in legacy:
+            chain: List[Dict[str, Any]] = []
+            seen: set = set()
+            at: Optional[Dict[str, Any]] = line
+            while at is not None and at.get("generation") is None and at["line_id"] not in seen:
+                seen.add(at["line_id"])
+                chain.append(at)
+                at = self._lines.get(at.get("parent_line") or "")
+            generation = at["generation"] + 1 if at is not None and at.get("generation") is not None else 0
+            for link in reversed(chain):
+                link["generation"] = generation
+                generation += 1
+        # Those lines not fetched since they were spawned started at their parent's yield x HOP_DECAY. The generation
+        # factor now carries that step, so they restart at their parent's yield, as new lines do. Oldest first, so parents settle first.
+        for line in sorted(legacy, key=lambda l: l["created_at"]):
             parent = self._lines.get(line.get("parent_line") or "")
-            if parent is not None and line["fetches"] == 0 and line["yield"] == 1.0:
-                line["yield"] = parent["yield"] * HOP_DECAY
+            if parent is not None and line["fetches"] == 0:
+                line["yield"] = parent["yield"]
         for line in self._lines.values():
             if line.get("relevance") is None:   # lines saved before 2026-11-11 have none: their yield is the best guess
                 line["relevance"] = line["yield"]
@@ -357,7 +376,7 @@ class Frontier:
         line = self._lines[entry["line_id"]]
         held_host = self._hosts.get(entry["host"], {}).get("fetches", 0) + extra_host
         return (
-            weight * entry["base"] * HOP_DECAY ** entry["hops"] * line["yield"]
+            weight * entry["base"] * HOP_DECAY ** entry["hops"] * line["yield"] * GENERATION_DECAY ** line["generation"]
             / (1.0 + held_host / HOST_HALF)
             / (1.0 + (line["fetches"] + extra_line) / LINE_HALF)
         )
@@ -365,11 +384,13 @@ class Frontier:
     # ------------------------------------------------------------ lines
 
     def _new_line(
-        self, line_id: str, seed_id: str, parent: Optional[str], root_url: str, now: dt.datetime, start_yield: float = 1.0,
+        self, line_id: str, seed_id: str, parent: Optional[Dict[str, Any]], root_url: str, now: dt.datetime,
     ) -> Dict[str, Any]:
+        """A seed line (parent None) starts at yield 1 and generation 0; a spawned line at its parent's yield, one generation down."""
         line = {
-            "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": root_url, "created_at": now,
-            "fetches": 0, "content": 0, "yield": start_yield, "relevance": 1.0, "inbound": 0,
+            "line_id": line_id, "seed_id": seed_id, "parent_line": parent and parent["line_id"], "root_url": root_url,
+            "created_at": now, "fetches": 0, "content": 0, "yield": parent["yield"] if parent else 1.0, "relevance": 1.0,
+            "inbound": 0, "generation": parent["generation"] + 1 if parent else 0,
         }
         self._lines[line_id] = line
         return line
@@ -412,11 +433,10 @@ class Frontier:
     def _spawn(self, entry: Dict[str, Any], now: dt.datetime) -> None:
         """A crossing link yielded content: its site becomes a line, and the queued links to that site move into it."""
         host = entry["host"]
-        parent = entry["line_id"]
         line_id = self._host_line.get(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
-            self._new_line(line_id, entry["seed_id"], parent, entry["url"], now, self._lines[parent]["yield"] * HOP_DECAY)
+            self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now)
             self._host_line[host] = line_id
             self.spawned += 1
         self._move(entry, line_id, 0)
@@ -994,6 +1014,7 @@ async def crawl(
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
+    by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation of the line they count toward
     # Re-test takes against ordinary ones, so the re-test share can be judged: pages taken, stored and judged, and relevance.
     kinds = {kind: dict.fromkeys(("taken", "stored", "judged", "relevance"), 0) for kind in ("retest", "ordinary")}
 
@@ -1006,6 +1027,8 @@ async def crawl(
     def record(entry: Dict[str, Any], row: Dict[str, Any], awaited: bool) -> None:
         """Phase 1, as soon as the page is fetched: everything that needs no judgement."""
         nonlocal links_added
+        generation = frontier.line(entry["line_id"])["generation"]
+        by_generation[str(generation) if generation < 4 else "4-7" if generation < 8 else "8+"] += 1
         if awaited:
             frontier.expect_judgement(row["fetch_id"], entry["line_id"])
         frontier.mark(entry, row, None, now())
@@ -1140,7 +1163,7 @@ async def crawl(
             "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
-            "lines_lifted": len(frontier.lines_lifted),
+            "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
