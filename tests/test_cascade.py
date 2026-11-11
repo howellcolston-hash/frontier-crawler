@@ -145,7 +145,7 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
 
     fetcher = asyncio.run(run())
     assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
-    assert fetcher.counts == {"http_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0}
+    assert fetcher.counts == {"http_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0, "browser_relaunches": 0}
 
 
 def test_a_timer_fault_does_not_break_a_fetch() -> None:
@@ -159,3 +159,199 @@ def test_a_timer_fault_does_not_break_a_fetch() -> None:
         return await fetcher.fetch("https://a.test/x")
 
     assert asyncio.run(run()).word_count > 100
+
+
+class FakeChromium:
+    """Stands in for playwright.async_api, offline. A URL says what its page does: "bad" fails to load,
+    "dies" kills the browser while loading (every time; "dies-once" only the first time), "slow" takes a moment,
+    "hangs" never answers the first time."""
+
+    class Error(Exception):
+        pass
+
+    class TimeoutError(Error):
+        pass
+
+    def __init__(self, fail_launches: int = 0) -> None:
+        self.fail_launches = fail_launches
+        self.drivers: List[Any] = []
+        self.browsers: List[Any] = []
+        self.contexts: List[Any] = []
+        self.died: List[str] = []
+        self.active = self.peak = 0
+
+    def async_playwright(self) -> Any:
+        fake = self
+
+        class Page:
+            def __init__(self, browser: Any) -> None:
+                self.browser, self.url = browser, ""
+
+            async def goto(self, url: str, wait_until: str, timeout: int) -> Any:
+                fake.active += 1
+                fake.peak = max(fake.peak, fake.active)
+                try:
+                    await asyncio.sleep(0.01 if "slow" in url else 0)
+                    if "hangs" in url and url not in fake.died:
+                        fake.died.append(url)
+                        await asyncio.sleep(60)
+                    if not self.browser.connected:
+                        raise fake.Error("Target page, context or browser has been closed")
+                    if "dies" in url and not ("once" in url and url in fake.died):
+                        fake.died.append(url)
+                        self.browser.connected = False
+                        raise fake.Error("Target page, context or browser has been closed")
+                    if "bad" in url:
+                        raise fake.Error("net::ERR_NAME_NOT_RESOLVED")
+                    self.url = url
+                    return type("Response", (), {"status": 200})()
+                finally:
+                    fake.active -= 1
+
+            async def inner_text(self, selector: str) -> str:
+                return "rendered text"
+
+            async def content(self) -> str:
+                return "<html><body>rendered text</body></html>"
+
+        class Context:
+            def __init__(self, browser: Any) -> None:
+                self.browser, self.closed = browser, False
+
+            async def new_page(self) -> Any:
+                return Page(self.browser)
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class Browser:
+            def __init__(self) -> None:
+                self.connected = True
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            async def new_context(self, user_agent: str) -> Any:
+                if not self.connected:
+                    raise fake.Error("Browser has been closed")
+                fake.contexts.append(Context(self))
+                return fake.contexts[-1]
+
+            async def close(self) -> None:
+                self.connected = False
+
+        class Driver:
+            def __init__(self) -> None:
+                self.stopped = False
+                self.chromium = self
+
+            async def start(self) -> Any:
+                fake.drivers.append(self)
+                return self
+
+            async def launch(self, headless: bool) -> Any:
+                if fake.fail_launches:
+                    fake.fail_launches -= 1
+                    raise fake.Error("chromium failed to start")
+                fake.browsers.append(Browser())
+                return fake.browsers[-1]
+
+            async def stop(self) -> None:
+                self.stopped = True
+
+        return Driver()
+
+
+@pytest.fixture
+def chromium(monkeypatch: pytest.MonkeyPatch) -> FakeChromium:
+    import types
+
+    fake = FakeChromium()
+    module = types.ModuleType("playwright.async_api")
+    module.Error, module.TimeoutError, module.async_playwright = fake.Error, fake.TimeoutError, fake.async_playwright
+    monkeypatch.setitem(__import__("sys").modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(__import__("sys").modules, "playwright.async_api", module)
+    return fake
+
+
+def _render(urls: List[str], browser_slots: int = 4) -> Any:
+    """Render the URLs through the browser tier at once; return (results, cascade) after the cascade closed."""
+
+    async def run() -> Any:
+        async with HarvesterCascade(browser_slots=browser_slots) as fetcher:
+            results = []
+            for batch in urls:
+                results += await asyncio.gather(*(fetcher._browser(url, None, 200) for url in batch.split()))
+        return results, fetcher
+
+    return asyncio.run(run())
+
+
+def _browser_counts(fetcher: HarvesterCascade) -> dict:
+    return {key: value for key, value in fetcher.counts.items() if key.startswith("browser_")}
+
+
+def test_one_browser_serves_every_page_and_each_context_is_closed(chromium: FakeChromium) -> None:
+    results, fetcher = _render(["https://a.test/1 https://a.test/2 https://a.test/3", "https://a.test/4 https://a.test/bad"])
+    assert [bool(r.raw_payload) for r in results] == [True, True, True, True, False]
+    assert results[0].tier_used == "HEADLESS_PLAYWRIGHT" and results[0].markdown_content == "rendered text"
+    assert "ERR_NAME_NOT_RESOLVED" in results[4].error_message
+    assert len(chromium.browsers) == 1 and len(chromium.contexts) == 5 and all(c.closed for c in chromium.contexts)
+    assert _browser_counts(fetcher) == {"browser_timeouts": 0, "browser_launches": 1, "browser_pages": 5, "browser_relaunches": 0}
+
+
+def test_closing_the_cascade_closes_browser_and_playwright(chromium: FakeChromium) -> None:
+    _render(["https://a.test/1"])
+    assert not chromium.browsers[0].connected and chromium.drivers[0].stopped
+
+
+def test_a_browser_that_dies_is_relaunched_and_the_page_retried(chromium: FakeChromium) -> None:
+    results, fetcher = _render(["https://a.test/dies-once"])
+    assert results[0].raw_payload and len(chromium.browsers) == 2 and chromium.drivers[0].stopped
+    assert all(c.closed for c in chromium.contexts)
+    assert _browser_counts(fetcher) == {"browser_timeouts": 0, "browser_launches": 2, "browser_pages": 1, "browser_relaunches": 1}
+
+
+def test_a_second_death_fails_the_page_and_the_next_page_launches_afresh(chromium: FakeChromium) -> None:
+    results, fetcher = _render(["https://a.test/dies", "https://a.test/after"])
+    assert results[0].raw_payload == b"" and results[0].http_status == 200 and "has been closed" in results[0].error_message
+    assert results[1].raw_payload and len(chromium.browsers) == 3
+    assert all(d.stopped for d in chromium.drivers) and all(c.closed for c in chromium.contexts)
+    assert _browser_counts(fetcher) == {"browser_timeouts": 0, "browser_launches": 3, "browser_pages": 2, "browser_relaunches": 2}
+
+
+def test_pages_on_a_browser_that_died_together_relaunch_it_once(chromium: FakeChromium) -> None:
+    results, fetcher = _render(["https://a.test/1", "https://a.test/slow-1 https://a.test/slow-2 https://a.test/dies-once"])
+    assert all(r.raw_payload for r in results) and len(chromium.browsers) == 2
+    assert fetcher.counts["browser_relaunches"] == 1
+
+
+def test_a_browser_found_disconnected_is_replaced_before_use(chromium: FakeChromium) -> None:
+    async def run() -> HarvesterCascade:
+        async with HarvesterCascade() as fetcher:
+            assert (await fetcher._browser("https://a.test/1", None, 200)).raw_payload
+            chromium.browsers[0].connected = False
+            assert (await fetcher._browser("https://a.test/2", None, 200)).raw_payload
+        return fetcher
+
+    fetcher = asyncio.run(run())
+    assert len(chromium.browsers) == 2 and chromium.drivers[0].stopped and fetcher.counts["browser_relaunches"] == 1
+
+
+def test_a_failed_launch_stops_playwright_and_is_tried_once_more(chromium: FakeChromium) -> None:
+    chromium.fail_launches = 2
+    results, fetcher = _render(["https://a.test/1", "https://a.test/2"])
+    assert results[0].raw_payload == b"" and "chromium failed to start" in results[0].error_message
+    assert results[1].raw_payload and all(d.stopped for d in chromium.drivers) and len(chromium.drivers) == 3
+
+
+def test_browser_slots_cap_pages_rendering_at_once(chromium: FakeChromium) -> None:
+    results, _ = _render([" ".join(f"https://a.test/slow-{i}" for i in range(6))], browser_slots=2)
+    assert all(r.raw_payload for r in results) and chromium.peak == 2
+
+
+def test_a_hung_browser_is_discarded_and_the_page_retried(chromium: FakeChromium, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cascade_module, "BROWSER_HUNG_SECONDS", 0.05)
+    results, fetcher = _render(["https://a.test/hangs"])
+    assert results[0].raw_payload and len(chromium.browsers) == 2 and chromium.drivers[0].stopped
+    assert all(c.closed for c in chromium.contexts) and fetcher.counts["browser_relaunches"] == 1
