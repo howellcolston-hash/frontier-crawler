@@ -5,11 +5,14 @@ organised into lines. A line is one direction of research: it starts at a seed, 
 site that another line reached and found content on. Lines multiply as the crawl finds
 new sites, each with its own counters, and each one ends when it stops paying.
 
-Branching. A link to a site that no line covers is queued under the line that found it.
-If fetching it yields content, that site becomes a new line and the parent line carries on.
-A new line is one generation below the line that found it (a seed line is generation 0). It
-starts at its parent's yield and earns its own yield from there; the generation factor in
-priority keeps the step down for good, so a line many sites from its seed stays discounted
+Branching. A link to a site that no line covers (a crossing) is queued under the line that found
+it. If fetching it yields content, that site becomes a new line and the parent line carries on.
+A line's record (fetches, content, yield) is its own pages: that first fetch is the new line's,
+and a crossing that yields nothing counts toward no line, only its host. What a page is worth as
+a route to other sites lives in its links' base, not in its line's yield. A new line is one
+generation below the line that found it (a seed line is generation 0). It starts at its parent's
+yield and earns its own yield from there; the generation factor in priority keeps the step down
+for good, so a line many sites from its seed stays discounted
 however well its own pages pay.
 
 Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 0 for
@@ -29,13 +32,19 @@ generation included). Growth is bounded by the fetches per run, so lines compete
 
     priority = seed weight x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
                / (1 + fetched from this host / HOST_HALF)
+               / (1 + fetched from this registered domain, all its hosts / DOMAIN_HALF)
                / (1 + fetched in this line / LINE_HALF)
 
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
-not been judged. hops count from the start of the line, generation from the seed. The share of
-each round kept for hosts never fetched ranks them by this priority too. There are no source
-tiers: any http(s) link can be followed.
+not been judged. hops count from the start of the line, generation from the seed. A crossing
+is priced as the line it would become: at its finder's generation + 1, so its priority does not
+drop when it becomes a line. The registered domain is the name a person registers (example.com
+for www.example.com), so a site's subdomains share one damping; it counts fetches done, not
+pages out with take() as the host and line factors do. The share of each round kept for
+registered domains never fetched (a new subdomain of a fetched one does not qualify) takes the
+best entry of each, ranked by this priority too. There are no source tiers: any http(s) link
+can be followed.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links.
@@ -60,6 +69,7 @@ import asyncio
 import bisect
 import contextlib
 import datetime as dt
+import functools
 import heapq
 import json
 import logging
@@ -74,6 +84,7 @@ from urllib.parse import urlsplit
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tld import get_fld
 
 from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import normalise
@@ -86,13 +97,14 @@ HOP_DECAY = 0.7
 GENERATION_DECAY = 0.7          # PROVISIONAL: priority factor per line between a line and its seed; it does not wear off
 DEFAULT_LINK_BASE = 0.3         # for links from a page Jev has not judged
 MIN_LINK_BASE = 0.05
-HOST_HALF = 25.0                # fetches from one host at which its priority halves
+HOST_HALF = 100.0               # PROVISIONAL: fetches from one host at which its priority halves
+DOMAIN_HALF = 200.0             # PROVISIONAL: fetches from one registered domain, all its hosts, at which its priority halves
 LINE_HALF = 100.0               # fetches in one line at which its priority halves
 YIELD_ALPHA = 0.15              # weight of the newest fetch in a line's running yield
 INBOUND_LIFT = 0.05             # share of the gap a link from a better line closes on the yield of the line it links into
 RETEST_SHARE = 0.02             # share of take() calls spent on a group drawn at random
 RETEST_DRAWS = 5                # draws a re-test makes past blocked groups before it falls back to the ranked take
-NEW_HOST_SHARE = 0.2            # part of each round kept for hosts never fetched before
+NEW_DOMAIN_SHARE = 0.05         # PROVISIONAL: part of each round kept for registered domains never fetched before
 HOST_ROUND_SHARE = 0.1          # most of one round that one host may take (at least 2)
 MAX_QUEUED_PER_HOST = 2000
 MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
@@ -200,6 +212,13 @@ def load_seeds(path: Path) -> List[Seed]:
     return seeds
 
 
+@functools.lru_cache(maxsize=None)
+def registered_domain(host: str) -> str:
+    """The name a person registers (example.com for www.example.com), from tld's bundled public suffix list, offline.
+    The host itself where the list cannot say: an IP address, an unknown suffix."""
+    return get_fld(host, fix_protocol=True, fail_silently=True) or host
+
+
 def link_base(answers: Optional[JevResult]) -> float:
     if answers is None:
         return DEFAULT_LINK_BASE
@@ -224,9 +243,10 @@ def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[f
 
 
 def _static(entry: Dict[str, Any], weight: float) -> float:
-    """The part of priority() fixed for a queued entry, in priority()'s own order of operations: priority() is
-    monotone in it, bit for bit, for one group's shared line and host factors."""
-    return weight * entry["base"] * HOP_DECAY ** entry["hops"]
+    """The part of priority() fixed for a queued entry, which priority() starts from: priority() is monotone in it,
+    bit for bit, for one group's shared line and host factors. A crossing takes one more generation step here, as the
+    line it would become."""
+    return weight * entry["base"] * HOP_DECAY ** entry["hops"] * (GENERATION_DECAY if entry.get("crossing") else 1.0)
 
 
 class _Group:
@@ -290,13 +310,19 @@ class Frontier:
         self._groups: Dict[Tuple[str, str, str], _Group] = {}
         self._groups_by_line: Dict[str, List[_Group]] = {}
         self._groups_by_host: Dict[str, List[_Group]] = {}
+        self._groups_by_domain: Dict[str, List[_Group]] = {}
+        # Fetches per registered domain, from the hosts table, kept current by mark(). A fetch only lowers the groups of
+        # its domain, so like a host's own it leaves them for _top() to re-score.
+        self._domain_fetches: Counter = Counter()
+        for host, host_counts in self._hosts.items():
+            self._domain_fetches[registered_domain(host)] += host_counts["fetches"]
         self._weights: Optional[Dict[str, float]] = None      # the active seeds' weights the heaps were built with
         self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
-        self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on hosts never fetched
+        self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on registered domains never fetched
         self._version = 0
         self._crossing: Dict[str, List[Dict[str, Any]]] = {}  # host -> its entries still marked crossing, any status
         self._statuses = Counter(entry["status"] for entry in self._entries.values())
-        self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line) of each entry out with take()
+        self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line, "" for a crossing) of each entry out with take()
         self._flight_host: Dict[str, int] = {}
         self._flight_line: Dict[str, int] = {}
         self._takes = 0
@@ -307,7 +333,7 @@ class Frontier:
         self.cooled: set = set()
         # fetch_id -> (the line credited, the urls add_links() queued from it), for pages whose judgement is awaited
         self._judging: Dict[str, Tuple[str, List[str]]] = {}
-        # seq is the order entries were queued in: select() has always broken ties within a never-fetched host by it.
+        # seq is the order entries were queued in: select() breaks ties within a never-fetched domain by it.
         for seq, entry in enumerate(self._entries.values()):
             entry["seq"] = seq
             if entry["status"] == "queued":
@@ -328,6 +354,7 @@ class Frontier:
                 group.members.sort(key=group.key)
         self._rng = random.Random(rng_seed)
         self.retests: set = set()   # urls taken as re-tests in this run
+        self.new_domain_takes = 0   # takes from the share kept for registered domains never fetched, in this run
         # What the queue declined to take in this run, by reason. Reported in the run summary.
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
@@ -380,8 +407,9 @@ class Frontier:
         line = self._lines[entry["line_id"]]
         held_host = self._hosts.get(entry["host"], {}).get("fetches", 0) + extra_host
         return (
-            weight * entry["base"] * HOP_DECAY ** entry["hops"] * line["yield"] * GENERATION_DECAY ** line["generation"]
+            _static(entry, weight) * line["yield"] * GENERATION_DECAY ** line["generation"]
             / (1.0 + held_host / HOST_HALF)
+            / (1.0 + self._domain_fetches.get(registered_domain(entry["host"]), 0) / DOMAIN_HALF)
             / (1.0 + (line["fetches"] + extra_line) / LINE_HALF)
         )
 
@@ -563,8 +591,7 @@ class Frontier:
     def mark(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> None:
         flight = self._in_flight.pop(entry["url"], None)
         if flight is not None:
-            self._flight_host[flight[0]] -= 1
-            self._flight_line[flight[1]] -= 1
+            self._unhold(flight)
             self._retry_flight -= entry["status"] == "retry"
         elif entry["status"] == "queued":
             self._dequeue(entry)
@@ -587,6 +614,7 @@ class Frontier:
         entry["stored"] = outcome in ("stored", "unchanged", "duplicate") and not row.get("block_marker")
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
+        self._domain_fetches[registered_domain(entry["host"])] += 1
         marker = row.get("block_marker") or ""
         refused = row.get("http_status") in _REFUSED_STATUS or (bool(marker) and not marker.startswith("http "))
         if outcome == "error":
@@ -599,18 +627,23 @@ class Frontier:
             counts["content"] += 1
             if row.get("tier_used") in _HEAVY_TIERS:
                 counts["heavy"] += 1
-        # The fetch counts toward the line that found it, so a line is credited for reaching new ground.
-        line = self._lines[entry["line_id"]]
+        # A line's record is its own pages. A crossing that brings content is the first fetch of the line its site
+        # becomes; one that brings nothing counts toward no line, only its host.
         value = fetch_yield(row, answers)
-        if value is None and row.get("fetch_id") not in self._judging:
-            value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
-        elif answers is not None and value is not None:
-            self._note_relevance(line, value)
-        self._record_yield(line, value)
-        if flight is not None and flight[1] != entry["line_id"]:
-            self._push_all(self._groups_by_line.get(flight[1], ()))   # the line it was taken from has one fewer in flight
         if entry.get("crossing") and (value is None or value > 0):
             self._spawn(entry, now)
+        fetch_id = row.get("fetch_id")
+        if entry.get("crossing"):
+            self._judging.pop(fetch_id, None)
+        else:
+            line = self._lines[entry["line_id"]]
+            if value is None and fetch_id not in self._judging:
+                value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
+            elif answers is not None and value is not None:
+                self._note_relevance(line, value)
+            self._record_yield(line, value)
+            if fetch_id in self._judging:   # a crossing's judgement moves the line it started, not the one that found it
+                self._judging[fetch_id] = (line["line_id"], self._judging[fetch_id][1])
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")
         if final and final not in self._entries:
@@ -620,7 +653,8 @@ class Frontier:
 
     def expect_judgement(self, fetch_id: str, line_id: str) -> None:
         """Call before mark() for a page that will be judged later. Its fetch counts now, its yield when judged() is
-        called, and the links add_links() queues from it are remembered until then, to be re-scored."""
+        called, and the links add_links() queues from it are remembered until then, to be re-scored. mark() moves
+        the record of a crossing to the line it starts, or drops it when it starts none."""
         self._judging[fetch_id] = (line_id, [])
 
     def judged(self, fetch_id: str, answers: Optional[JevResult]) -> None:
@@ -667,6 +701,7 @@ class Frontier:
             group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0))
             self._groups_by_line.setdefault(key[0], []).append(group)
             self._groups_by_host.setdefault(key[1], []).append(group)
+            self._groups_by_domain.setdefault(registered_domain(key[1]), []).append(group)
         return group
 
     def _enqueue(self, entry: Dict[str, Any]) -> None:
@@ -698,8 +733,8 @@ class Frontier:
         return (bool(group.members) and group.seed in (self._weights or {}) and group.line in self._lines
                 and group.host not in self.cooled)
 
-    def _never_fetched(self, host: str) -> bool:
-        return self._hosts.get(host, {}).get("fetches", 0) == 0
+    def _new_domain(self, host: str) -> bool:
+        return self._domain_fetches[registered_domain(host)] == 0
 
     def _extras(self, group: _Group) -> Tuple[int, int]:
         return self._flight_host.get(group.host, 0), self._flight_line.get(group.line, 0)
@@ -740,7 +775,7 @@ class Frontier:
         group.version = self._version
         item = (-score, entry["url"], self._version, group)
         heapq.heappush(self._heap, item)
-        if self._never_fetched(group.host):
+        if self._new_domain(group.host):
             heapq.heappush(self._new_heap, item)
 
     def _push_all(self, groups: Any) -> None:
@@ -760,11 +795,11 @@ class Frontier:
                 group.members.sort(key=group.key)
             self._push(group)
 
-    def _top(self, heap: List[Tuple[float, str, int, _Group]], new_hosts: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
+    def _top(self, heap: List[Tuple[float, str, int, _Group]], new_domains: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
         """The heap's first item, once it is current and exact; stale items are dropped and high ones re-scored."""
         while heap:
             negative, url, version, group = heap[0]
-            if version != group.version or not self._eligible(group) or (new_hosts and not self._never_fetched(group.host)):
+            if version != group.version or not self._eligible(group) or (new_domains and not self._new_domain(group.host)):
                 heapq.heappop(heap)
                 continue
             score, entry = self._best(group, *self._extras(group))  # type: ignore[misc]
@@ -794,10 +829,11 @@ class Frontier:
         def take(entry: Dict[str, Any]) -> None:
             picked.append(entry)
             in_host[entry["host"]] = in_host.get(entry["host"], 0) + 1
-            in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
+            if not entry.get("crossing"):   # held against its line only if its fetch will count toward it, as in take()
+                in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
-        # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
-        for entry in self._new_host_picks(math.ceil(n * NEW_HOST_SHARE)):
+        # First, the share kept for registered domains never fetched: the best entry of each, best domains first.
+        for entry in self._new_domain_picks(math.ceil(n * NEW_DOMAIN_SHARE)):
             take(entry)
 
         # Then the rest by priority. Each pick lowers the priority of what shares its host or line, so an entry is
@@ -859,43 +895,44 @@ class Frontier:
             heapq.heappush(self._heap, item)
         return picked
 
-    def _new_host_picks(self, k: int) -> List[Dict[str, Any]]:
-        """The best entry of each of the k best hosts never fetched, best first. Ties within a host go to the entry
-        queued first, ties between hosts to the url, as select() has always done."""
+    def _new_domain_picks(self, k: int) -> List[Dict[str, Any]]:
+        """The best entry of each of the k best registered domains never fetched, best first. Ties within a domain go
+        to the entry queued first, ties between domains to the url."""
         scores: Dict[str, float] = {}
         order: List[str] = []
         popped = []
         while k > 0:
-            item = self._top(self._new_heap, new_hosts=True)
+            item = self._top(self._new_heap, new_domains=True)
             if item is None or (len(order) >= k and -item[0] < scores[order[k - 1]]):
                 break
             popped.append(heapq.heappop(self._new_heap))
-            if item[3].host not in scores:
-                scores[item[3].host] = -item[0]
-                order.append(item[3].host)
+            domain = registered_domain(item[3].host)
+            if domain not in scores:
+                scores[domain] = -item[0]
+                order.append(domain)
         for item in popped:
             heapq.heappush(self._new_heap, item)
         picks = []
-        for host in order:
+        for domain in order:
             first = None
-            for group in self._groups_by_host[host]:
+            for group in self._groups_by_domain[domain]:
                 if not self._eligible(group):
                     continue
                 extras = self._extras(group)
                 for i, j in self._runs(group, 0):
-                    if self.priority(group.members[i], group.weight, *extras) != scores[host]:
+                    if self.priority(group.members[i], group.weight, *extras) != scores[domain]:
                         break
                     for entry in group.members[i:j]:
                         if first is None or entry["seq"] < first["seq"]:
                             first = entry
             picks.append(first)
-        picks.sort(key=lambda e: (-scores[e["host"]], e["url"]))  # type: ignore[index]
+        picks.sort(key=lambda e: (-scores[registered_domain(e["host"])], e["url"]))  # type: ignore[index]
         return picks[:k]  # type: ignore[return-value]
 
     def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
         and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
-        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Every 1/RETEST_SHARE-th call
+        Every 1/NEW_DOMAIN_SHARE-th call takes from registered domains never fetched while there are any. Every 1/RETEST_SHARE-th call
         is a re-test: the best entry of a group drawn uniformly from the groups with queued entries, under the same
         per-host limits; it falls back to the ranked take after RETEST_DRAWS blocked draws. Before any of that, a page
         waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are, and after it, when nothing else can
@@ -914,12 +951,12 @@ class Frontier:
                     self._hold(entry)
                     return entry
         heaps = [(self._heap, False)]
-        if self._takes % round(1 / NEW_HOST_SHARE) == 0:
+        if self._takes % round(1 / NEW_DOMAIN_SHARE) == 0:
             heaps.insert(0, (self._new_heap, True))
-        for heap, new_hosts in heaps:
+        for heap, new_domains in heaps:
             full = []
             while True:
-                item = self._top(heap, new_hosts)
+                item = self._top(heap, new_domains)
                 if item is None or self._flight_host.get(item[3].host, 0) < MAX_IN_FLIGHT_PER_HOST:
                     break
                 full.append(heapq.heappop(heap))
@@ -929,6 +966,7 @@ class Frontier:
                 entry = self._entries[item[1]]
                 self._dequeue(entry)
                 self._hold(entry)
+                self.new_domain_takes += new_domains
                 return entry
         return self.take_retry(seeds, today)   # nothing else to take: idle workers work off the retries
 
@@ -968,15 +1006,22 @@ class Frontier:
         return len(old)
 
     def _hold(self, entry: Dict[str, Any]) -> None:
-        self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
+        # A crossing in flight is held against its host only: its fetch will not count toward the line that found it.
+        line = "" if entry.get("crossing") else entry["line_id"]
+        self._in_flight[entry["url"]] = (entry["host"], line)
         self._flight_host[entry["host"]] = self._flight_host.get(entry["host"], 0) + 1
-        self._flight_line[entry["line_id"]] = self._flight_line.get(entry["line_id"], 0) + 1
+        if line:
+            self._flight_line[line] = self._flight_line.get(line, 0) + 1
+
+    def _unhold(self, flight: Tuple[str, str]) -> None:
+        self._flight_host[flight[0]] -= 1
+        if flight[1]:
+            self._flight_line[flight[1]] -= 1
 
     def release(self, entry: Dict[str, Any]) -> None:
         """Return an entry from take() that was not fetched to the queue (or to the retry lane)."""
-        host, line = self._in_flight.pop(entry["url"])
-        self._flight_host[host] -= 1
-        self._flight_line[line] -= 1
+        host, line = flight = self._in_flight.pop(entry["url"])
+        self._unhold(flight)
         if entry["status"] == "retry":
             self._retry_flight -= 1
             self._retry[entry["url"]] = entry
@@ -1023,7 +1068,8 @@ async def crawl(
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
-    by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation of the line they count toward
+    by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
+    by_host_page = dict.fromkeys(("1", "2-5", "6-20", "21+"), 0)   # fetches by their page number on their host
     # Re-test takes against ordinary ones, so the re-test share can be judged: pages taken, stored and judged, and relevance.
     kinds = {kind: dict.fromkeys(("taken", "stored", "judged", "relevance"), 0) for kind in ("retest", "ordinary")}
 
@@ -1036,8 +1082,10 @@ async def crawl(
     def record(entry: Dict[str, Any], row: Dict[str, Any], awaited: bool) -> None:
         """Phase 1, as soon as the page is fetched: everything that needs no judgement."""
         nonlocal links_added
-        generation = frontier.line(entry["line_id"])["generation"]
+        generation = frontier.line(entry["line_id"])["generation"] + bool(entry.get("crossing"))   # a crossing: its finder's + 1
         by_generation[str(generation) if generation < 4 else "4-7" if generation < 8 else "8+"] += 1
+        page = frontier._hosts.get(entry["host"], {}).get("fetches", 0) + 1
+        by_host_page["1" if page == 1 else "2-5" if page <= 5 else "6-20" if page <= 20 else "21+"] += 1
         if awaited:
             frontier.expect_judgement(row["fetch_id"], entry["line_id"])
         frontier.mark(entry, row, None, now())
@@ -1173,6 +1221,7 @@ async def crawl(
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
+            "fetches_by_host_page": by_host_page, "fetches_new_domain_share": frontier.new_domain_takes,
             "seed_urls_requeued": frontier.seed_urls_requeued,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
