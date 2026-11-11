@@ -197,6 +197,18 @@ def test_a_better_line_lifts_another_once_per_run_and_never_lowers_it() -> None:
     assert frontier.line("b")["yield"] == b_now and frontier.line("b")["inbound"] == 0 and frontier.lifts == 2
 
 
+def test_a_lift_never_takes_a_line_above_its_own_relevance() -> None:
+    frontier = _two_lines({"a": 0.2, "b": 0.9, "c": 0.9})
+    frontier.line("a")["relevance"] = 0.3
+    b = frontier.entry("https://b.test/")
+    frontier.add_links(b, _page_row(b["url"], '<a href="https://a.test/0">x</a>'), None, NOW)
+    assert frontier.line("a")["yield"] == 0.2 + 0.05 * (0.3 - 0.2)       # toward its relevance, not b's yield
+    frontier.line("a")["yield"] = 0.3
+    c = frontier.entry("https://c.test/")
+    frontier.add_links(c, _page_row(c["url"], '<a href="https://a.test/0">x</a>'), None, NOW)
+    assert frontier.line("a")["yield"] == 0.3 and frontier.line("a")["inbound"] == 1 and frontier.lifts == 1   # at it: nothing
+
+
 def test_a_lift_into_a_sunk_line_ranks_it_up_for_the_next_take() -> None:
     frontier = _two_lines({"a": 0.1, "c": 0.105, "b": 1.0})
     seeds = [_seed(sid, f"https://{sid}.test/") for sid in ("a", "b", "c")]

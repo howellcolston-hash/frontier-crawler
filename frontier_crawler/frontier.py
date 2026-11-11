@@ -21,7 +21,8 @@ it out instead would let the zeros outweigh the judged pages by one over the sam
 page whose judgement is still coming leaves the yield until it arrives. Priority carries the yield, so a
 line that stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
 data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT of the way
-toward that line's (only upward, and only on the first link from that line into it in a run), and every 1/RETEST_SHARE-th take() fetches the
+toward that line's yield, capped at its own relevance (only upward, and only on the first link from that line into it
+in a run), and every 1/RETEST_SHARE-th take() fetches the
 best entry of a group drawn at random, so cold groups are tried again (the draw ignores priority, generation included). Growth is bounded by the fetches per
 run, so lines compete for a fixed capacity.
 
@@ -421,12 +422,13 @@ class Frontier:
 
     def _note_inbound(self, line_id: str, from_line: str) -> None:
         """A page of from_line linked into line_id. The first such link in a run moves line_id's yield INBOUND_LIFT of the
-        way toward from_line's, if higher; later ones do nothing, so a much-linked site cannot be held up by the links alone."""
+        way toward from_line's, capped at line_id's own relevance, if higher; later ones do nothing. Links alone cannot
+        hold a much-linked site above what its judged pages are worth."""
         if (from_line, line_id) in self._linked:
             return
         self._linked.add((from_line, line_id))
         line = self._lines[line_id]
-        gap = self._lines[from_line]["yield"] - line["yield"]
+        gap = min(self._lines[from_line]["yield"], line["relevance"]) - line["yield"]
         if gap > 0:
             self._set_yield(line, line["yield"] + INBOUND_LIFT * gap)
             line["inbound"] += 1
