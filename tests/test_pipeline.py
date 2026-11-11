@@ -468,3 +468,40 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
     assert later("o2", "ocr_days")["scans_read"] == 0                                      # not read twice
     assert later("j1", "judge_days")["judged"] == 1                                        # only the text PDF was still unjudged
     assert later("j2", "judge_days")["judged"] == 0
+
+
+# ---------------------------------------------------------------- measurements
+
+def test_a_run_records_where_its_time_and_bytes_went(tmp_path: Path) -> None:
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x"), "https://a.test/api": _page("https://a.test/api", tier="API", body=b'{"a": 1}')})
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run(
+        [_job("https://a.test/x"), _job("https://a.test/api"), _job("https://a.test/missing")]))
+    slot = stats["slot_seconds"]
+    assert set(slot) >= {"jev", "observe", "flush", "idle"} and all(isinstance(v, float) and v >= 0 for v in slot.values())
+    tiers = stats["fetch_seconds_by_tier"]
+    assert set(tiers) == {"DOM_TRAFILATURA", "API", "error"} and tiers["error"]["n"] == 1
+    assert all(0 <= t["p50"] <= t["p90"] <= t["max"] for t in tiers.values())
+    assert stats["bytes_by_tier"]["DOM_TRAFILATURA"] == {"n": 1, "body": len(f"<html>{DOC}</html>"), "text": len(DOC.encode())}
+    assert stats["shard_bytes"]["fetches"] > 0 and stats["shard_bytes"]["judgements"] > 0
+    assert stats["state_bytes"]["url_state"] > 0 and stats["state_bytes"]["jev_spend"] > 0
+    assert stats["jev"]["calls"] == 1 and stats["jev"]["ceiling_usd_today"] > 0 and stats["jev"]["seconds_mean"] >= 0
+    assert stats["timeouts"] == {"http": 0, "browser": 0} and stats["browser_launches"] == 0
+    assert stats["peak_rss_mb"] > 0
+    json.dumps(stats)   # the run record is JSON
+
+
+def test_a_fault_in_measuring_does_not_break_a_fetch(tmp_path: Path) -> None:
+    class Broken(dict):
+        def __setitem__(self, key: Any, value: Any) -> None:
+            raise RuntimeError("timer fault")
+
+        def setdefault(self, *args: Any) -> Any:
+            raise RuntimeError("timer fault")
+
+    cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
+    run = _engine(tmp_path, cascade, "r1")
+    run.engine._slot = Broken()
+    run.engine._fetch_seconds = Broken()
+    stats = asyncio.run(run.run([_job("https://a.test/x")]))
+    assert stats["stored"] == 1 and len(_rows(tmp_path / "store", "fetches")) == 1

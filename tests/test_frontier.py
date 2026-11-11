@@ -235,6 +235,11 @@ def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, batch=2, now=lambda: NOW))
     assert stats["rounds"] >= 3 and stats["total"] == 7 and store.queue_uploads == 1
+    seconds = stats["seconds"]
+    assert set(seconds) == {"load_state", "select", "fetch_rounds", "final_save", "total"}
+    assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetch_rounds"]
+    assert stats["slot_seconds"]["idle"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
+    assert set(stats["state_bytes"]) >= {"frontier", "hosts", "lines", "url_state"} and all(stats["state_bytes"].values())
 
 
 def test_crawl_stops_starting_rounds_after_max_minutes(tmp_path: Path) -> None:
