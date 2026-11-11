@@ -15,12 +15,12 @@ import pytest
 from frontier_crawler.harvester.cascade import ScrapeResult, Target
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge.excerpt import build_excerpt
-from frontier_crawler.judge.jev import JevClient, JevRejected, JevUnavailable
+from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevUnavailable
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.questions import relevance
 
 QUESTIONS_V1 = judging.active()  # the built-in example set
-from frontier_crawler.pipeline import Engine, block_marker
+from frontier_crawler.pipeline import FORECAST_KEY, Engine, block_marker
 from frontier_crawler.storage.shards import day_folder
 from frontier_crawler.storage.store import HubStore, LocalStore
 
@@ -364,7 +364,7 @@ def test_ceiling_leaves_documents_pending_and_the_backlog_picks_them_up(tmp_path
 def test_the_ceiling_stops_calls_once_the_month_has_spent_it(tmp_path: Path) -> None:
     pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(4)}
     jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
-    # 3,333 tokens a month at the list price, and NOW is day 9 of 30, so 1,000 may be spent by now.
+    # 3,333 tokens a month at the list price, and NOW is 8 days 20 hours into a 30-day month, so 981 may be spent by now.
     # Each call reports 700, so the second call passes the ceiling.
     stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev, monthly_usd=0.00014, concurrency=1).run([_job(url) for url in pages]))
     assert stats["stored"] == 4 and stats["judged"] == 2 and stats["pending"] == 2
@@ -505,3 +505,65 @@ def test_a_fault_in_measuring_does_not_break_a_fetch(tmp_path: Path) -> None:
     run.engine._fetch_seconds = Broken()
     stats = asyncio.run(run.run([_job("https://a.test/x")]))
     assert stats["stored"] == 1 and len(_rows(tmp_path / "store", "fetches")) == 1
+
+
+# ---------------------------------------------------------------- spreading the budget over a run
+
+def _write_spend(store_root: Path, spend: Dict[str, Any]) -> None:
+    (store_root / "state").mkdir(parents=True, exist_ok=True)
+    (store_root / "state" / "jev_spend.json").write_text(json.dumps(spend), encoding="utf-8")
+
+
+def _usd_for(tokens_per_month: float) -> float:
+    return tokens_per_month * PRICE_PER_MTOK_USD / 1_000_000
+
+
+def test_the_ceiling_accrues_through_the_month_not_by_whole_days(tmp_path: Path) -> None:
+    def ceiling(when: dt.datetime) -> int:
+        return Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / "w", monthly_usd=_usd_for(720_000), now=lambda: when)._ceiling_tokens
+
+    # 720,000 tokens over a 30-day month is 1,000 an hour. NOW is 212 hours in.
+    assert abs(ceiling(NOW) - 212_000) <= 1
+    assert abs(ceiling(NOW.replace(hour=0)) - 192_000) <= 1
+    assert abs(ceiling(NOW.replace(hour=6)) - 198_000) <= 1
+
+
+def test_every_document_is_judged_with_no_forecast_or_with_budget_to_spare(tmp_path: Path) -> None:
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(3)}
+    jev = lambda: _jev(lambda request: httpx.Response(200, json=_jev_body()))  # noqa: E731
+    # A forecast is on file but no call this month: nothing to price it with.
+    _write_spend(tmp_path / "store", {FORECAST_KEY: 1000})
+    first = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev(), monthly_usd=8).run([_job(url) for url in pages]))
+    assert first["jev_sample_rate"] == 1.0 and first["judged"] == 3 and first["not_sampled"] == 0
+    # 1,000 pages at 700 tokens each is far under what $8 a month allows by now.
+    pages = {f"https://a.test/n{i}": _page(f"https://a.test/n{i}", body=f"new {i}".encode()) for i in range(3)}
+    second = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r2", jev=jev(), monthly_usd=8).run([_job(url) for url in pages]))
+    assert second["jev_sample_rate"] == 1.0 and second["judged"] == 3 and second["not_sampled"] == 0
+
+
+def test_a_run_the_budget_cannot_cover_judges_an_even_sample_and_leaves_none_pending(tmp_path: Path) -> None:
+    # One call of 700 tokens so far; the last crawl run saw 1,000 judgeable pages, so a run needs 700,000.
+    # The ceiling by NOW leaves a quarter of that: 175,700 tokens less the 700 spent.
+    _write_spend(tmp_path / "store", {"2026-11": {"input_tokens": 700, "calls": 1}, FORECAST_KEY: 1000})
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(200)}
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    engine = _engine(tmp_path, FakeCascade(pages), "r1", jev=jev, monthly_usd=_usd_for(175_700 * 720 / 212))
+    stats = asyncio.run(engine.run([_job(url) for url in pages]))
+    assert stats["jev_sample_rate"] == pytest.approx(0.25, abs=1e-4)
+    rate = engine.engine._sample_rate
+    picked = [row for row in _rows(tmp_path / "store", "fetches") if int(row["sha256"][:8], 16) / 2**32 < rate]
+    assert stats["judged"] == len(picked) and 30 <= len(picked) <= 70
+    assert stats["not_sampled"] == 200 - len(picked) and stats["pending"] == 0
+    assert {call["fetch_id"] for call in _rows(tmp_path / "store", "judgement_calls")} == {row["fetch_id"] for row in picked}
+
+
+def test_the_forecast_is_kept_from_the_last_sizeable_crawl_run(tmp_path: Path) -> None:
+    def spend() -> Dict[str, Any]:
+        return json.loads((tmp_path / "store" / "state" / "jev_spend.json").read_text(encoding="utf-8"))
+
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(500)}
+    asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1").run([_job(url) for url in pages]))
+    assert spend()[FORECAST_KEY] == 500 and spend()["2026-11"] == {"input_tokens": 0, "calls": 0}
+    few = {f"https://a.test/f{i}": _page(f"https://a.test/f{i}", body=f"few {i}".encode()) for i in range(3)}
+    asyncio.run(_engine(tmp_path, FakeCascade(few), "r2").run([_job(url) for url in few]))
+    assert spend()[FORECAST_KEY] == 500   # a short run does not replace it

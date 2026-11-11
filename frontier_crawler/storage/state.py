@@ -62,8 +62,8 @@ class UrlState:
         return local, URL_STATE_PATH
 
 
-def load_spend(store: Store, workdir: Path) -> Dict[str, Dict[str, int]]:
-    """{"2026-11": {"input_tokens": n, "calls": m}}"""
+def load_spend(store: Store, workdir: Path) -> Dict[str, Any]:
+    """{"2026-11": {"input_tokens": n, "calls": m}, "judgeable_pages_last_crawl_run": k} (k once a sizeable run is recorded)."""
     local = Path(workdir) / "state-in" / "jev_spend.json"
     if not store.get(JEV_SPEND_PATH, local):
         return {}
@@ -71,7 +71,7 @@ def load_spend(store: Store, workdir: Path) -> Dict[str, Dict[str, int]]:
     return data if isinstance(data, dict) else {}
 
 
-def save_spend(spend: Dict[str, Dict[str, int]], workdir: Path) -> Tuple[Path, str]:
+def save_spend(spend: Dict[str, Any], workdir: Path) -> Tuple[Path, str]:
     local = Path(workdir) / "state-out" / "jev_spend.json"
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(json.dumps(spend, sort_keys=True, indent=1) + "\n", encoding="utf-8")

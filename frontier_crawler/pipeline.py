@@ -6,7 +6,9 @@ stored before anything judges it.
 Judging (inside run when a Jev client is given, or later through Engine.judge_days): ask Jev
 the configured questions (judge/questions.py) about each new document and store every answer.
 A document Jev was not asked about (no key, the monthly ceiling reached, Jev unavailable)
-stays pending. Judging can be re-run; fetching is never repeated for it.
+stays pending. When the budget cannot cover a run, run judges a sample of its documents, chosen
+by content hash, so the allowance is spread over the whole run; the rest are counted not_sampled.
+Judging can be re-run; fetching is never repeated for it.
 
 Input contract:
     engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
@@ -56,6 +58,11 @@ _ERROR_PAGE_MAX_WORDS = 150
 _MIN_JUDGE_WORDS = 20
 # PROVISIONAL: stop calling Jev for the rest of a run after this many refusals in a row (a bad key, a changed API).
 _MAX_REJECTIONS = 3
+# PROVISIONAL: a crawl run must see at least this many judgeable pages for its count to become the
+# forecast of the next run's need, so a short manual run does not shrink the sample.
+_MIN_FORECAST_PAGES = 500
+# Top-level key in the spend file for that count. The file's other keys are months ("2026-11").
+FORECAST_KEY = "judgeable_pages_last_crawl_run"
 # Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
 _UPLOAD_EVERY_S = 600.0
 
@@ -133,9 +140,12 @@ class Engine:
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._now = now
         started = now()
-        # The month's Jev budget is spread over its days: by day d, at most d/days of it may be spent,
-        # so judging never stops for the rest of a month. Spend is counted from the tokens Jev reports.
-        share = started.day / calendar.monthrange(started.year, started.month)[1]
+        # The month's Jev budget accrues steadily through the month: by a given moment at most the elapsed
+        # share of it may be spent, so judging never stops for the rest of a month and runs later in a day
+        # get their part of that day. Spend is counted from the tokens Jev reports.
+        month_start = started.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_seconds = calendar.monthrange(started.year, started.month)[1] * 86400
+        share = (started - month_start).total_seconds() / month_seconds
         self._ceiling_tokens = int(monthly_usd * share / PRICE_PER_MTOK_USD * 1_000_000)
         self.run_id = run_id or f"{started.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
         self._day = started.date()
@@ -145,6 +155,8 @@ class Engine:
         self._last_upload = time.monotonic()
         self._seen: Dict[str, str] = {}
         self._rejections = 0
+        self._sample_rate = 1.0
+        self._judgeable_seen = 0
         # Measurement only: seconds summed over fetch slots, per-tier fetch durations and Jev call time.
         # finish() summarises them into stats.
         self._slot: Dict[str, float] = dict.fromkeys(("jev", "observe", "flush", "idle"), 0.0)
@@ -154,6 +166,7 @@ class Engine:
             "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
             "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
             "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
+            "not_sampled": 0, "jev_sample_rate": 1.0,
             "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
         }
 
@@ -162,6 +175,13 @@ class Engine:
         self._spend = await asyncio.to_thread(load_spend, self._store, self._workdir)
         month = self._spend.setdefault(self._month, {"input_tokens": 0, "calls": 0})
         self.stats["jev_usd_month"] = round(month["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 4)
+        # The share of this run's documents Jev can read: what may be spent now over what the last sizeable
+        # crawl run would cost at this month's tokens per call. With no forecast, every document is read.
+        pages = self._spend.get(FORECAST_KEY)
+        if pages and month["calls"] and month["input_tokens"]:
+            available = max(0, self._ceiling_tokens - month["input_tokens"])
+            self._sample_rate = min(1.0, available / (pages * month["input_tokens"] / month["calls"]))
+        self.stats["jev_sample_rate"] = round(self._sample_rate, 4)
 
     # ------------------------------------------------------------ writing
 
@@ -192,6 +212,8 @@ class Engine:
 
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
         """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
+        if self._judgeable_seen >= _MIN_FORECAST_PAGES:
+            self._spend[FORECAST_KEY] = self._judgeable_seen
         state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir)]
         self.stats["state_bytes"] = {Path(remote).stem: _size(local) for local, remote in state_files + list(extra)}
         await self.flush(force=True, extra=state_files + list(extra))
@@ -248,8 +270,13 @@ class Engine:
                 self.stats["blocked"] += 1
             answers: Optional[JevResult] = None
             if judgeable(row):
-                with timed(self._slot, "jev"):
-                    answers = await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+                self._judgeable_seen += 1
+                # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
+                if int(row["sha256"][:8], 16) / 2**32 < self._sample_rate:
+                    with timed(self._slot, "jev"):
+                        answers = await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+                else:
+                    self.stats["not_sampled"] += 1
             if observer is not None:
                 try:
                     with timed(self._slot, "observe"):
