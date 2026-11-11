@@ -7,10 +7,14 @@ new sites, each with its own counters, and each one ends when it stops paying.
 
 Branching. A link to a site that no line covers is queued under the line that found it.
 If fetching it yields content, that site becomes a new line and the parent line carries on.
+A new line starts at its parent's yield x HOP_DECAY, one step from the line that found it,
+and earns its own yield from there: a branch is not handed full strength for being new.
 
 Freezing. Every line keeps a running yield: 1 for a fetch that brought new content (Jev's
 relevance for it once judged), 0 for a dead link, a duplicate, an unchanged page or a
-refusal. A line whose yield stays under FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is
+refusal. The running yield is a plain mean of the line's start value and its fetches
+until it has about 1/YIELD_ALPHA of them, then a moving average, so a line's first fetches
+count in full. A line whose yield stays under FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is
 frozen: its queue is kept and nothing in it is fetched. A frozen line thaws when other
 lines link into it THAW_INBOUND times. Growth is bounded by the fetches per run, so lines
 compete for a fixed capacity.
@@ -322,10 +326,12 @@ class Frontier:
 
     # ------------------------------------------------------------ lines
 
-    def _new_line(self, line_id: str, seed_id: str, parent: Optional[str], root_url: str, now: dt.datetime) -> Dict[str, Any]:
+    def _new_line(
+        self, line_id: str, seed_id: str, parent: Optional[str], root_url: str, now: dt.datetime, start_yield: float = 1.0,
+    ) -> Dict[str, Any]:
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": root_url, "created_at": now,
-            "fetches": 0, "content": 0, "since_thaw": 0, "yield": 1.0, "status": "active", "frozen_at": None, "inbound": 0,
+            "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "status": "active", "frozen_at": None, "inbound": 0,
         }
         self._lines[line_id] = line
         return line
@@ -334,7 +340,9 @@ class Frontier:
         line["fetches"] += 1
         line["content"] += value > 0
         line["since_thaw"] += 1
-        line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
+        # The start value counts as one observation, so early fetches are a plain mean, not a 15% nudge.
+        alpha = max(YIELD_ALPHA, 1.0 / (line["since_thaw"] + 1))
+        line["yield"] = (1.0 - alpha) * line["yield"] + alpha * value
         if line["status"] == "active" and line["since_thaw"] >= MIN_FETCHES_TO_FREEZE and line["yield"] < FREEZE_YIELD:
             line["status"] = "frozen"
             line["frozen_at"] = now
@@ -358,7 +366,7 @@ class Frontier:
         line_id = self._host_line.get(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
-            self._new_line(line_id, entry["seed_id"], parent, entry["url"], now)
+            self._new_line(line_id, entry["seed_id"], parent, entry["url"], now, self._lines[parent]["yield"] * HOP_DECAY)
             self._host_line[host] = line_id
             self.spawned += 1
         entry.update({"line_id": line_id, "crossing": False, "hops": 0})
