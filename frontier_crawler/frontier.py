@@ -354,6 +354,7 @@ class Frontier:
                 group.members.sort(key=group.key)
         self._rng = random.Random(rng_seed)
         self.retests: set = set()   # urls taken as re-tests in this run
+        self.new_domain_takes = 0   # takes from the share kept for registered domains never fetched, in this run
         # What the queue declined to take in this run, by reason. Reported in the run summary.
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
@@ -965,6 +966,7 @@ class Frontier:
                 entry = self._entries[item[1]]
                 self._dequeue(entry)
                 self._hold(entry)
+                self.new_domain_takes += new_domains
                 return entry
         return self.take_retry(seeds, today)   # nothing else to take: idle workers work off the retries
 
@@ -1066,7 +1068,8 @@ async def crawl(
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
-    by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation of the line they count toward
+    by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
+    by_host_page = dict.fromkeys(("1", "2-5", "6-20", "21+"), 0)   # fetches by their page number on their host
     # Re-test takes against ordinary ones, so the re-test share can be judged: pages taken, stored and judged, and relevance.
     kinds = {kind: dict.fromkeys(("taken", "stored", "judged", "relevance"), 0) for kind in ("retest", "ordinary")}
 
@@ -1079,8 +1082,10 @@ async def crawl(
     def record(entry: Dict[str, Any], row: Dict[str, Any], awaited: bool) -> None:
         """Phase 1, as soon as the page is fetched: everything that needs no judgement."""
         nonlocal links_added
-        generation = frontier.line(entry["line_id"])["generation"]
+        generation = frontier.line(entry["line_id"])["generation"] + bool(entry.get("crossing"))   # a crossing: its finder's + 1
         by_generation[str(generation) if generation < 4 else "4-7" if generation < 8 else "8+"] += 1
+        page = frontier._hosts.get(entry["host"], {}).get("fetches", 0) + 1
+        by_host_page["1" if page == 1 else "2-5" if page <= 5 else "6-20" if page <= 20 else "21+"] += 1
         if awaited:
             frontier.expect_judgement(row["fetch_id"], entry["line_id"])
         frontier.mark(entry, row, None, now())
@@ -1216,6 +1221,7 @@ async def crawl(
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
+            "fetches_by_host_page": by_host_page, "fetches_new_domain_share": frontier.new_domain_takes,
             "seed_urls_requeued": frontier.seed_urls_requeued,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},

@@ -324,6 +324,8 @@ def test_re_tests_and_ordinary_takes_are_reported_apart_and_add_up(tmp_path: Pat
     expected = round(frontier_module.judged_yield(_answers(0.6)), 4)
     assert retest["mean_relevance"] == ordinary["mean_relevance"] == expected and stats["inbound_lifts"] == stats["lines_lifted"] == 0
     assert "lines_frozen" not in stats and "lines_thawed" not in stats
+    # Every 20th take goes to a never-fetched domain, except take 100, a re-test: 20, 40, 60, 80 and 120.
+    assert stats["fetches_new_domain_share"] == 5 and stats["fetches_by_host_page"] == {"1": 121, "2-5": 0, "6-20": 0, "21+": 0}
 
 
 def test_a_crawl_reports_cooled_hosts_and_its_queue_by_seed_in_the_record_only(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

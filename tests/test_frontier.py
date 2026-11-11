@@ -406,7 +406,7 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert deep["parent_fetch_id"] == rows["https://a.test/one"]["fetch_id"]        # every row says which fetch led to it
 
 
-def test_a_crawl_counts_fetches_by_the_generation_of_their_line(tmp_path: Path) -> None:
+def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path: Path) -> None:
     site = FakeSite({
         "https://a.test/": '<a href="https://b.test/">b</a>',
         "https://b.test/": '<a href="/x">x</a> <a href="https://c.test/">c</a>',
@@ -416,8 +416,10 @@ def test_a_crawl_counts_fetches_by_the_generation_of_their_line(tmp_path: Path) 
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW))
-    # a.test/ and the find b.test/ count toward the seed line; b.test/x and the find c.test/ toward the line b.test started.
-    assert stats["fetches_by_generation"] == {"0": 2, "1": 2, "2": 0, "3": 0, "4-7": 0, "8+": 0}
+    # A find counts at the generation it is priced at, its finder's + 1: a.test/ at 0, b.test/ and b.test/x at 1, c.test/ at 2.
+    assert stats["fetches_by_generation"] == {"0": 1, "1": 2, "2": 1, "3": 0, "4-7": 0, "8+": 0}
+    assert stats["fetches_by_host_page"] == {"1": 3, "2-5": 1, "6-20": 0, "21+": 0}   # b.test/x is its host's second page
+    assert stats["fetches_new_domain_share"] == 0                                      # four takes: no new-domain turn yet
 
 
 def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
