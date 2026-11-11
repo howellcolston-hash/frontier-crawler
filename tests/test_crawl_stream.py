@@ -207,10 +207,10 @@ def test_links_are_queued_at_once_and_re_scored_when_the_judgement_arrives(tmp_p
     assert stats["judged"] == 1 and stats["links_added"] == 3 and bases == {frontier_module.link_base(_answers())}
 
 
-def _answers() -> Any:
+def _answers(noul: float = 0.9) -> Any:
     class Answers:
         def nouls(self) -> Dict[str, float]:
-            return {q.id: 0.9 for q in judging.active() if q.type == "noul"}
+            return {q.id: noul for q in judging.active() if q.type == "noul"}
 
     return Answers()
 
@@ -299,6 +299,16 @@ def test_with_no_jev_a_line_of_good_pages_keeps_a_high_yield(tmp_path: Path) -> 
     stats = _crawl(tmp_path, Site(12, dead=4), concurrency=1)
     line = _frontier(tmp_path).line("a")
     assert stats["pending"] == 13 and stats["error_pages"] == 4 and line["fetches"] == 17 and line["yield"] > 0.85
+
+
+def test_re_tests_and_ordinary_takes_are_reported_apart_and_add_up(tmp_path: Path) -> None:
+    stats = _crawl(tmp_path, Site(120), jev=_jev(lambda request: httpx.Response(200, json=_jev_body(0.6))), monthly_usd=8, concurrency=1)
+    retest, ordinary = stats["retest"], stats["ordinary"]
+    assert retest["taken"] == 2 and retest["taken"] + ordinary["taken"] == stats["total"] == 121   # takes 50 and 100
+    assert retest["stored"] + ordinary["stored"] == stats["stored"] and retest["judged"] + ordinary["judged"] == stats["judged"] == 121
+    expected = round(frontier_module.judged_yield(_answers(0.6)), 4)
+    assert retest["mean_relevance"] == ordinary["mean_relevance"] == expected and stats["inbound_lifts"] == 0
+    assert "lines_frozen" not in stats and "lines_thawed" not in stats
 
 
 def test_a_crawl_reports_cooled_hosts_and_its_queue_by_seed_in_the_record_only(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
