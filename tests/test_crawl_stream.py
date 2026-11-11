@@ -245,12 +245,49 @@ def test_a_timed_out_page_is_retried_once_with_the_long_limit(tmp_path: Path) ->
 
 def test_a_retry_left_at_the_end_of_a_run_is_taken_by_the_next(tmp_path: Path) -> None:
     late = "https://h0.test/"
+    clock = [0.0]
+
+    async def time_runs_out(site: Site, url: str) -> None:
+        if url == late:
+            clock[0] = 10_000.0   # the deadline passes while it times out: no worker is left to retry it
+
     site = Site(3, timeouts={late: 1})
-    first = _crawl(tmp_path, site, run="r1", max_fetches=2, concurrency=1)
+    site.on_start = time_runs_out
+    first = _crawl(tmp_path, site, run="r1", concurrency=1, max_minutes=1, clock=lambda: clock[0])
     assert first["retries"] == 0 and _frontier(tmp_path).entry(late)["status"] == "retry"
     site.limits.clear()
-    second = _crawl(tmp_path, site, run="r2", max_fetches=1, concurrency=1)
+    site.on_start = None
+    second = _crawl(tmp_path, site, run="r2", max_fetches=0, concurrency=1)
     assert site.limits == [(late, frontier_module.RETRY_TIMEOUT_SECONDS)] and second["retry_recovered"] == 1
+
+
+def test_past_max_fetches_every_idle_worker_works_off_the_retries(tmp_path: Path) -> None:
+    slow = {f"https://h{i}.test/": 1 for i in range(6)}
+    site = Site(6, delay=0.01, timeouts=slow)
+    retrying: List[int] = [0, 0]   # now, peak
+
+    async def count_retries(site: Site, url: str) -> None:
+        if site.limits[-1][1] is not None:
+            retrying[0] += 1
+            retrying[1] = max(retrying)
+            await asyncio.sleep(0.02)
+            retrying[0] -= 1
+
+    site.on_start = count_retries
+    stats = _crawl(tmp_path, site, max_fetches=7, concurrency=4)
+    assert stats["stopped_by"] == "max_fetches" and stats["retries"] == stats["retry_recovered"] == 6 and stats["total"] == 13
+    assert retrying[1] > frontier_module.MAX_RETRY_IN_FLIGHT and _frontier(tmp_path).count("retry") == 0
+
+
+def test_a_crawl_fails_retries_that_waited_too_long(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path / "store")
+    frontier = Frontier()
+    frontier.add_seeds(SEEDS, NOW)
+    frontier._add("https://h0.test/", "a", "a", 1, 1.0, NOW)
+    frontier.mark(frontier.entry("https://h0.test/"), {"outcome": "error", "timed_out": True}, None, NOW - dt.timedelta(days=3))
+    store.put_many(frontier.save(tmp_path / "w0"), "state")
+    stats = _crawl(tmp_path, Site(0), store=store)
+    assert stats["retries_expired"] == 1 and stats["retries"] == 0 and _frontier(tmp_path).entry("https://h0.test/")["status"] == "failed"
 
 
 def test_with_no_jev_a_line_of_good_pages_keeps_a_high_yield(tmp_path: Path) -> None:

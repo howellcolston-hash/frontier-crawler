@@ -33,7 +33,8 @@ http(s) link can be followed.
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links.
 
-A page that timed out is retried once, with a longer limit, through take()'s retry lane; a second timeout fails it.
+A page that timed out is retried once, with a longer limit, through take()'s retry lane; a second timeout fails it,
+and so does waiting longer than RETRY_MAX_AGE for the retry.
 
 Input contract:
     frontier = Frontier.load(store, workdir); frontier.add_seeds(seeds, now)
@@ -89,7 +90,8 @@ MAX_LINKS_PER_PAGE = 300
 MAX_QUEUED_PER_HOST = 2000
 MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
 PORTAL_THRESHOLD = 0.7          # Jev's data_portal answer at which a page is listed as a candidate for a derived client
-MAX_RETRY_IN_FLIGHT = 2         # timed-out pages being fetched again at once, so slow hosts cannot take over a run
+MAX_RETRY_IN_FLIGHT = 2         # timed-out pages fetched again at once while there is other work, so slow hosts cannot take over a run
+RETRY_MAX_AGE = dt.timedelta(days=2)   # a retry still waiting this long after its first attempt is failed
 RETRY_TIMEOUT_SECONDS = 90.0    # the limit for that second attempt
 JEV_SLOTS = 8                   # judgements running at once in a crawl
 JUDGE_GRACE_SECONDS = 60.0      # how long the end of a crawl waits for judgements still running; the rest stay unjudged
@@ -907,16 +909,11 @@ class Frontier:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
         and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
         Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Before any of that, a page
-        waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are; its status is still "retry"."""
-        self._ready(seeds, today)
-        if self._retry_flight < MAX_RETRY_IN_FLIGHT:
-            entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
-                          and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
-            if entry is not None:
-                del self._retry[entry["url"]]
-                self._retry_flight += 1
-                self._hold(entry)
-                return entry
+        waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are, and after it, when nothing else can
+        be taken, with no such limit; its status is still "retry"."""
+        entry = self.take_retry(seeds, today, MAX_RETRY_IN_FLIGHT)
+        if entry is not None:
+            return entry
         self._takes += 1
         heaps = [(self._heap, False)]
         if self._takes % round(1 / NEW_HOST_SHARE) == 0:
@@ -935,7 +932,28 @@ class Frontier:
                 self._dequeue(entry)
                 self._hold(entry)
                 return entry
-        return None
+        return self.take_retry(seeds, today)   # nothing else to take: idle workers work off the retries
+
+    def take_retry(self, seeds: Sequence[Seed], today: dt.date, limit: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """The oldest page waiting for its retry whose host has room, while fewer than limit retries are in flight."""
+        self._ready(seeds, today)
+        if limit is not None and self._retry_flight >= limit:
+            return None
+        entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
+                      and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
+        if entry is not None:
+            del self._retry[entry["url"]]
+            self._retry_flight += 1
+            self._hold(entry)
+        return entry
+
+    def expire_retries(self, now: dt.datetime) -> int:
+        """Fail the retries still waiting RETRY_MAX_AGE after their first attempt, so the lane cannot grow without bound."""
+        old = [e for e in self._retry.values() if e["fetched_at"] is not None and now - e["fetched_at"] > RETRY_MAX_AGE]
+        for entry in old:
+            del self._retry[entry["url"]]
+            self._set_status(entry, "failed")
+        return len(old)
 
     def _hold(self, entry: Dict[str, Any]) -> None:
         self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
@@ -966,7 +984,8 @@ async def crawl(
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     clock: Callable[[], float] = time.monotonic,
 ) -> Dict[str, Any]:
-    """Fetch in a rolling stream until max_fetches are taken, max_minutes has passed, or nothing is left to take.
+    """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
+    or nothing is left to take.
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -985,6 +1004,7 @@ async def crawl(
     with timed(seconds, "load_state"):
         frontier = Frontier.load(store, workdir)
     by_id = {seed.id: seed for seed in seeds}
+    retries_expired = frontier.expire_retries(now())
     seeds_added = frontier.add_seeds(seeds, now())
     links_added = 0
     stored_by_seed = {seed.id: 0 for seed in seeds}
@@ -1052,21 +1072,22 @@ async def crawl(
     async def worker() -> None:
         nonlocal stopped_by
         while True:
-            if counts["taken"] >= max_fetches:
-                stopped_by = "max_fetches"
-                return
             if deadline is not None and clock() >= deadline:
                 stopped_by = "max_minutes"
                 return
+            # max_fetches counts new pages only. Past it, workers still work off the retries, until the deadline.
+            new_pages = counts["taken"] < max_fetches
             with timed(seconds, "take"):
-                entry = frontier.take(seeds, now().date())
+                entry = frontier.take(seeds, now().date()) if new_pages else frontier.take_retry(seeds, now().date())
             if entry is None:
                 if not counts["in_flight"]:
+                    if not new_pages:
+                        stopped_by = "max_fetches"
                     return
                 with engine.slot_timer("waiting"):  # pages in flight may bring links, or free a host
                     await asyncio.sleep(TAKE_WAIT_SECONDS)
                 continue
-            counts["taken"] += 1
+            counts["taken"] += entry["status"] != "retry"
             counts["in_flight"] += 1
             counts["peak_in_flight"] = max(counts["peak_in_flight"], counts["in_flight"])
             try:
@@ -1126,7 +1147,7 @@ async def crawl(
             "lines_active": frontier.count_lines("active"), "lines_frozen": frontier.count_lines("frozen"),
             "lines_spawned": frontier.spawned, "lines_thawed": frontier.thawed,
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
-            "retries": counts["retries"], "retry_recovered": counts["retry_recovered"],
+            "retries": counts["retries"], "retry_recovered": counts["retry_recovered"], "retries_expired": retries_expired,
             "stored_by_seed": stored_by_seed,
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "seed_url_problems": seed_url_problems,

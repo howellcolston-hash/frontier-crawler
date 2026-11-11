@@ -729,16 +729,33 @@ def test_a_timed_out_page_is_retried_once_through_its_own_lane(tmp_path: Path) -
     for entry in first[3:]:
         frontier.mark(entry, _content(), None, NOW)
     assert frontier.count("retry") == 3 and frontier.count("queued") == 0
+    frontier._add("https://h9.test/", "s", "s", 1, 1.0, NOW)
     retries = [frontier.take(seeds, NOW.date()) for _ in range(3)]
-    assert [e["status"] for e in retries[:2]] == ["retry", "retry"] and retries[2] is None   # at most MAX_RETRY_IN_FLIGHT at once
+    # At most MAX_RETRY_IN_FLIGHT at once while there is other work; with none left, the rest too.
+    assert [e["status"] for e in retries] == ["retry", "retry", "queued"]
+    assert frontier.take(seeds, NOW.date())["url"] == first[2]["url"]
+    frontier.release(frontier.entry(first[2]["url"]))
+    frontier.mark(retries[2], _content(), None, NOW)
     frontier.mark(retries[0], _timed_out(), None, NOW)                  # a second timeout fails it
     frontier.mark(retries[1], _content(), None, NOW)                    # this one recovered
     assert retries[0]["status"] == "failed" and retries[1]["status"] == "fetched"
     store = LocalStore(tmp_path / "store")
     store.put_many(frontier.save(tmp_path / "w"), "state")
     again = Frontier.load(store, tmp_path / "w2")                       # the one left waiting is kept for the next run
-    assert again.count("retry") == 1
+    assert again.count("retry") == 1 and again.expire_retries(NOW + dt.timedelta(days=1)) == 0
     left = again.take(seeds, NOW.date())
     assert left["status"] == "retry" and left["url"] == first[2]["url"]
     again.release(left)
     assert again.take(seeds, NOW.date()) is left
+
+
+def test_a_retry_that_waits_too_long_is_failed() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i, age in enumerate((3, 1)):
+        frontier._add(f"https://h{i}.test/", "s", "s", 1, 1.0, NOW)
+        frontier.mark(frontier.entry(f"https://h{i}.test/"), _timed_out(), None, NOW - dt.timedelta(days=age))
+    assert frontier.expire_retries(NOW) == 1 and frontier.count("retry") == 1 and frontier.count("failed") == 1
+    assert frontier.entry("https://h0.test/")["status"] == "failed"
+    assert frontier.take_retry(seeds, NOW.date())["url"] == "https://h1.test/" and frontier.take_retry(seeds, NOW.date()) is None
