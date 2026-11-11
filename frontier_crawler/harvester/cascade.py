@@ -14,7 +14,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.parse import urlsplit
 
 import certifi
@@ -35,6 +35,9 @@ _BROWSER_RETRY_STATUS = (403, 503)
 # Request headers that carry a visitor's credentials. Never copied into a capture or a client spec.
 CREDENTIAL_HEADERS = ("cookie", "authorization", "x-api-key", "x-csrf-token", "x-xsrf-token")
 PDF_SECONDS = 60.0  # PROVISIONAL: text reading stops here; the stored PDF is complete either way
+# PROVISIONAL. A page attempt still running after this long means the shared browser has stopped
+# answering; it is discarded. Above the sum of a page's own Playwright timeouts (two loads and inner_text's 30 s).
+BROWSER_HUNG_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -234,20 +237,28 @@ class HarvesterCascade:
         timeout_s: float = 15.0,
         client: Optional[httpx.AsyncClient] = None,
         throttle: Optional[HostThrottle] = None,
+        browser_slots: int = 4,  # PROVISIONAL: pages rendering at once in the shared browser
     ) -> None:
         self._timeout_s = timeout_s
         self._client = client
         self._owned: Optional[httpx.AsyncClient] = None
         self._throttle = throttle
         self._pdf_lock = asyncio.Lock()  # the PDF library must not run in two threads at once
+        self._browser_slots = asyncio.Semaphore(browser_slots)
+        self._launch_lock = asyncio.Lock()  # two pages must not both launch
+        self._chromium: Optional[Tuple[Any, Any]] = None  # (playwright, browser), shared by every page of the run
         # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
         self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
-        self.counts: Dict[str, int] = dict.fromkeys(("http_timeouts", "browser_timeouts", "browser_launches"), 0)
+        self.counts: Dict[str, int] = dict.fromkeys(
+            ("http_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches"), 0
+        )
 
     async def __aenter__(self) -> "HarvesterCascade":
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        if self._chromium is not None:
+            await self._discard(self._chromium[1])
         if self._owned is not None:
             await self._owned.aclose()
             self._owned = None
@@ -331,21 +342,39 @@ class HarvesterCascade:
 
     async def _browser(self, url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
         try:
-            from playwright.async_api import Error as PlaywrightError
             from playwright.async_api import TimeoutError as PlaywrightTimeout
             from playwright.async_api import async_playwright
         except ImportError as exc:
             return _failed(url, "HEADLESS_PLAYWRIGHT", f"playwright is not installed: {exc}", prior_status)
-        if self._throttle is not None:
-            await self._throttle.wait(url)
-        playwright = None
-        browser = None
+        self.counts["browser_pages"] += 1
+        for _ in range(2):  # a second try only after the browser itself was found dead
+            if self._throttle is not None:
+                await self._throttle.wait(url)
+            browser = None
+            async with self._browser_slots:
+                try:
+                    browser = await self._shared_browser(async_playwright)
+                    return await asyncio.wait_for(self._render(browser, url, prior_note, prior_status), BROWSER_HUNG_SECONDS)
+                except Exception as exc:
+                    if isinstance(exc, PlaywrightTimeout):
+                        self.counts["browser_timeouts"] += 1
+                    failed = _failed(url, "HEADLESS_PLAYWRIGHT", f"{prior_note or ''}; browser: {type(exc).__name__}: {exc}".lstrip("; "), prior_status)
+                    # Navigation errors and page timeouts leave the browser fine. A failed launch, a lost
+                    # connection to it or a hang (asyncio's TimeoutError, not Playwright's) do not.
+                    if browser is not None and browser.is_connected() and "Connection closed" not in str(exc) and not isinstance(exc, TimeoutError):
+                        return failed
+                    if browser is not None:
+                        await self._discard(browser)
+        return failed
+
+    async def _render(self, browser: Any, url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
+        """One page in a fresh context, so no cookies or storage carry from one site to the next."""
+        from playwright.async_api import Error as PlaywrightError
+
         timeout_ms = int(self._timeout_s * 1000)
+        context = await browser.new_context(user_agent=USER_AGENT)
         try:
-            playwright = await async_playwright().start()
-            self.counts["browser_launches"] += 1
-            browser = await playwright.chromium.launch(headless=True)
-            page = await (await browser.new_context(user_agent=USER_AGENT)).new_page()
+            page = await context.new_page()
             try:
                 response = await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
             except PlaywrightError:
@@ -359,15 +388,39 @@ class HarvesterCascade:
                 page.url or url, status, html.encode("utf-8"), text, word_count(text),
                 "HEADLESS_PLAYWRIGHT", prior_note, "text/html; rendered",
             )
-        except Exception as exc:
-            if isinstance(exc, PlaywrightTimeout):
-                self.counts["browser_timeouts"] += 1
-            return _failed(url, "HEADLESS_PLAYWRIGHT", f"{prior_note or ''}; browser: {type(exc).__name__}: {exc}".lstrip("; "), prior_status)
         finally:
-            # A leaked Chromium uses up a small machine's memory.
-            if browser is not None:
-                await browser.close()
-            if playwright is not None:
+            # An open context keeps its pages' memory. Bounded: a dead or hung browser may never answer.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(context.close(), self._timeout_s)
+
+    async def _shared_browser(self, async_playwright: Any) -> Any:
+        """The run's one Chromium: launched on first use, and again once the last one died."""
+        if self._chromium is not None and not self._chromium[1].is_connected():
+            await self._discard(self._chromium[1])
+        async with self._launch_lock:
+            if self._chromium is None:
+                playwright = await async_playwright().start()
+                if self.counts["browser_launches"]:
+                    self.counts["browser_relaunches"] += 1
+                self.counts["browser_launches"] += 1
+                try:
+                    browser = await playwright.chromium.launch(headless=True)
+                except BaseException:
+                    await playwright.stop()  # a failed launch must not leave Playwright running
+                    raise
+                self._chromium = (playwright, browser)
+            return self._chromium[1]
+
+    async def _discard(self, browser: Any) -> None:
+        """Close the shared browser and its Playwright, unless another page already replaced it."""
+        async with self._launch_lock:
+            if self._chromium is None or self._chromium[1] is not browser:
+                return
+            playwright, self._chromium = self._chromium[0], None
+            # A leaked Chromium uses up a small machine's memory. Stopping Playwright ends its Chromium even if close() hung.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(browser.close(), self._timeout_s)
+            with contextlib.suppress(Exception):
                 await playwright.stop()
 
 

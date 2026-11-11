@@ -232,7 +232,7 @@ class Engine:
                     "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
                     "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
                     "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
-                    "browser_launches": counts.get("browser_launches", 0),
+                    **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
                     "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                             "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
                     "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),  # Linux reports KB
