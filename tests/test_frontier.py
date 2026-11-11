@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from frontier_crawler.frontier import (
-    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, extract_links, fetch_yield, link_base, load_seeds,
-    normalise,
+    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
 )
+from frontier_crawler.harvester.readers import extract_links, normalise
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
@@ -54,7 +54,8 @@ DEAD = {"outcome": "error_page", "http_status": 404, "block_marker": "http 404"}
 
 
 def _page_row(url: str, links: str) -> Dict[str, Any]:
-    return {**_content(url), "fetch_id": "f-" + url, "content_type": "text/html", "body": f"<html><body>{links}</body></html>".encode()}
+    """A stored HTML page as Engine.fetch returns it, with its links extracted."""
+    return {**_content(url), "fetch_id": "f-" + url, "content_type": "text/html", "links": extract_links(f"<html><body>{links}</body></html>".encode(), url)}
 
 
 def test_a_round_spreads_across_hosts_and_lines() -> None:
@@ -266,7 +267,7 @@ class FakeSite:
         if url not in self.pages:
             return ScrapeResult(url, 404, b"<html>Not found</html>", "Not found", 2, "DOM_TRAFILATURA", None, "text/html")
         body = f"<html><body><h1>{url}</h1>{self.pages[url]}<p>{TEXT}</p></body></html>".encode()
-        return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html")
+        return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html", links=extract_links(body, url))
 
 
 def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:

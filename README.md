@@ -31,6 +31,20 @@ Read from the store's `config/` folder at the start of a run:
 
 Judging uses [Jev](https://docs.typesafe.ai) and needs `JEV_API_KEY`. Without it pages are stored and left pending.
 
+## Tables
+
+Parquet shards in the store, in folders by the UTC day the fetching run started (`<table>/year=/month=/day=/`):
+
+| table | one row per |
+|---|---|
+| `fetches` | fetch attempt: where the URL came from, status, outcome, content hash, size and text. Rows from engine 0.2.0 and earlier also carry the bytes in `body` |
+| `bodies` | content hash stored: the bytes as served (rendered HTML for the browser tier). Identical bytes are stored once, across runs; `python -m frontier_crawler body SHA256` writes one out |
+| `links` | distinct link on a stored HTML page, in page order, whether or not the queue took it |
+| `ocr_text` | scanned PDF read with Tesseract |
+| `judgement_calls`, `judgements` | Jev call about a document, and each answer in it |
+
+Crawl state (`state/`) holds the queue, lines, hosts, what each URL last served, the set of stored body hashes and Jev spend.
+
 ## Logs
 
 A run prints counts only. What it fetched, and anything that went wrong, is written to the store as `runs/<run id>.json`. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.

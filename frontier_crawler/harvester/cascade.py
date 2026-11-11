@@ -2,16 +2,15 @@
 
 Input contract: result = await cascade.fetch(url, timeout=None). Network and parse failures come back
 in the result; result.timed_out says the page timed out with nothing served. Only BlockedAddress is
-raised, for a URL the engine must never request.
+raised, for a URL the engine must never request. Fetched bytes are read in worker processes (readers.py);
+close the cascade (async with) to stop them.
 """
 
 from __future__ import annotations
 
 import asyncio
-import codecs
 import contextlib
 import ipaddress
-import re
 import ssl
 import time
 import warnings
@@ -22,9 +21,9 @@ from urllib.parse import urlsplit
 
 import certifi
 import httpx
-import trafilatura
-from trafilatura.utils import detect_encoding
 
+from frontier_crawler.harvester import readers
+from frontier_crawler.harvester.readers import Links, ReaderFailed, ReaderPool, decode, pdf_text, read_html
 from frontier_crawler.harvester.throttle import HostThrottle
 
 USER_AGENT = "Mozilla/5.0 (compatible; frontier-crawler/1.0; +https://github.com/howellcolston-hash/frontier-crawler)"
@@ -75,6 +74,7 @@ class ScrapeResult:
     too_large_bytes: Optional[int] = None
     timed_out: bool = False  # nothing was served because the request or the page load timed out
     throttle_wait: float = 0.0  # seconds this fetch waited for its host's turn
+    links: Optional[Links] = None  # (links, unparseable hrefs) of an HTML page, as its reader found them
 
 
 @contextlib.contextmanager
@@ -112,61 +112,6 @@ def check_public(url: str) -> None:
 
 def word_count(text: str) -> int:
     return len(text.split()) if text else 0
-
-
-# Legacy charsets as browsers read them: pages labelled with one routinely use its superset's extra characters.
-_SUPERSETS = {"gb2312": "gb18030", "gbk": "gb18030", "big5": "big5hkscs", "shift_jis": "cp932", "euc_kr": "cp949"}
-
-
-def decode(body: bytes, content_type: str) -> Tuple[str, Optional[str]]:
-    """(text, encoding read in). Valid UTF-8 as it is; else the charset the header declares, the one the page's
-    <meta> declares, then a detected one. Encoding None: nothing fit, so UTF-8 with replacement characters."""
-    try:
-        return body.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
-        pass
-    header = re.search(r"charset=[\"']?([\w.:-]+)", content_type, re.I)
-    meta = re.search(r"<meta[^>]+charset\s*=\s*[\"']?([\w.:-]+)", body[:4096].decode("ascii", "ignore"), re.I)
-
-    def candidates() -> Iterator[str]:
-        yield from (found.group(1) for found in (header, meta) if found)
-        yield from detect_encoding(body)  # only reached when no declared charset fits
-
-    for name in candidates():
-        try:
-            codec = codecs.lookup(name).name
-            codec = _SUPERSETS.get(codec, codec)
-            return body.decode(codec), codec
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return body.decode("utf-8", errors="replace"), None
-
-
-def _html_text(body: bytes, content_type: str) -> Tuple[Optional[str], Optional[str]]:
-    """(markdown text, encoding read in), for a worker thread: detecting the encoding of a large page is slow."""
-    html, encoding = decode(body, content_type)
-    return trafilatura.extract(html, output_format="markdown", include_comments=False, include_tables=True), encoding
-
-
-def _pdf_text(body: bytes) -> Tuple[str, Optional[str]]:
-    """(text of every page, a note when PDF_SECONDS ran out first). Scanned pages have no text."""
-    import pypdfium2
-
-    pdf = pypdfium2.PdfDocument(body)
-    try:
-        parts = []
-        deadline = time.monotonic() + PDF_SECONDS
-        for index in range(len(pdf)):
-            if time.monotonic() > deadline:
-                return "\n".join(parts), f"text read for the first {index} of {len(pdf)} pages"
-            page = pdf[index]
-            textpage = page.get_textpage()
-            parts.append(textpage.get_text_bounded())
-            textpage.close()
-            page.close()
-        return "\n".join(parts), None
-    finally:
-        pdf.close()
 
 
 async def read_capped(response: httpx.Response) -> Tuple[Optional[bytes], int]:
@@ -287,25 +232,31 @@ class HarvesterCascade:
         self._client = client
         self._owned: Optional[httpx.AsyncClient] = None
         self._throttle = throttle
-        self._pdf_lock = asyncio.Lock()  # the PDF library must not run in two threads at once
         self._browser_slots = asyncio.Semaphore(browser_slots)
         self._launch_lock = asyncio.Lock()  # two pages must not both launch
         self._chromium: Optional[Tuple[Any, Any]] = None  # (playwright, browser), shared by every page of the run
         # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
         self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
         self.counts: Dict[str, int] = dict.fromkeys(
-            ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8"), 0
+            ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8",
+             "reader_crashes", "reader_timeouts"), 0
         )
+        self._readers = ReaderPool(self.counts)
+        # Module-level functions, as a worker process must import them. Tests swap in readers that crash or hang.
+        self.read_html, self.read_pdf = read_html, pdf_text
 
     async def __aenter__(self) -> "HarvesterCascade":
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        if self._chromium is not None:
-            await self._discard(self._chromium[1])
-        if self._owned is not None:
-            await self._owned.aclose()
-            self._owned = None
+        try:
+            if self._chromium is not None:
+                await self._discard(self._chromium[1])
+            if self._owned is not None:
+                await self._owned.aclose()
+                self._owned = None
+        finally:
+            self._readers.close()
 
     def _http_client(self) -> httpx.AsyncClient:
         if self._client is not None:
@@ -345,6 +296,9 @@ class HarvesterCascade:
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
             rendered = await self._browser(url, result.error_message, result.http_status, timeout, waited)
         if rendered.raw_payload:
+            # Links only: the browser gave the text. Without them the page is still stored.
+            with contextlib.suppress(Exception), timed(self.timings, "extract_html"):
+                rendered.links = (await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url))[2]
             return rendered
         # The browser got nothing. Keep what the plain request was served.
         result.error_message = rendered.error_message
@@ -369,8 +323,8 @@ class HarvesterCascade:
             result.too_large_bytes = size
             return result, False
 
-        def served(text: Optional[str], tier: str, note: Optional[str] = None) -> ScrapeResult:
-            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type)
+        def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None) -> ScrapeResult:
+            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links)
 
         def undecoded(encoding: Optional[str]) -> Optional[str]:
             """Count a page read in a legacy encoding; the note when no encoding fit."""
@@ -379,28 +333,29 @@ class HarvesterCascade:
             return None if encoding else "text encoding not detected"
 
         if "json" in content_type.lower() or body.lstrip()[:1] in (b"{", b"["):
-            text, encoding = await asyncio.to_thread(decode, body, content_type)
+            try:
+                text, encoding = await self._readers.run(readers.HTML_SECONDS, decode, body, content_type)
+            except ReaderFailed as exc:
+                return served(None, "API", str(exc)), False
             return served(text, "API", undecoded(encoding)), False
         if "application/pdf" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".pdf"):
             try:
-                with timed(self.timings, "pdf_text"):  # includes waiting for the lock
-                    async with self._pdf_lock:
-                        text, note = await asyncio.to_thread(_pdf_text, body)
-            except Exception as exc:  # encrypted, damaged, or not a PDF at all
+                with timed(self.timings, "pdf_text"):  # the round trip to a reader process
+                    text, note = await self._readers.run(PDF_SECONDS + readers.MARGIN_SECONDS, self.read_pdf, body, PDF_SECONDS)
+            except Exception as exc:  # encrypted, damaged, not a PDF at all, or the reader crashed or hung
                 return served(None, "PDF", f"pdf not read: {exc}"), False
             return served(text, "PDF", note), False
-        note = None
         try:
-            with timed(self.timings, "extract_html"):  # includes decoding
-                text, encoding = await asyncio.to_thread(_html_text, body, content_type)
+            with timed(self.timings, "extract_html"):  # the round trip to a reader process: decoding, text and links
+                text, encoding, links = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
             note = undecoded(encoding)
-        except Exception:
-            text = None
+        except Exception as exc:  # the reader crashed or hung: the page is kept, without text or links, and not rendered
+            return served(None, "DOM_TRAFILATURA", f"html not read: {exc}"), False
         words = word_count(text or "")
         shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
         if (status == 200 and shell) or status in _BROWSER_RETRY_STATUS:
-            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words"), True
-        return served(text, "DOM_TRAFILATURA", note), False
+            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links), True
+        return served(text, "DOM_TRAFILATURA", note, links), False
 
     async def _browser(
         self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None, waited: Optional[Dict[str, float]] = None,

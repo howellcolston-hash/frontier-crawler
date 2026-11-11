@@ -1,7 +1,8 @@
 """Fetch and store, then judge.
 
 Fetching (Engine.fetch): fetch a target and write one row per attempt to the fetches table,
-with where it came from and the bytes served. Nothing here waits on a model: a document is
+with where it came from; new bytes go to the bodies table, once per content hash across runs, and
+a stored HTML page's links to the links table. Nothing here waits on a model: a document is
 stored before anything judges it.
 Judging (Engine.judge when a Jev client is given, or later through Engine.judge_days): ask Jev
 the configured questions (judge/questions.py) about each new document and store every answer.
@@ -13,7 +14,7 @@ Judging can be re-run; fetching is never repeated for it.
 Input contract:
     engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
     await engine.start()
-    row = await engine.fetch(target)         # fetched, buffered and counted; or, a batch at a time:
+    row = await engine.fetch(target)         # fetched, buffered and counted (row["links"]: see fetch); or, a batch at a time:
     answers = await engine.judge(row)        #   await engine.run(targets, observer), which does both
     await engine.flush()                     # uploads full or old buffers; call it now and then
     stats = await engine.finish(extra_files) # final upload: tables, state and extra files in one commit
@@ -39,13 +40,16 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 import pyarrow.parquet as pq
 
 from frontier_crawler.harvester.cascade import MIN_WORDS as THIN_HTML_WORDS, ScrapeResult, Target, timed
+from frontier_crawler.harvester.readers import ReaderPool
 from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.questions import Question, relevance
 from frontier_crawler import ocr
-from frontier_crawler.storage.shards import ANSWER_SCHEMA, CALL_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, OCR_SCHEMA, ShardWriter, day_folder
-from frontier_crawler.storage.state import UrlState, load_spend, save_spend
+from frontier_crawler.storage.shards import (
+    ANSWER_SCHEMA, BODY_SCHEMA, CALL_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, HEAVY_LEVEL, LINK_SCHEMA, OCR_SCHEMA, ShardWriter, bodies_of, day_folder,
+)
+from frontier_crawler.storage.state import BodyHashes, UrlState, load_spend, save_spend
 from frontier_crawler.storage.store import Store
 
 logger = logging.getLogger("frontier_crawler.pipeline")
@@ -66,6 +70,9 @@ _MAX_REJECTIONS = 3
 _MIN_FORECAST_PAGES = 500
 # Top-level key in the spend file for that count. The file's other keys are months ("2026-11").
 FORECAST_KEY = "judgeable_pages_last_crawl_run"
+# PROVISIONAL: a scan's reader process is killed after this long: past read_scan's own limit, which the page in
+# progress can overrun by its two Tesseract calls of up to 120 s each.
+_OCR_LIMIT_S = ocr.OCR_SECONDS + 300.0
 # Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
 _UPLOAD_EVERY_S = 600.0
 
@@ -155,6 +162,8 @@ class Engine:
         self._month = started.strftime("%Y-%m")
         self._writers: Dict[Tuple[str, dt.date], ShardWriter] = {}
         self._unsent: List[Tuple[Path, str]] = []   # shards written but not yet uploaded: kept for the next upload
+        self._unsent_bodies: List[str] = []         # the hashes in those shards' bodies
+        self._bodies_written: set = set()           # hashes given to the bodies writer in this run
         self._flush_lock = asyncio.Lock()
         self._last_upload = time.monotonic()
         self._seen: Dict[str, str] = {}
@@ -175,10 +184,13 @@ class Engine:
             "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
             "not_sampled": 0, "jev_sample_rate": 1.0,
             "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
+            "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
+            "links_written": 0, "reader_crashes": 0, "reader_timeouts": 0,
         }
 
     async def start(self) -> None:
         self._state = await asyncio.to_thread(UrlState.load, self._store, self._workdir)
+        self._hashes = await asyncio.to_thread(BodyHashes.load, self._store, self._workdir)
         self._spend = await asyncio.to_thread(load_spend, self._store, self._workdir)
         month = self._spend.setdefault(self._month, {"input_tokens": 0, "calls": 0})
         self.stats["jev_usd_month"] = round(month["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 4)
@@ -197,38 +209,54 @@ class Engine:
     def _writer(self, table: str, day: dt.date) -> ShardWriter:
         key = (table, day)
         if key not in self._writers:
-            schema = {"fetches": FETCH_SCHEMA, "judgement_calls": CALL_SCHEMA, "judgements": ANSWER_SCHEMA, "ocr_text": OCR_SCHEMA}[table]
-            self._writers[key] = ShardWriter(table, schema, self.run_id, day, self._workdir)
+            schema = {"fetches": FETCH_SCHEMA, "bodies": BODY_SCHEMA, "links": LINK_SCHEMA, "judgement_calls": CALL_SCHEMA,
+                      "judgements": ANSWER_SCHEMA, "ocr_text": OCR_SCHEMA}[table]
+            level = HEAVY_LEVEL if table in ("bodies", "links") else None
+            self._writers[key] = ShardWriter(table, schema, self.run_id, day, self._workdir, level=level)
         return self._writers[key]
+
+    async def _cut(self, force: bool) -> None:
+        """Write full buffers (all of them when forced) to shards, which wait in _unsent for the next upload."""
+        fetches_cut = False
+        for (table, _), writer in sorted(self._writers.items(), key=lambda item: item[0][0] != "fetches"):
+            # Bodies are cut whenever fetch rows are, so a fetch row never goes up without its bytes.
+            batch = writer.take(force or (fetches_cut and table == "bodies"))
+            if batch is None:
+                continue
+            fetches_cut |= table == "fetches"
+            hashes = [row["sha256"] for row in batch[1]] if table == "bodies" else []
+            local, remote = await asyncio.to_thread(writer.write, batch)
+            self._unsent.append((local, remote))
+            self._unsent_bodies += hashes
+            self.stats["shard_bytes"][table] = self.stats["shard_bytes"].get(table, 0) + _size(local)
 
     async def flush(self, force: bool = False, extra: Sequence[Tuple[Path, str]] = ()) -> None:
         """Upload full buffers (all of them when forced or when the last upload is old), with any extra files, in one commit."""
         async with self._flush_lock:
             began = time.monotonic()
-            force = force or began - self._last_upload >= _UPLOAD_EVERY_S
+            await self._cut(force or began - self._last_upload >= _UPLOAD_EVERY_S)
             files = self._unsent
-            for writer in list(self._writers.values()):
-                batch = writer.take(force)
-                if batch is not None:
-                    local, remote = await asyncio.to_thread(writer.write, batch)
-                    files.append((local, remote))
-                    table = remote.split("/", 1)[0]
-                    self.stats["shard_bytes"][table] = self.stats["shard_bytes"].get(table, 0) + _size(local)
             if not files and not extra:
                 return
             # A failed upload leaves the shards in _unsent, so the next flush sends them: no row is lost.
             await asyncio.to_thread(self._store.put_many, files + list(extra), f"engine {self.run_id}: {len(files) + len(extra)} file(s)")
             self._unsent = []
+            self._hashes.add(self._unsent_bodies)
+            self._unsent_bodies = []
             self.stats["shards"] += [remote for _, remote in files]
             self._last_upload = time.monotonic()
             self._uploads += 1
             self._upload_seconds += self._last_upload - began
 
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
-        """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
+        """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row,
+        and the stored-hash set grows in the same commit as the last bodies, so it never names one the store lacks."""
         if self._judgeable_seen >= _MIN_FORECAST_PAGES:
             self._spend[FORECAST_KEY] = self._judgeable_seen
-        state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir)]
+        async with self._flush_lock:
+            await self._cut(force=True)
+        state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir),
+                       *self._hashes.save(self._workdir, self._unsent_bodies)]
         self.stats["state_bytes"] = {Path(remote).stem: _size(local) for local, remote in state_files + list(extra)}
         await self.flush(force=True, extra=state_files + list(extra))
         self._measure()
@@ -247,6 +275,8 @@ class Engine:
                 "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
                 "timeouts": {"connect": counts.get("connect_timeouts", 0), "read": counts.get("read_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
                 **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8")},
+                # Pages whose reader process died or hung: the fetcher's, and the OCR command's own.
+                **{key: self.stats[key] + counts.get(key, 0) for key in ("reader_crashes", "reader_timeouts")},
                 "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                         "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
                 # shortcut: ru_maxrss is KB on Linux only; macOS reports bytes
@@ -279,11 +309,12 @@ class Engine:
         return timed(self._slot, key)
 
     async def fetch(self, target: Target, **limits: float) -> Dict[str, Any]:
-        """Fetch one target, buffer its row and count it. Returns the row; row["timed_out"], not a stored
-        column, is set when nothing was served because of a timeout. limits (timeout=, connect=) go to the fetcher."""
+        """Fetch one target, buffer its row and count it. Returns the row with two keys that are not stored columns:
+        row["links"], (links, unparseable hrefs) of a stored HTML page as its reader found them, else None;
+        and row["timed_out"], set when nothing was served because of a timeout. limits (timeout=, connect=) go to the fetcher."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
-            row, scraped = await self._fetch_row(target, limits)
+            row, scraped, links = await self._fetch_row(target, limits)
         with contextlib.suppress(Exception):  # measuring must never break a fetch (tested)
             tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
             # Without the wait for the host's turn, which is politeness, not the page.
@@ -300,7 +331,9 @@ class Engine:
             self._judgeable_seen += 1
             if not self.sampled(row):
                 self.stats["not_sampled"] += 1
-        return {**row, "timed_out": True} if scraped is not None and scraped.timed_out else row
+        if scraped is not None and scraped.timed_out:
+            return {**row, "links": links, "timed_out": True}
+        return {**row, "links": links}
 
     def sampled(self, row: Dict[str, Any]) -> bool:
         """Whether judge() will ask Jev about this row: new readable content within the run's sample."""
@@ -313,8 +346,8 @@ class Engine:
             return None
         return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
 
-    async def _fetch_row(self, target: Target, limits: Dict[str, float]) -> Tuple[Dict[str, Any], Optional[ScrapeResult]]:
-        """(the row, what the fetcher returned: None when it raised)."""
+    async def _fetch_row(self, target: Target, limits: Dict[str, float]) -> Tuple[Dict[str, Any], Optional[ScrapeResult], Any]:
+        """(the row, what the fetcher returned: None when it raised, the page's links: see fetch)."""
         row: Dict[str, Any] = {
             "fetch_id": str(uuid.uuid4()),
             "run_id": self.run_id,
@@ -334,7 +367,7 @@ class Engine:
             scraped = await self._fetcher.fetch(target.url, **limits)
         except Exception as exc:
             logger.warning("fetch failed for %s: %s: %s", target.url, type(exc).__name__, exc)
-            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, None
+            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, None, None
         when = self._now()
         body = scraped.raw_payload or b""
         row.update(
@@ -347,9 +380,9 @@ class Engine:
             }
         )
         if scraped.too_large_bytes is not None:
-            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}, scraped
+            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}, scraped, None
         if not body:
-            return {**row, "error": scraped.error_message or "nothing was served"}, scraped
+            return {**row, "error": scraped.error_message or "nothing was served"}, scraped, None
         text = scraped.markdown_content or ""
         digest = hashlib.sha256(body).hexdigest()
         key = row["url_final"]
@@ -373,8 +406,10 @@ class Engine:
                 "tier_note": scraped.error_message,
             }
         )
+        links = None
         if outcome == "stored":
-            row["body"] = body
+            self._keep_body(row, body)
+            links = self._links(row, scraped.links)
             self.stats["stored_bytes"] += len(body)
             tier = scraped.tier_used
             self.stats["stored_by_tier"][tier] = self.stats["stored_by_tier"].get(tier, 0) + 1
@@ -385,7 +420,32 @@ class Engine:
             sizes = self.stats["bytes_by_tier"].setdefault(tier, {"body": 0, "text": 0})
             sizes["body"] += len(body)
             sizes["text"] += len(text.encode("utf-8"))
-        return row, scraped
+        return row, scraped, links
+
+    def _keep_body(self, row: Dict[str, Any], body: bytes) -> None:
+        """Buffer the bytes for the bodies table, unless a body with their hash is stored already, in this run or before."""
+        digest = row["sha256"]
+        if digest in self._bodies_written or digest in self._hashes:
+            self.stats["bodies_already_stored"] += 1
+            self.stats["bodies_already_stored_bytes"] += len(body)
+            return
+        self._bodies_written.add(digest)
+        self._writer("bodies", self._day).add({
+            "sha256": digest, "size_bytes": len(body), "content_type": row["content_type"], "tier_used": row["tier_used"],
+            "body": body, "first_fetch_id": row["fetch_id"], "stored_at": row["fetched_at"],
+        })
+        self.stats["bodies_written"] += 1
+        self.stats["bodies_written_bytes"] += len(body)
+
+    def _links(self, row: Dict[str, Any], links: Any) -> Any:
+        """Write a stored HTML page's links, as the fetcher's reader found them, to the links table; hand them on for the queue."""
+        if links is None:
+            return None
+        writer = self._writer("links", self._day)
+        for position, (url, anchor) in enumerate(links[0]):
+            writer.add({"fetch_id": row["fetch_id"], "url": url, "anchor": anchor or None, "position": position})
+        self.stats["links_written"] += len(links[0])
+        return links
 
     # ------------------------------------------------------------ judging
 
@@ -484,19 +544,30 @@ class Engine:
         Stops starting new scans after max_minutes; scans already read are skipped by the next run.
         """
         deadline = None if max_minutes is None else time.monotonic() + max_minutes * 60
+        readers = ReaderPool(self.stats, workers=1)
+        try:
+            await self._ocr_days(days, deadline, readers)
+        finally:
+            readers.close()
+
+    async def _ocr_days(self, days: Sequence[dt.date], deadline: Optional[float], readers: ReaderPool) -> None:
         for day in days:
             done = {row["fetch_id"] for row in await self._read_day("ocr_text", day, ["fetch_id"])}
             columns = ["fetch_id", "sha256", "outcome", "tier_used", "word_count", "body"]
-            for row in await self._read_day("fetches", day, columns):
-                if row["outcome"] != "stored" or row["tier_used"] != "PDF" or row["fetch_id"] in done:
-                    continue
-                if (row["word_count"] or 0) >= ocr.SCAN_MAX_WORDS:
-                    continue
+            scans = [row for row in await self._read_day("fetches", day, columns)
+                     if row["outcome"] == "stored" and row["tier_used"] == "PDF" and row["fetch_id"] not in done
+                     and (row["word_count"] or 0) < ocr.SCAN_MAX_WORDS]
+            found = bodies_of(self._store, self._workdir, scans, day)
+            while (item := await asyncio.to_thread(next, found, None)) is not None:
                 if deadline is not None and time.monotonic() >= deadline:
                     self.stats["stopped_by"] = "max_minutes"
                     return
+                row, body = item
+                if body is None:
+                    logger.warning("no stored body for %s", row["fetch_id"])
+                    continue
                 try:
-                    text, pages_read, pages_total, langs = await asyncio.to_thread(ocr.read_scan, row["body"])
+                    text, pages_read, pages_total, langs = await readers.run(_OCR_LIMIT_S, ocr.read_scan, body)
                 except Exception as exc:
                     logger.warning("scan not read for %s: %s: %s", row["fetch_id"], type(exc).__name__, exc)
                     continue

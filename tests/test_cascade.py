@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from frontier_crawler.harvester import cascade as cascade_module
+from frontier_crawler.harvester import readers
 from frontier_crawler.harvester.cascade import BlockedAddress, HarvesterCascade, ScrapeResult, check_public
 
 WORDS = "The port authority published the berth schedule and the tariff for bulk cargo. " * 15
@@ -17,18 +18,22 @@ WORDS = "The port authority published the berth schedule and the tariff for bulk
 PDF = base64.b64decode("JVBERi0xLjMKJZOMi54gUmVwb3J0TGFiIEdlbmVyYXRlZCBQREYgZG9jdW1lbnQgKG9wZW5zb3VyY2UpCjEgMCBvYmoKPDwKL0YxIDIgMCBSCj4+CmVuZG9iagoyIDAgb2JqCjw8Ci9CYXNlRm9udCAvSGVsdmV0aWNhIC9FbmNvZGluZyAvV2luQW5zaUVuY29kaW5nIC9OYW1lIC9GMSAvU3VidHlwZSAvVHlwZTEgL1R5cGUgL0ZvbnQKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL0NvbnRlbnRzIDkgMCBSIC9NZWRpYUJveCBbIDAgMCA1OTUuMjc1NiA4NDEuODg5OCBdIC9QYXJlbnQgOCAwIFIgL1Jlc291cmNlcyA8PAovRm9udCAxIDAgUiAvUHJvY1NldCBbIC9QREYgL1RleHQgL0ltYWdlQiAvSW1hZ2VDIC9JbWFnZUkgXQo+PiAvUm90YXRlIDAgL1RyYW5zIDw8Cgo+PiAKICAvVHlwZSAvUGFnZQo+PgplbmRvYmoKNCAwIG9iago8PAovQ29udGVudHMgMTAgMCBSIC9NZWRpYUJveCBbIDAgMCA1OTUuMjc1NiA4NDEuODg5OCBdIC9QYXJlbnQgOCAwIFIgL1Jlc291cmNlcyA8PAovRm9udCAxIDAgUiAvUHJvY1NldCBbIC9QREYgL1RleHQgL0ltYWdlQiAvSW1hZ2VDIC9JbWFnZUkgXQo+PiAvUm90YXRlIDAgL1RyYW5zIDw8Cgo+PiAKICAvVHlwZSAvUGFnZQo+PgplbmRvYmoKNSAwIG9iago8PAovQ29udGVudHMgMTEgMCBSIC9NZWRpYUJveCBbIDAgMCA1OTUuMjc1NiA4NDEuODg5OCBdIC9QYXJlbnQgOCAwIFIgL1Jlc291cmNlcyA8PAovRm9udCAxIDAgUiAvUHJvY1NldCBbIC9QREYgL1RleHQgL0ltYWdlQiAvSW1hZ2VDIC9JbWFnZUkgXQo+PiAvUm90YXRlIDAgL1RyYW5zIDw8Cgo+PiAKICAvVHlwZSAvUGFnZQo+PgplbmRvYmoKNiAwIG9iago8PAovUGFnZU1vZGUgL1VzZU5vbmUgL1BhZ2VzIDggMCBSIC9UeXBlIC9DYXRhbG9nCj4+CmVuZG9iago3IDAgb2JqCjw8Ci9BdXRob3IgKGFub255bW91cykgL0NyZWF0aW9uRGF0ZSAoRDoyMDI2MTEwOTIxMDYxNy0wNScwMCcpIC9DcmVhdG9yIChhbm9ueW1vdXMpIC9LZXl3b3JkcyAoKSAvTW9kRGF0ZSAoRDoyMDI2MTEwOTIxMDYxNy0wNScwMCcpIC9Qcm9kdWNlciAoUmVwb3J0TGFiIFBERiBMaWJyYXJ5IC0gXChvcGVuc291cmNlXCkpIAogIC9TdWJqZWN0ICh1bnNwZWNpZmllZCkgL1RpdGxlICh1bnRpdGxlZCkgL1RyYXBwZWQgL0ZhbHNlCj4+CmVuZG9iago4IDAgb2JqCjw8Ci9Db3VudCAzIC9LaWRzIFsgMyAwIFIgNCAwIFIgNSAwIFIgXSAvVHlwZSAvUGFnZXMKPj4KZW5kb2JqCjkgMCBvYmoKPDwKL0ZpbHRlciBbIC9BU0NJSTg1RGVjb2RlIC9GbGF0ZURlY29kZSBdIC9MZW5ndGggMTQ2Cj4+CnN0cmVhbQpHYXBBMDBhW3Q6JjQiV2w6W3EpYz0+Uy47SyZxbUQ9TyUoOioxKUpMTG5yR0lNZGw6WWB0bmRYcSkmblNRMGhHMSFQS1tlNUdEZCNnPEtJYV9ERXFVIUExQkpuU1BCRz88Xi9vZk1TcWU/YiM5MFNyRGJLXiJKKj9nIjVlTnJaXnVNb1MuN3Q+SWtAJlIzRE1+PmVuZHN0cmVhbQplbmRvYmoKMTAgMCBvYmoKPDwKL0ZpbHRlciBbIC9BU0NJSTg1RGVjb2RlIC9GbGF0ZURlY29kZSBdIC9MZW5ndGggMTQ2Cj4+CnN0cmVhbQpHYXBBMDBhW3Q6JjQiV2w6W3EpYz0+Uy47SyZxbUQ9TyUoOioxKUpMTG5yR0lNZGw6WWB0bmRYcSkmblNRMGhHMSFQS1tlNUdEZCNnPEtJYV9ERXFVIUExQkpuU1BCRz88XjBabG1VUG4wQUxWKDpXRHNhaFghUzBsdF5sN0lqK2IvXXFMcWFRTDRrNGdgY1t+PmVuZHN0cmVhbQplbmRvYmoKMTEgMCBvYmoKPDwKL0ZpbHRlciBbIC9BU0NJSTg1RGVjb2RlIC9GbGF0ZURlY29kZSBdIC9MZW5ndGggMTQ2Cj4+CnN0cmVhbQpHYXBBMDBhW3Q6JjQiV2w6W3EpYz0+T0FvXy9fdF0vRVsoLSoxKUpMTG5yR0lNZGw6WWB0bmRYcSkmblNQak0+MExnSDQ7KzQpZUttM19jVkA+cC4iVFM6cDFJVHBUQmY5VlU0R0VoSUkoW2E7Ty1ZJUdJaFghUzBsdF5tanJaXyZPb1MuN3Q+SWtAJyshTF5+PmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDEyCjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDA2MSAwMDAwMCBuIAowMDAwMDAwMDkyIDAwMDAwIG4gCjAwMDAwMDAxOTkgMDAwMDAgbiAKMDAwMDAwMDQwMiAwMDAwMCBuIAowMDAwMDAwNjA2IDAwMDAwIG4gCjAwMDAwMDA4MTAgMDAwMDAgbiAKMDAwMDAwMDg3OCAwMDAwMCBuIAowMDAwMDAxMTM5IDAwMDAwIG4gCjAwMDAwMDEyMTAgMDAwMDAgbiAKMDAwMDAwMTQ0NiAwMDAwMCBuIAowMDAwMDAxNjgzIDAwMDAwIG4gCnRyYWlsZXIKPDwKL0lEIApbPDkxMjc5NDkxYjgzNzJhZGRmZjc4NGJiMmZlZmFlMTMwPjw5MTI3OTQ5MWI4MzcyYWRkZmY3ODRiYjJmZWZhZTEzMD5dCiUgUmVwb3J0TGFiIGdlbmVyYXRlZCBQREYgZG9jdW1lbnQgLS0gZGlnZXN0IChvcGVuc291cmNlKQoKL0luZm8gNyAwIFIKL1Jvb3QgNiAwIFIKL1NpemUgMTIKPj4Kc3RhcnR4cmVmCjE5MjAKJSVFT0YK")
 
 
-def _fetch(handler: Any, url: str = "https://a.test/x", browser: Optional[List[str]] = None, monkeypatch: Any = None) -> ScrapeResult:
-    """Fetch through a fake server. When `browser` is a list, the browser tier is replaced and records its calls."""
+def _fetch(handler: Any, url: str = "https://a.test/x", browser: Optional[List[str]] = None, monkeypatch: Any = None,
+           reader: Any = None) -> ScrapeResult:
+    """Fetch through a fake server. When `browser` is a list, the browser tier is replaced and records its calls.
+    reader replaces the HTML reader (a module-level function: it runs in a worker process)."""
 
     async def run() -> ScrapeResult:
-        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-        if browser is not None:
-            async def fake_browser(url: str, prior_note: Optional[str], prior_status: int, *_: Any) -> ScrapeResult:
-                browser.append(url)
-                return ScrapeResult(url, 0, b"", None, 0, "HEADLESS_PLAYWRIGHT", "browser got nothing")
+        async with HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(handler))) as fetcher:
+            if browser is not None:
+                async def fake_browser(url: str, prior_note: Optional[str], prior_status: int, *_: Any) -> ScrapeResult:
+                    browser.append(url)
+                    return ScrapeResult(url, 0, b"", None, 0, "HEADLESS_PLAYWRIGHT", "browser got nothing")
 
-            monkeypatch.setattr(fetcher, "_browser", fake_browser)
-        return await fetcher.fetch(url)
+                monkeypatch.setattr(fetcher, "_browser", fake_browser)
+            if reader is not None:
+                fetcher.read_html = reader
+            return await fetcher.fetch(url)
 
     return asyncio.run(run())
 
@@ -103,12 +108,19 @@ def test_a_bogus_or_wrong_declared_charset_falls_back_to_detection() -> None:
         assert sentence[:12] in result.markdown_content and result.raw_payload == body
 
 
+def _no_encoding_fits(body: bytes, content_type: str, url: str) -> Any:
+    """read_html as it answers when no encoding fits. Module level, so a worker process can import it."""
+    text, _, links = readers.read_html(body, content_type, url)
+    return text, None, links
+
+
 def test_bytes_no_encoding_fits_are_read_as_utf8_with_a_note(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cascade_module, "detect_encoding", lambda body: ["no-such-charset"])
     body = b"<html><body><p>" + b"word \xff " * 200 + b"</p></body></html>"
-    result = _fetch(lambda request: httpx.Response(200, content=body, headers={"content-type": "text/html; charset=bogus"}))
-    assert result.word_count >= 150 and "\ufffd" in result.markdown_content and result.raw_payload == body
-    assert result.error_message == "text encoding not detected"
+    monkeypatch.setattr(readers, "detect_encoding", lambda body: ["no-such-charset"])
+    text, encoding = readers.decode(body, "text/html; charset=bogus")
+    assert encoding is None and "\ufffd" in text
+    result = _fetch(lambda request: httpx.Response(200, content=body, headers={"content-type": "text/html; charset=bogus"}), reader=_no_encoding_fits)
+    assert result.word_count >= 150 and result.raw_payload == body and result.error_message == "text encoding not detected"
 
 
 def test_a_utf8_page_is_unchanged_whatever_it_declares() -> None:
@@ -208,7 +220,7 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
     fetcher = asyncio.run(run())
     assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
     assert fetcher.counts == {"connect_timeouts": 0, "read_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0,
-                              "browser_relaunches": 0, "decoded_non_utf8": 0}
+                              "browser_relaunches": 0, "decoded_non_utf8": 0, "reader_crashes": 0, "reader_timeouts": 0}
 
 
 def test_a_timeout_is_flagged_and_one_call_can_ask_for_longer_limits() -> None:
