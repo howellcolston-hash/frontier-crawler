@@ -10,16 +10,18 @@ If fetching it yields content, that site becomes a new line and the parent line 
 A new line starts at its parent's yield x HOP_DECAY, one step from the line that found it,
 and earns its own yield from there: a branch is not handed full strength for being new.
 
-Freezing. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
+Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
 new content Jev does not read (structured data, a scan with no text, a very short page), 0 for
 a dead link, a duplicate, an unchanged page or a refusal. A page Jev would read but does not
 (out of the sample, no key, the ceiling, an outage, a judgement abandoned at the end of a run)
 counts at the line's relevance: the running mean of the relevance of its judged pages. Leaving
 it out instead would let the zeros outweigh the judged pages by one over the sample rate. A
-page whose judgement is still coming leaves the yield until it arrives. A line whose yield stays under
-FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is frozen: its queue is kept and nothing in
-it is fetched. A frozen line thaws when other lines link into it THAW_INBOUND times. Growth is
-bounded by the fetches per run, so lines compete for a fixed capacity.
+page whose judgement is still coming leaves the yield until it arrives. Priority carries the yield, so a
+line that stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
+data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT of the way
+toward that line's (only upward, and only on the first link from that line into it in a run), and every 1/RETEST_SHARE-th take() fetches the
+best entry of a group drawn at random, so cold groups are tried again. Growth is bounded by the fetches per
+run, so lines compete for a fixed capacity.
 
     priority = seed weight x base x HOP_DECAY^hops x line yield
                / (1 + fetched from this host / HOST_HALF)
@@ -41,7 +43,7 @@ Input contract:
     picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
     # or in two phases, so nothing waits on Jev: frontier.expect_judgement(fetch_id, line_id), mark and add_links with
-    # answers None, then frontier.judged(fetch_id, answers or None, now) when the judgement arrives
+    # answers None, then frontier.judged(fetch_id, answers or None) when the judgement arrives
     files = frontier.save(workdir)          # upload with store.put_many
     stats = await crawl(store, engine, seeds, workdir=..., max_fetches=...)
 Every constant below is PROVISIONAL.
@@ -57,6 +59,7 @@ import heapq
 import json
 import logging
 import math
+import random
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -80,10 +83,9 @@ MIN_LINK_BASE = 0.05
 HOST_HALF = 25.0                # fetches from one host at which its priority halves
 LINE_HALF = 100.0               # fetches in one line at which its priority halves
 YIELD_ALPHA = 0.15              # weight of the newest fetch in a line's running yield
-FREEZE_YIELD = 0.1              # a line is frozen when its running yield falls below this
-MIN_FETCHES_TO_FREEZE = 10      # ... and it has had at least this many fetches (since any thaw)
-THAW_INBOUND = 3                # links into a frozen line from other lines that thaw it
-THAW_YIELD = 0.5                # the running yield a thawed line restarts with
+INBOUND_LIFT = 0.05             # share of the gap a link from a better line closes on the yield of the line it links into
+RETEST_SHARE = 0.02             # share of take() calls spent on a group drawn at random
+RETEST_DRAWS = 5                # draws a re-test makes past blocked groups before it falls back to the ranked take
 NEW_HOST_SHARE = 0.2            # part of each round kept for hosts never fetched before
 HOST_ROUND_SHARE = 0.1          # most of one round that one host may take (at least 2)
 MAX_LINKS_PER_PAGE = 300
@@ -137,12 +139,9 @@ _LINES_SCHEMA = pa.schema(
         ("created_at", _TS),
         ("fetches", pa.int64()),
         ("content", pa.int64()),   # fetches that brought something new
-        ("since_thaw", pa.int64()),
         ("yield", pa.float64()),
         ("relevance", pa.float64()),  # running mean of Jev's relevance for its judged pages, at YIELD_ALPHA
-        ("status", pa.string()),  # active | frozen
-        ("frozen_at", _TS),
-        ("inbound", pa.int64()),  # links from other lines since it was frozen
+        ("inbound", pa.int64()),  # lifts received from links in other lines
     ]
 )
 
@@ -287,12 +286,13 @@ class _Group:
     """The queued entries that share a line, a host and a seed, and so every factor of priority() but the static one.
     members are kept best first: static score down, then url."""
 
-    __slots__ = ("line", "host", "seed", "weight", "members", "version")
+    __slots__ = ("line", "host", "seed", "weight", "members", "version", "slot")
 
     def __init__(self, line: str, host: str, seed: str, weight: float) -> None:
         self.line, self.host, self.seed, self.weight = line, host, seed, weight
         self.members: List[Dict[str, Any]] = []
         self.version = 0
+        self.slot = -1   # its place in Frontier._filled while it has members
 
     def key(self, entry: Dict[str, Any]) -> Tuple[float, str]:
         return -_static(entry, self.weight), entry["url"]
@@ -304,17 +304,19 @@ class Frontier:
         entries: Optional[List[Dict[str, Any]]] = None,
         hosts: Optional[List[Dict[str, Any]]] = None,
         lines: Optional[List[Dict[str, Any]]] = None,
+        rng_seed: Any = 0,
     ) -> None:
         self._entries: Dict[str, Dict[str, Any]] = {entry["url"]: entry for entry in (entries or [])}
         self._hosts: Dict[str, Dict[str, int]] = {
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
         }
+        # Lines saved before 2026-11-11 may carry status "frozen", since_thaw and frozen_at: every line is active, and those are dropped on save.
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
         # One-time catch-up for lines spawned before 2026-11-11 at full strength and not fetched since:
         # they start one hop below their parent, as new lines do now. Oldest first, so parents settle first.
         for line in sorted(self._lines.values(), key=lambda l: l["created_at"]):
             parent = self._lines.get(line.get("parent_line") or "")
-            if parent is not None and line["since_thaw"] == 0 and line["yield"] == 1.0:
+            if parent is not None and line["fetches"] == 0 and line["yield"] == 1.0:
                 line["yield"] = parent["yield"] * HOP_DECAY
         for line in self._lines.values():
             if line.get("relevance") is None:   # lines saved before 2026-11-11 have none: their yield is the best guess
@@ -331,7 +333,6 @@ class Frontier:
         self._version = 0
         self._crossing: Dict[str, List[Dict[str, Any]]] = {}  # host -> its entries still marked crossing, any status
         self._statuses = Counter(entry["status"] for entry in self._entries.values())
-        self._line_statuses = Counter(line["status"] for line in self._lines.values())
         self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line) of each entry out with take()
         self._flight_host: Dict[str, int] = {}
         self._flight_line: Dict[str, int] = {}
@@ -356,24 +357,30 @@ class Frontier:
             elif entry["host"]:
                 self._host_line.setdefault(entry["host"], entry["line_id"])
         self._seq = len(self._entries)
-        for group in self._groups.values():
+        # The groups with members, each at its slot, so a re-test draws one uniformly without scanning them.
+        self._filled: List[_Group] = list(self._groups.values())
+        for slot, group in enumerate(self._filled):
+            group.slot = slot
             if len(group.members) > 1:
                 group.members.sort(key=group.key)
+        self._rng = random.Random(rng_seed)
+        self.retests: set = set()   # urls taken as re-tests in this run
         # What the queue declined to take in this run, by reason. Reported in the run summary.
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
-        self.frozen = 0
-        self.thawed = 0
+        self.lifts = 0
+        self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
+        self.lines_lifted: set = set()
 
     # ------------------------------------------------------------ persistence
 
     @classmethod
-    def load(cls, store: Store, workdir: Path) -> "Frontier":
+    def load(cls, store: Store, workdir: Path, rng_seed: Any = 0) -> "Frontier":
         tables: List[List[Dict[str, Any]]] = []
         for remote in (FRONTIER_PATH, HOSTS_PATH, LINES_PATH):
             local = Path(workdir) / "state-in" / remote.rsplit("/", 1)[1]
             tables.append(pq.read_table(local).to_pylist() if store.get(remote, local) else [])
-        return cls(*tables)
+        return cls(*tables, rng_seed=rng_seed)
 
     def save(self, workdir: Path) -> List[Tuple[Path, str]]:
         out = Path(workdir) / "state-out"
@@ -405,9 +412,6 @@ class Frontier:
     def count(self, status: str) -> int:
         return self._statuses[status]
 
-    def count_lines(self, status: str) -> int:
-        return self._line_statuses[status]
-
     def priority(self, entry: Dict[str, Any], weight: float, extra_host: int = 0, extra_line: int = 0) -> float:
         line = self._lines[entry["line_id"]]
         held_host = self._hosts.get(entry["host"], {}).get("fetches", 0) + extra_host
@@ -424,48 +428,45 @@ class Frontier:
     ) -> Dict[str, Any]:
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": root_url, "created_at": now,
-            "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "relevance": 1.0, "status": "active", "frozen_at": None, "inbound": 0,
+            "fetches": 0, "content": 0, "yield": start_yield, "relevance": 1.0, "inbound": 0,
         }
         self._lines[line_id] = line
-        self._line_statuses["active"] += 1
         return line
 
-    def _record_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
+    def _record_yield(self, line: Dict[str, Any], value: Optional[float]) -> None:
         """value None: new content whose judgement is still coming. It counts as content and leaves the yield where it was."""
         line["fetches"] += 1
         line["content"] += value is None or value > 0
-        line["since_thaw"] += 1
-        self._move_yield(line, value, now)
+        self._move_yield(line, value)
 
-    def _move_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
-        """One step of the line's running yield toward value (none for None), then freeze it if it stopped paying."""
+    def _move_yield(self, line: Dict[str, Any], value: Optional[float]) -> None:
+        """One step of the line's running yield toward value (none for None)."""
         if value is not None:
-            before = line["yield"]
-            line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
-            if line["yield"] > before:
-                self._push_all(self._groups_by_line.get(line["line_id"], ()))
-        if line["status"] == "active" and line["since_thaw"] >= MIN_FETCHES_TO_FREEZE and line["yield"] < FREEZE_YIELD:
-            line["status"] = "frozen"
-            self._line_statuses.update({"active": -1, "frozen": 1})
-            line["frozen_at"] = now
-            line["inbound"] = 0
-            self.frozen += 1
+            self._set_yield(line, (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value)
+
+    def _set_yield(self, line: Dict[str, Any], value: float) -> None:
+        """A rise re-ranks the line's groups; a fall is left for _top() to re-score."""
+        before, line["yield"] = line["yield"], value
+        if value > before:
+            self._push_all(self._groups_by_line.get(line["line_id"], ()))
 
     @staticmethod
     def _note_relevance(line: Dict[str, Any], value: float) -> None:
         line["relevance"] = (1.0 - YIELD_ALPHA) * line["relevance"] + YIELD_ALPHA * value
 
-    def _note_inbound(self, target: Dict[str, Any], from_line: str) -> None:
-        """Another line linked to a URL of this line. Enough of these thaw a frozen line."""
-        line = self._lines[target["line_id"]]
-        if line["status"] != "frozen" or from_line == line["line_id"] or target["status"] != "queued":
+    def _note_inbound(self, line_id: str, from_line: str) -> None:
+        """A page of from_line linked into line_id. The first such link in a run moves line_id's yield INBOUND_LIFT of the
+        way toward from_line's, if higher; later ones do nothing, so a much-linked site cannot be held up by the links alone."""
+        if (from_line, line_id) in self._linked:
             return
-        line["inbound"] += 1
-        if line["inbound"] >= THAW_INBOUND:
-            line.update({"status": "active", "frozen_at": None, "inbound": 0, "since_thaw": 0, "yield": THAW_YIELD})
-            self._line_statuses.update({"active": 1, "frozen": -1})
-            self.thawed += 1
-            self._push_all(self._groups_by_line.get(line["line_id"], ()))
+        self._linked.add((from_line, line_id))
+        line = self._lines[line_id]
+        gap = self._lines[from_line]["yield"] - line["yield"]
+        if gap > 0:
+            self._set_yield(line, line["yield"] + INBOUND_LIFT * gap)
+            line["inbound"] += 1
+            self.lifts += 1
+            self.lines_lifted.add(line_id)
 
     def _spawn(self, entry: Dict[str, Any], now: dt.datetime) -> None:
         """A crossing link yielded content: its site becomes a line, and the queued links to that site move into it."""
@@ -563,12 +564,13 @@ class Frontier:
                 })
                 self.skipped["unparseable_link"] += 1
         for url, anchor in links:
-            known = self._entries.get(url)
-            if known is not None:
-                self._note_inbound(known, own_line)
-                continue
             host = urlsplit(url).netloc
             covering = self._host_line.get(host)
+            # A link into another line's site, queued, fetched or new: the host map knows its line either way.
+            if covering is not None and covering != own_line:
+                self._note_inbound(covering, own_line)
+            if url in self._entries:
+                continue
             if covering == own_line:
                 hops, line_id, crossing = entry["hops"] + 1, own_line, False
             elif covering is not None:
@@ -585,8 +587,6 @@ class Frontier:
                 added += 1
                 if awaited is not None:
                     awaited[1].append(url)
-                if covering is not None and covering != own_line:
-                    self._note_inbound(self._entries[url], own_line)
         return added
 
     # ------------------------------------------------------------ after a fetch
@@ -636,7 +636,7 @@ class Frontier:
             value = line["relevance"]   # Jev would read it but will not: it counts at what the line's judged pages were worth
         elif answers is not None and value is not None:
             self._note_relevance(line, value)
-        self._record_yield(line, value, now)
+        self._record_yield(line, value)
         if flight is not None and flight[1] != entry["line_id"]:
             self._push_all(self._groups_by_line.get(flight[1], ()))   # the line it was taken from has one fewer in flight
         if entry.get("crossing") and (value is None or value > 0):
@@ -653,7 +653,7 @@ class Frontier:
         called, and the links add_links() queues from it are remembered until then, to be re-scored."""
         self._judging[fetch_id] = (line_id, [])
 
-    def judged(self, fetch_id: str, answers: Optional[JevResult], now: dt.datetime) -> None:
+    def judged(self, fetch_id: str, answers: Optional[JevResult]) -> None:
         """The judgement of a page passed to expect_judgement(), or None when none will come. Moves the line's yield
         as mark() does (by the page's relevance, or by the line's when none came), and re-scores the links queued
         from it that are still waiting."""
@@ -662,11 +662,11 @@ class Frontier:
             return
         line = self._lines[line_id]
         if answers is None:
-            self._move_yield(line, line["relevance"], now)   # it will not be judged: it counts as mark() counts such a page
+            self._move_yield(line, line["relevance"])   # it will not be judged: it counts as mark() counts such a page
             return
         value = judged_yield(answers)
         self._note_relevance(line, value)
-        self._move_yield(line, value, now)
+        self._move_yield(line, value)
         base = link_base(answers)
         for url in urls:
             self.rebase(self._entries[url], base)
@@ -687,7 +687,7 @@ class Frontier:
     # Every factor of priority() but the static one is shared by a group (line, host, seed), so a group ranks by its best
     # entry, and the heaps hold one item per group. An item's score may be stale only by being too high: whatever lowers a
     # group (a fetch, an entry leaving, an entry in flight) is left for _top() to re-score, and whatever raises one (a
-    # line's yield rising, a thaw, an entry put back, a better entry joining) pushes a new item. Older items are skipped by
+    # line's yield rising, an entry put back, a better entry joining) pushes a new item. Older items are skipped by
     # their version.
 
     def _group(self, entry: Dict[str, Any]) -> _Group:
@@ -704,6 +704,9 @@ class Frontier:
         members = group.members
         i = bisect.bisect_left(members, group.key(entry), key=group.key)
         members.insert(i, entry)
+        if len(members) == 1:
+            group.slot = len(self._filled)
+            self._filled.append(group)
         if self._weights is not None and self._eligible(group):
             extras = self._extras(group)
             # A later entry can still lead: two static scores may round to one score, and then the url decides.
@@ -715,10 +718,14 @@ class Frontier:
         i = bisect.bisect_left(group.members, group.key(entry), key=group.key)
         assert group.members[i] is entry
         del group.members[i]
+        if not group.members:   # swap the last filled group into its slot
+            last = self._filled.pop()
+            if last is not group:
+                self._filled[group.slot], last.slot = last, group.slot
+            group.slot = -1
 
     def _eligible(self, group: _Group) -> bool:
-        line = self._lines.get(group.line)
-        return (bool(group.members) and group.seed in (self._weights or {}) and line is not None and line["status"] == "active"
+        return (bool(group.members) and group.seed in (self._weights or {}) and group.line in self._lines
                 and group.host not in self.cooled)
 
     def _never_fetched(self, host: str) -> bool:
@@ -800,7 +807,7 @@ class Frontier:
     # ------------------------------------------------------------ choosing
 
     def select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> List[Dict[str, Any]]:
-        """Up to n queued entries for the next round, from active lines, spread across hosts and lines.
+        """Up to n queued entries for the next round, from active seeds, spread across hosts and lines.
 
         The result is exactly that of scoring every queued entry and taking them through a lazily re-scored heap
         (tests/test_frontier.py keeps that version and checks this against it). Here a group stands in the heap for its
@@ -918,13 +925,24 @@ class Frontier:
     def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
         and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
-        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Before any of that, a page
+        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Every 1/RETEST_SHARE-th call
+        is a re-test: the best entry of a group drawn uniformly from the groups with queued entries, under the same
+        per-host limits; it falls back to the ranked take after RETEST_DRAWS blocked draws. Before any of that, a page
         waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are, and after it, when nothing else can
         be taken, with no such limit; its status is still "retry"."""
         entry = self.take_retry(seeds, today, MAX_RETRY_IN_FLIGHT)
         if entry is not None:
             return entry
         self._takes += 1
+        if self._takes % round(1 / RETEST_SHARE) == 0:
+            for _ in range(RETEST_DRAWS if self._filled else 0):
+                group = self._rng.choice(self._filled)
+                if self._eligible(group) and self._flight_host.get(group.host, 0) < MAX_IN_FLIGHT_PER_HOST:
+                    entry = self._best(group, *self._extras(group))[1]  # type: ignore[index]
+                    self.retests.add(entry["url"])
+                    self._dequeue(entry)
+                    self._hold(entry)
+                    return entry
         heaps = [(self._heap, False)]
         if self._takes % round(1 / NEW_HOST_SHARE) == 0:
             heaps.insert(0, (self._new_heap, True))
@@ -967,7 +985,7 @@ class Frontier:
             if entry["status"] != "queued" or seed not in weights:
                 continue
             queued[seed] += 1
-            if self._lines[entry["line_id"]]["status"] == "active" and entry["host"] not in self.cooled:
+            if entry["host"] not in self.cooled:
                 top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed]), 4))
         return queued, top
 
@@ -1026,7 +1044,7 @@ async def crawl(
     began = time.monotonic()
     seconds: Dict[str, float] = dict.fromkeys(("load_state", "take", "fetching", "judge_wait", "final_save"), 0.0)
     with timed(seconds, "load_state"):
-        frontier = Frontier.load(store, workdir)
+        frontier = Frontier.load(store, workdir, rng_seed=now().strftime("%Y-%m-%dT%H"))   # the run's start hour: re-tests reproducible
     by_id = {seed.id: seed for seed in seeds}
     retries_expired = frontier.expire_retries(now())
     seeds_added = frontier.add_seeds(seeds, now())
@@ -1035,6 +1053,11 @@ async def crawl(
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
+    # Re-test takes against ordinary ones, so the re-test share can be judged: pages taken, stored and judged, and relevance.
+    kinds = {kind: dict.fromkeys(("taken", "stored", "judged", "relevance"), 0) for kind in ("retest", "ordinary")}
+
+    def kind(url: str) -> Dict[str, Any]:
+        return kinds["retest" if url in frontier.retests else "ordinary"]
     judging: set = set()
     jev_slots = asyncio.Semaphore(JEV_SLOTS)
     stopped_by = "queue_empty"
@@ -1046,23 +1069,27 @@ async def crawl(
             frontier.expect_judgement(row["fetch_id"], entry["line_id"])
         frontier.mark(entry, row, None, now())
         links_added += frontier.add_links(entry, row, None, now())
+        kind(entry["url"])["stored"] += row["outcome"] == "stored"   # as the engine counts stored
         if row["outcome"] == "stored" and not row["block_marker"]:
             stored_by_seed[entry["seed_id"]] = stored_by_seed.get(entry["seed_id"], 0) + 1
         elif entry["parent_fetch_id"] is None:  # a seed's own starting URL
             reason = row.get("error") or row.get("block_marker") or row.get("tier_note") or ""
             seed_url_problems[entry["url"]] = f"{row['outcome']}, status {row['http_status']}: {reason}"[:300]
 
-    async def judge(row: Dict[str, Any]) -> None:
+    async def judge(row: Dict[str, Any], tally: Dict[str, Any]) -> None:
         """Phase 2, in its own task: the page's relevance and its links' scores."""
         answers = None
         try:
             async with jev_slots:
                 answers = await engine.judge(row)
+            if answers is not None:
+                tally["judged"] += 1
+                tally["relevance"] += judged_yield(answers)
         except Exception:
             logger.exception("judging failed; the page stays unjudged")
         finally:  # also when abandoned at the end of the run
             try:
-                frontier.judged(row["fetch_id"], answers, now())
+                frontier.judged(row["fetch_id"], answers)
                 portal = answers.nouls().get("data_portal", 0.0) if answers is not None else 0.0
                 if portal >= PORTAL_THRESHOLD:
                     data_portals[row["url_final"]] = round(portal, 2)
@@ -1084,7 +1111,7 @@ async def crawl(
                 counts["retries"] += 1
                 counts["retry_recovered"] += row["outcome"] in ("stored", "unchanged", "duplicate")
             if fetch_id is not None:
-                task = asyncio.create_task(judge({**row, "body": None}))  # the body is not needed to judge; free it with its shard
+                task = asyncio.create_task(judge({**row, "body": None}, kind(entry["url"])))  # the body is not needed to judge; free it with its shard
                 judging.add(task)
                 task.add_done_callback(judging.discard)
         except Exception:
@@ -1113,6 +1140,7 @@ async def crawl(
                     await asyncio.sleep(TAKE_WAIT_SECONDS)
                 continue
             counts["taken"] += entry["status"] != "retry"
+            kind(entry["url"])["taken"] += entry["status"] != "retry"
             counts["in_flight"] += 1
             counts["peak_in_flight"] = max(counts["peak_in_flight"], counts["in_flight"])
             try:
@@ -1170,8 +1198,10 @@ async def crawl(
         {
             "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
             "queued": frontier.count("queued"), "known_urls": len(frontier),
-            "lines_active": frontier.count_lines("active"), "lines_frozen": frontier.count_lines("frozen"),
-            "lines_spawned": frontier.spawned, "lines_thawed": frontier.thawed,
+            "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
+            "lines_lifted": len(frontier.lines_lifted),
+            **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
+                      "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
             "retries": counts["retries"], "retry_recovered": counts["retry_recovered"], "retries_expired": retries_expired,
             # Seed ids: these go to the private run record only. __main__ prints top-level numbers alone.

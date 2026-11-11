@@ -3,7 +3,7 @@
 A crawler that starts from a few seed pages, follows links outward on its own, stores every page it is served, and judges the pages afterwards.
 
 - **Store first, judge later.** Pages are saved before any model reads them. Each answer about a page is stored as a probability, so thresholds can change later without asking again.
-- **Lines, not a fixed list.** A site that yields content becomes its own line of the crawl. A line that stops paying freezes and keeps its queue; a link from elsewhere can thaw it. Priority falls with what is already held from a site, so the crawl spreads out instead of going deep on one place.
+- **Lines, not a fixed list.** A site that yields content becomes its own line of the crawl. A line that stops paying sinks and keeps its queue; links into it from better lines lift it, and a small share of fetches re-tests groups drawn at random. Priority falls with what is already held from a site, so the crawl spreads out instead of going deep on one place.
 - **Three ways to read a page**: plain HTTP, a headless browser when a page is built by script, and OCR (Tesseract) for scanned PDFs.
 - **Derived clients.** Where a page loads its figures from a backend, a small JSON spec can fetch that backend directly; a client whose replies change shape is reported as broken.
 - **One store.** Tables (Parquet), crawl state, configuration and run records live together in a Hugging Face dataset repository, or in a local folder.
