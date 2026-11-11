@@ -487,7 +487,7 @@ def test_a_run_records_where_its_time_and_bytes_went(tmp_path: Path) -> None:
     assert stats["shard_bytes"]["fetches"] > 0 and stats["shard_bytes"]["judgements"] > 0
     assert stats["state_bytes"]["url_state"] > 0 and stats["state_bytes"]["jev_spend"] > 0
     assert stats["jev"]["calls"] == 1 and stats["jev"]["ceiling_usd_today"] > 0 and stats["jev"]["seconds_mean"] >= 0
-    assert stats["timeouts"] == {"http": 0, "browser": 0} and stats["browser_launches"] == 0
+    assert stats["timeouts"] == {"connect": 0, "read": 0, "browser": 0} and stats["browser_launches"] == 0
     assert stats["peak_rss_mb"] > 0
     json.dumps(stats)   # the run record is JSON
 

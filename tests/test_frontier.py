@@ -206,7 +206,7 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
 
     first = go("r1", 2)
     assert first["total"] == 2 and first["links_added"] == 3 and first["queued"] == 3   # the broken link is skipped, not fatal
-    assert first["skipped"] == {"unparseable_link": 1, "hop_limit": 0, "host_queue_full": 0, "too_large": 0}
+    assert first["skipped"] == {"unparseable_link": 1, "hop_limit": 0, "host_queue_full": 0, "too_large": 0, "host_cooled": 0}
     assert sorted(site.fetched) == ["https://a.test/", "https://dead.test/"]
     assert first["stored_by_seed"] == {"a": 1, "dead": 0} and first["seeds_with_nothing"] == ["dead"]
     assert first["seed_url_problems"] == {"https://dead.test/": "error_page, status 404: http 404"}
@@ -407,6 +407,7 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
     queued = [
         entry for entry in self._entries.values()
         if entry["status"] == "queued" and entry["seed_id"] in weights and self._lines[entry["line_id"]]["status"] == "active"
+        and entry["host"] not in self.cooled   # hosts that served nothing COOL_AFTER times in a row in this run
     ]
     if n <= 0 or not queued:
         return []
@@ -463,6 +464,7 @@ def reference_take(frontier: Frontier, seeds: Sequence[Seed], today: dt.date, ne
         entry for entry in frontier._entries.values()
         if entry["status"] == "queued" and entry["url"] not in frontier._in_flight and entry["seed_id"] in weights
         and frontier._lines[entry["line_id"]]["status"] == "active" and out_host[entry["host"]] < MAX_IN_FLIGHT_PER_HOST
+        and entry["host"] not in frontier.cooled
     ]
     if new_turn:
         waiting = [entry for entry in waiting if frontier._hosts.get(entry["host"], {}).get("fetches", 0) == 0] or waiting
@@ -759,3 +761,23 @@ def test_a_retry_that_waits_too_long_is_failed() -> None:
     assert frontier.expire_retries(NOW) == 1 and frontier.count("retry") == 1 and frontier.count("failed") == 1
     assert frontier.entry("https://h0.test/")["status"] == "failed"
     assert frontier.take_retry(seeds, NOW.date())["url"] == "https://h1.test/" and frontier.take_retry(seeds, NOW.date()) is None
+
+
+def test_a_host_that_serves_nothing_three_times_in_a_row_is_left_alone_for_the_run() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i in range(6):
+        frontier._add(f"https://a.test/{i}", "s", "s", 1, 1.0, NOW)
+    for row in ({"outcome": "error"}, {"outcome": "error"}, _content(), {"outcome": "error"}, _timed_out()):
+        frontier.mark(frontier.take(seeds, NOW.date()), row, None, NOW)
+    assert frontier.cooled == set()                                   # a success in between clears the count
+    frontier.mark(frontier.take(seeds, NOW.date()), {"outcome": "error"}, None, NOW)
+    frontier._add("https://b.test/", "s", "s", 1, 0.01, NOW)
+    assert frontier.cooled == {"a.test"} and frontier.count("queued") == 3   # left queued, not failed (the sixth take was the retry)
+    b = frontier.take(seeds, NOW.date())
+    assert b["host"] == "b.test" and frontier.take(seeds, NOW.date()) is None
+    frontier.mark(b, _content(), None, NOW)
+    assert frontier.select(5, seeds, NOW.date()) == []
+    queued, top = frontier.by_seed(seeds, NOW.date())
+    assert queued == {"s": 2} and top == {}                           # a.test entries queued, none takeable now

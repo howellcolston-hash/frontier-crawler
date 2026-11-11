@@ -92,7 +92,9 @@ MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marke
 PORTAL_THRESHOLD = 0.7          # Jev's data_portal answer at which a page is listed as a candidate for a derived client
 MAX_RETRY_IN_FLIGHT = 2         # timed-out pages fetched again at once while there is other work, so slow hosts cannot take over a run
 RETRY_MAX_AGE = dt.timedelta(days=2)   # a retry still waiting this long after its first attempt is failed
-RETRY_TIMEOUT_SECONDS = 90.0    # the limit for that second attempt
+RETRY_TIMEOUT_SECONDS = 90.0    # the read limit for that second attempt
+RETRY_CONNECT_SECONDS = 20.0    # and its connect limit
+COOL_AFTER = 3                  # fetches in a row from one host that served nothing, after which a run leaves the host alone
 JEV_SLOTS = 8                   # judgements running at once in a crawl
 JUDGE_GRACE_SECONDS = 60.0      # how long the end of a crawl waits for judgements still running; the rest stay unjudged
 FLUSH_EVERY_SECONDS = 5.0       # how often a crawl asks the engine to upload what it has buffered
@@ -336,6 +338,9 @@ class Frontier:
         self._takes = 0
         self._retry: Dict[str, Dict[str, Any]] = {}   # entries waiting for their second attempt, oldest first
         self._retry_flight = 0
+        # In this run only: fetches in a row per host that served nothing, and the hosts left alone for that.
+        self._strikes: Dict[str, int] = {}
+        self.cooled: set = set()
         # fetch_id -> (the line credited, the urls add_links() queued from it), for pages whose judgement is awaited
         self._judging: Dict[str, Tuple[str, List[str]]] = {}
         # seq is the order entries were queued in: select() has always broken ties within a never-fetched host by it.
@@ -598,6 +603,10 @@ class Frontier:
         if entry["status"] == "queued":
             self._queued_per_host[entry["host"]] = max(0, self._queued_per_host.get(entry["host"], 0) - 1)
         outcome = row.get("outcome")
+        # A timeout or a connection error (nothing served) is a strike; anything served clears them.
+        self._strikes[entry["host"]] = self._strikes.get(entry["host"], 0) + 1 if outcome == "error" else 0
+        if self._strikes[entry["host"]] >= COOL_AFTER:
+            self.cooled.add(entry["host"])   # its entries stay queued for later runs; the heaps drop its groups
         if outcome != "error":
             self._set_status(entry, "fetched")
         elif row.get("timed_out") and entry["status"] != "retry":
@@ -709,7 +718,8 @@ class Frontier:
 
     def _eligible(self, group: _Group) -> bool:
         line = self._lines.get(group.line)
-        return bool(group.members) and group.seed in (self._weights or {}) and line is not None and line["status"] == "active"
+        return (bool(group.members) and group.seed in (self._weights or {}) and line is not None and line["status"] == "active"
+                and group.host not in self.cooled)
 
     def _never_fetched(self, host: str) -> bool:
         return self._hosts.get(host, {}).get("fetches", 0) == 0
@@ -940,12 +950,26 @@ class Frontier:
         if limit is not None and self._retry_flight >= limit:
             return None
         entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
-                      and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
+                      and e["host"] not in self.cooled and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
         if entry is not None:
             del self._retry[entry["url"]]
             self._retry_flight += 1
             self._hold(entry)
         return entry
+
+    def by_seed(self, seeds: Sequence[Seed], today: dt.date) -> Tuple[Dict[str, int], Dict[str, float]]:
+        """(queued entries per seed, the best priority of any of them that could be taken now) for the active seeds."""
+        weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
+        queued = dict.fromkeys(weights, 0)
+        top: Dict[str, float] = {}
+        for entry in self._entries.values():
+            seed = entry["seed_id"]
+            if entry["status"] != "queued" or seed not in weights:
+                continue
+            queued[seed] += 1
+            if self._lines[entry["line_id"]]["status"] == "active" and entry["host"] not in self.cooled:
+                top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed]), 4))
+        return queued, top
 
     def expire_retries(self, now: dt.datetime) -> int:
         """Fail the retries still waiting RETRY_MAX_AGE after their first attempt, so the lane cannot grow without bound."""
@@ -1050,7 +1074,8 @@ async def crawl(
         fetch_id = None
         try:
             target = Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
-            row = await engine.fetch(target, RETRY_TIMEOUT_SECONDS if retry else None)
+            limits = {"timeout": RETRY_TIMEOUT_SECONDS, "connect": RETRY_CONNECT_SECONDS} if retry else {}
+            row = await engine.fetch(target, **limits)
             if engine.sampled(row):
                 fetch_id = row["fetch_id"]
             with engine.slot_timer("observe"):
@@ -1139,6 +1164,7 @@ async def crawl(
     await uploader
     with timed(seconds, "final_save"):
         stats = dict(await engine.finish(frontier.save(workdir)))
+    queued_by_seed, top_priority_by_seed = frontier.by_seed(seeds, now().date())
     seconds["total"] = time.monotonic() - began
     stats.update(
         {
@@ -1148,13 +1174,16 @@ async def crawl(
             "lines_spawned": frontier.spawned, "lines_thawed": frontier.thawed,
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
             "retries": counts["retries"], "retry_recovered": counts["retry_recovered"], "retries_expired": retries_expired,
-            "stored_by_seed": stored_by_seed,
+            # Seed ids: these go to the private run record only. __main__ prints top-level numbers alone.
+            "stored_by_seed": stored_by_seed, "queued_by_seed": queued_by_seed, "top_priority_by_seed": top_priority_by_seed,
+            "hosts_cooled": len(frontier.cooled),
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "seed_url_problems": seed_url_problems,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
             "data_portals": dict(sorted(data_portals.items(), key=lambda item: -item[1])[:20]),
             # What the engine chose not to do in this run. Read these when reviewing the limits.
-            "skipped": {**frontier.skipped, "too_large": stats["too_large"]},
+            "skipped": {**frontier.skipped, "too_large": stats["too_large"],
+                        "host_cooled": sum(frontier._queued_per_host.get(host, 0) for host in frontier.cooled)},
             # A seed here has been fetched, in this run or an earlier one, and has never stored
             # anything: a dead or blocked starting URL.
             "seeds_with_nothing": sorted(

@@ -145,24 +145,30 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
 
     fetcher = asyncio.run(run())
     assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
-    assert fetcher.counts == {"http_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0, "browser_relaunches": 0}
+    assert fetcher.counts == {"connect_timeouts": 0, "read_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0, "browser_relaunches": 0}
 
 
-def test_a_timeout_is_flagged_and_one_call_can_ask_for_a_longer_limit() -> None:
-    limits: List[float] = []
+def test_a_timeout_is_flagged_and_one_call_can_ask_for_longer_limits() -> None:
+    limits: List[tuple] = []
 
     def server(request: httpx.Request) -> httpx.Response:
-        limits.append(request.extensions["timeout"]["read"])
+        limits.append((request.extensions["timeout"]["connect"], request.extensions["timeout"]["read"]))
         if request.url.path == "/slow":
             raise httpx.ReadTimeout("slow", request=request)
+        if request.url.path == "/dead":
+            raise httpx.ConnectTimeout("dead", request=request)
         return httpx.Response(404, text="gone")
 
-    async def run() -> List[ScrapeResult]:
+    async def run() -> Any:
         fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
-        return [await fetcher.fetch("https://a.test/slow"), await fetcher.fetch("https://a.test/slow", timeout=90), await fetcher.fetch("https://a.test/gone")]
+        results = [await fetcher.fetch("https://a.test/slow"), await fetcher.fetch("https://a.test/slow", timeout=90, connect=20),
+                   await fetcher.fetch("https://a.test/dead"), await fetcher.fetch("https://a.test/gone")]
+        return results, fetcher
 
-    slow, slower, gone = asyncio.run(run())
-    assert slow.timed_out and slower.timed_out and not gone.timed_out and limits == [30.0, 90.0, 30.0]
+    (slow, slower, dead, gone), fetcher = asyncio.run(run())
+    assert slow.timed_out and slower.timed_out and dead.timed_out and not gone.timed_out
+    assert limits == [(10.0, 30.0), (20.0, 90.0), (10.0, 30.0), (10.0, 30.0)]
+    assert fetcher.counts["connect_timeouts"] == 1 and fetcher.counts["read_timeouts"] == 2
 
 
 def test_each_fetch_reports_its_own_wait_for_the_hosts_turn() -> None:
@@ -206,6 +212,8 @@ class FakeChromium:
         self.browsers: List[Any] = []
         self.contexts: List[Any] = []
         self.died: List[str] = []
+        self.loads: List[str] = []
+        self.waits: List[tuple] = []
         self.active = self.peak = 0
 
     def async_playwright(self) -> Any:
@@ -216,6 +224,7 @@ class FakeChromium:
                 self.browser, self.url = browser, ""
 
             async def goto(self, url: str, wait_until: str, timeout: int) -> Any:
+                fake.loads.append(wait_until)
                 fake.active += 1
                 fake.peak = max(fake.peak, fake.active)
                 try:
@@ -237,6 +246,11 @@ class FakeChromium:
                     return type("Response", (), {"status": 200})()
                 finally:
                     fake.active -= 1
+
+            async def wait_for_load_state(self, state: str, timeout: int) -> None:
+                fake.waits.append((state, timeout))
+                if "busy" in self.url:
+                    raise fake.TimeoutError(f"Timeout {timeout}ms exceeded")
 
             async def inner_text(self, selector: str) -> str:
                 return "rendered text"
@@ -328,6 +342,12 @@ def test_one_browser_serves_every_page_and_each_context_is_closed(chromium: Fake
     assert "ERR_NAME_NOT_RESOLVED" in results[4].error_message
     assert len(chromium.browsers) == 1 and len(chromium.contexts) == 5 and all(c.closed for c in chromium.contexts)
     assert _browser_counts(fetcher) == {"browser_timeouts": 0, "browser_launches": 1, "browser_pages": 5, "browser_relaunches": 0}
+
+
+def test_a_page_loads_once_and_waits_a_moment_for_its_requests_to_settle(chromium: FakeChromium) -> None:
+    results, _ = _render(["https://a.test/1 https://a.test/busy"])
+    assert all(r.raw_payload for r in results) and not any(r.timed_out for r in results)   # one that never settles is taken as it is
+    assert chromium.loads == ["domcontentloaded", "domcontentloaded"] and chromium.waits == [("networkidle", 6000)] * 2
 
 
 def test_a_page_load_timeout_is_flagged_and_leaves_the_browser_running(chromium: FakeChromium) -> None:

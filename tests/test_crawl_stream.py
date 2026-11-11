@@ -39,12 +39,14 @@ class Site:
         self.started: List[str] = []
         self.finished: List[str] = []
         self.limits: List[tuple] = []
+        self.connects: List[Optional[float]] = []
         self.gates: Dict[str, asyncio.Event] = {}
         self.on_start: Any = None
 
-    async def fetch(self, url: str, timeout: Optional[float] = None) -> ScrapeResult:
+    async def fetch(self, url: str, timeout: Optional[float] = None, connect: Optional[float] = None) -> ScrapeResult:
         self.started.append(url)
         self.limits.append((url, timeout))
+        self.connects.append(connect)
         try:
             if self.on_start is not None:
                 await self.on_start(self, url)
@@ -156,10 +158,10 @@ def test_a_worker_survives_a_fault_in_fetching_in_recording_and_in_judging(tmp_p
     engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1", jev=_jev(jev), monthly_usd=8)
     fetch_row = engine._fetch_row
 
-    async def faulty(target: Any, timeout: Optional[float] = None) -> Any:
+    async def faulty(target: Any, limits: Any) -> Any:
         if target.url == broken_fetch:
             raise RuntimeError("a bug in the engine")
-        return await fetch_row(target, timeout)
+        return await fetch_row(target, limits)
 
     engine._fetch_row = faulty  # type: ignore[method-assign]
     stats = asyncio.run(crawl(store, engine, SEEDS, workdir=tmp_path / "r1", max_fetches=100, now=lambda: NOW))
@@ -239,6 +241,7 @@ def test_a_timed_out_page_is_retried_once_with_the_long_limit(tmp_path: Path) ->
     stats = _crawl(tmp_path, site)
     assert stats["retries"] == 2 and stats["retry_recovered"] == 1 and stats["errors"] == 3
     assert [limit for url, limit in site.limits if url == recovers] == [None, frontier_module.RETRY_TIMEOUT_SECONDS]
+    assert sorted(c for c in site.connects if c) == [frontier_module.RETRY_CONNECT_SECONDS] * 2
     frontier = _frontier(tmp_path)
     assert frontier.entry(recovers)["status"] == "fetched" and frontier.entry(fails)["status"] == "failed"
 
@@ -296,3 +299,19 @@ def test_with_no_jev_a_line_of_good_pages_keeps_a_high_yield(tmp_path: Path) -> 
     stats = _crawl(tmp_path, Site(12, dead=4), concurrency=1)
     line = _frontier(tmp_path).line("a")
     assert stats["pending"] == 13 and stats["error_pages"] == 4 and line["fetches"] == 17 and line["yield"] > 0.85
+
+
+def test_a_crawl_reports_cooled_hosts_and_its_queue_by_seed_in_the_record_only(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    dead = {f"https://h{i}.test/": 5 for i in range(3)}
+    site = Site(3, timeouts=dead)
+    stats = _crawl(tmp_path, site, max_fetches=1, concurrency=1)
+    assert stats["queued_by_seed"] == {"a": 3} and set(stats["top_priority_by_seed"]) == {"a"}
+    assert stats["hosts_cooled"] == 0 and stats["skipped"]["host_cooled"] == 0
+    from frontier_crawler import __main__ as cli
+
+    async def job(args: Any, ctx: Dict[str, Any]) -> None:
+        ctx["stats"] = stats
+
+    cli._run(type("Args", (), {"command": "crawl"})(), {}, job)
+    printed = capsys.readouterr().out
+    assert "queued_by_seed" not in printed and "top_priority_by_seed" not in printed and "stored_by_seed" not in printed

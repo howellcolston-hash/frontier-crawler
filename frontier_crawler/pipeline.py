@@ -17,7 +17,7 @@ Input contract:
     answers = await engine.judge(row)        #   await engine.run(targets, observer), which does both
     await engine.flush()                     # uploads full or old buffers; call it now and then
     stats = await engine.finish(extra_files) # final upload: tables, state and extra files in one commit
-The fetcher is any object with `async fetch(url) -> ScrapeResult` (and `timeout=` when fetch is given one).
+The fetcher is any object with `async fetch(url) -> ScrapeResult` (and the limits, timeout= and connect=, when fetch is given them).
 """
 
 from __future__ import annotations
@@ -245,7 +245,7 @@ class Engine:
                 "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
                 "flush": {"uploads": self._uploads, "seconds_total": round(self._upload_seconds, 1)},
                 "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
-                "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
+                "timeouts": {"connect": counts.get("connect_timeouts", 0), "read": counts.get("read_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
                 **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
                 "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                         "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
@@ -278,12 +278,12 @@ class Engine:
         """Add the seconds a block takes to the run's slot_seconds under key."""
         return timed(self._slot, key)
 
-    async def fetch(self, target: Target, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def fetch(self, target: Target, **limits: float) -> Dict[str, Any]:
         """Fetch one target, buffer its row and count it. Returns the row; row["timed_out"], not a stored
-        column, is set when nothing was served because of a timeout. timeout goes to the fetcher when given."""
+        column, is set when nothing was served because of a timeout. limits (timeout=, connect=) go to the fetcher."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
-            row, scraped = await self._fetch_row(target, timeout)
+            row, scraped = await self._fetch_row(target, limits)
         with contextlib.suppress(Exception):  # measuring must never break a fetch (tested)
             tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
             # Without the wait for the host's turn, which is politeness, not the page.
@@ -313,7 +313,7 @@ class Engine:
             return None
         return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
 
-    async def _fetch_row(self, target: Target, timeout: Optional[float] = None) -> Tuple[Dict[str, Any], Optional[ScrapeResult]]:
+    async def _fetch_row(self, target: Target, limits: Dict[str, float]) -> Tuple[Dict[str, Any], Optional[ScrapeResult]]:
         """(the row, what the fetcher returned: None when it raised)."""
         row: Dict[str, Any] = {
             "fetch_id": str(uuid.uuid4()),
@@ -331,7 +331,7 @@ class Engine:
             "engine_version": ENGINE_VERSION,
         }
         try:
-            scraped = await (self._fetcher.fetch(target.url) if timeout is None else self._fetcher.fetch(target.url, timeout=timeout))
+            scraped = await self._fetcher.fetch(target.url, **limits)
         except Exception as exc:
             logger.warning("fetch failed for %s: %s: %s", target.url, type(exc).__name__, exc)
             return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, None

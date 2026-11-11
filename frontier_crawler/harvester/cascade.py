@@ -37,10 +37,12 @@ _BROWSER_RETRY_STATUS = (403, 503)
 CREDENTIAL_HEADERS = ("cookie", "authorization", "x-api-key", "x-csrf-token", "x-xsrf-token")
 PDF_SECONDS = 60.0  # PROVISIONAL: text reading stops here; the stored PDF is complete either way
 # PROVISIONAL. A page attempt still running after this long means the shared browser has stopped
-# answering; it is discarded. Above the sum of a page's own Playwright timeouts (two loads and inner_text's 30 s);
-# a longer per-call timeout adds its two loads' worth.
+# answering; it is discarded. Above the sum of a page's own Playwright waits (the load, NETWORK_IDLE_SECONDS and
+# inner_text's 30 s); a longer per-call timeout adds two loads' worth.
 BROWSER_HUNG_SECONDS = 120.0
-TIMEOUT_SECONDS = 30.0  # PROVISIONAL: HTTP and browser page timeout, unless a call asks for another
+TIMEOUT_SECONDS = 30.0  # PROVISIONAL: HTTP read and browser page-load timeout, unless a call asks for another
+CONNECT_SECONDS = 10.0  # PROVISIONAL: a host that will not accept a connection this fast is dead or dropping us
+NETWORK_IDLE_SECONDS = 6.0  # PROVISIONAL: after the page has loaded, how long the browser waits for its requests to settle
 
 
 @dataclass(frozen=True)
@@ -255,7 +257,7 @@ class HarvesterCascade:
         # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
         self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
         self.counts: Dict[str, int] = dict.fromkeys(
-            ("http_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches"), 0
+            ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches"), 0
         )
 
     async def __aenter__(self) -> "HarvesterCascade":
@@ -281,22 +283,24 @@ class HarvesterCascade:
             )
         return self._owned
 
-    async def fetch(self, url: str, timeout: Optional[float] = None) -> ScrapeResult:
-        """timeout: seconds for the request and for each browser page load; the cascade's own when None."""
+    async def fetch(self, url: str, timeout: Optional[float] = None, connect: Optional[float] = None) -> ScrapeResult:
+        """timeout: seconds for HTTP reads and for the browser's page load; connect: seconds to connect. The cascade's own when None."""
         waited: Dict[str, float] = {}
-        result = await self._fetch(url, timeout or self._timeout_s, waited)
+        limits = (timeout or self._timeout_s, connect or CONNECT_SECONDS)
+        result = await self._fetch(url, limits, waited)
         result.throttle_wait = waited.get("throttle_wait", 0.0)
         return result
 
-    async def _fetch(self, url: str, timeout: float, waited: Dict[str, float]) -> ScrapeResult:
+    async def _fetch(self, url: str, limits: Tuple[float, float], waited: Dict[str, float]) -> ScrapeResult:
         check_public(url)
+        timeout = limits[0]
         try:
-            result, wants_browser = await self._http(url, timeout, waited)
+            result, wants_browser = await self._http(url, httpx.Timeout(timeout, connect=limits[1]), waited)
         except httpx.HTTPError as exc:
             # A dead host or a timeout. A browser would meet the same wall.
             failed = _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
             if isinstance(exc, httpx.TimeoutException):
-                self.counts["http_timeouts"] += 1
+                self.counts["connect_timeouts" if isinstance(exc, httpx.ConnectTimeout) else "read_timeouts"] += 1
                 failed.timed_out = True
             return failed
         if not wants_browser:
@@ -310,7 +314,7 @@ class HarvesterCascade:
         result.timed_out = rendered.timed_out and not result.raw_payload
         return result
 
-    async def _http(self, url: str, timeout: float, waited: Dict[str, float]) -> Tuple[ScrapeResult, bool]:
+    async def _http(self, url: str, timeout: httpx.Timeout, waited: Dict[str, float]) -> Tuple[ScrapeResult, bool]:
         """One GET. Returns (what was served, whether the browser tier should try)."""
         if self._throttle is not None:
             with timed(self.timings, "throttle_wait"), timed(waited, "throttle_wait"):
@@ -397,11 +401,10 @@ class HarvesterCascade:
         context = await browser.new_context(user_agent=USER_AGENT)
         try:
             page = await context.new_page()
-            try:
-                response = await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            except PlaywrightError:
-                # Some pages never stop loading. Take what is there once the document itself has loaded.
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            # Give scripts a moment to fill the page in. Some pages never stop loading: take what is there.
+            with contextlib.suppress(PlaywrightError):
+                await page.wait_for_load_state("networkidle", timeout=int(NETWORK_IDLE_SECONDS * 1000))
             check_public(page.url or url)  # a script may have sent the page somewhere else
             text = await page.inner_text("body")
             html = await page.content()
