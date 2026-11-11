@@ -1,9 +1,9 @@
 """Fetch and store, then judge.
 
-Fetching (Engine.run): fetch each target and write one row per attempt to the fetches table,
+Fetching (Engine.fetch): fetch a target and write one row per attempt to the fetches table,
 with where it came from and the bytes served. Nothing here waits on a model: a document is
 stored before anything judges it.
-Judging (inside run when a Jev client is given, or later through Engine.judge_days): ask Jev
+Judging (Engine.judge when a Jev client is given, or later through Engine.judge_days): ask Jev
 the configured questions (judge/questions.py) about each new document and store every answer.
 A document Jev was not asked about (no key, the monthly ceiling reached, Jev unavailable)
 stays pending. When the budget cannot cover a run, run judges a sample of its documents, chosen
@@ -13,9 +13,11 @@ Judging can be re-run; fetching is never repeated for it.
 Input contract:
     engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
     await engine.start()
-    await engine.run(targets, observer)      # any number of batches
+    row = await engine.fetch(target)         # fetched, buffered and counted; or, a batch at a time:
+    answers = await engine.judge(row)        #   await engine.run(targets, observer), which does both
+    await engine.flush()                     # uploads full or old buffers; call it now and then
     stats = await engine.finish(extra_files) # final upload: tables, state and extra files in one commit
-The fetcher is any object with `async fetch(url) -> ScrapeResult`.
+The fetcher is any object with `async fetch(url) -> ScrapeResult` (and `timeout=` when fetch is given one).
 """
 
 from __future__ import annotations
@@ -136,8 +138,8 @@ class Engine:
         self._jev = jev
         self._questions = questions or judging.active()
         self._max_words = max_excerpt_words
-        self._concurrency = max(1, concurrency)
-        self._semaphore = asyncio.Semaphore(self._concurrency)
+        self.concurrency = max(1, concurrency)
+        self._semaphore = asyncio.Semaphore(self.concurrency)
         self._now = now
         started = now()
         # The month's Jev budget accrues steadily through the month: by a given moment at most the elapsed
@@ -151,15 +153,17 @@ class Engine:
         self._day = started.date()
         self._month = started.strftime("%Y-%m")
         self._writers: Dict[Tuple[str, dt.date], ShardWriter] = {}
+        self._unsent: List[Tuple[Path, str]] = []   # shards written but not yet uploaded: kept for the next upload
         self._flush_lock = asyncio.Lock()
         self._last_upload = time.monotonic()
         self._seen: Dict[str, str] = {}
         self._rejections = 0
         self._sample_rate = 1.0
         self._judgeable_seen = 0
-        # Measurement only: seconds summed over fetch slots, per-tier fetch durations and Jev call time.
+        # Measurement only: seconds summed over fetch slots, per-tier fetch durations, Jev call and upload time.
         # finish() summarises them into stats.
-        self._slot: Dict[str, float] = dict.fromkeys(("jev", "observe", "flush", "idle"), 0.0)
+        self._slot: Dict[str, float] = dict.fromkeys(("observe", "waiting"), 0.0)
+        self._uploads: Dict[str, float] = {"uploads": 0, "seconds_total": 0.0}
         self._fetch_seconds: Dict[str, List[float]] = {}
         self._jev_spent: Dict[str, float] = {"calls": 0, "seconds": 0.0}
         self.stats: Dict[str, Any] = {
@@ -195,8 +199,9 @@ class Engine:
     async def flush(self, force: bool = False, extra: Sequence[Tuple[Path, str]] = ()) -> None:
         """Upload full buffers (all of them when forced or when the last upload is old), with any extra files, in one commit."""
         async with self._flush_lock:
-            force = force or time.monotonic() - self._last_upload >= _UPLOAD_EVERY_S
-            files: List[Tuple[Path, str]] = []
+            began = time.monotonic()
+            force = force or began - self._last_upload >= _UPLOAD_EVERY_S
+            files = self._unsent
             for writer in list(self._writers.values()):
                 batch = writer.take(force)
                 if batch is not None:
@@ -206,9 +211,13 @@ class Engine:
                     self.stats["shard_bytes"][table] = self.stats["shard_bytes"].get(table, 0) + _size(local)
             if not files and not extra:
                 return
+            # A failed upload leaves the shards in _unsent, so the next flush sends them: no row is lost.
             await asyncio.to_thread(self._store.put_many, files + list(extra), f"engine {self.run_id}: {len(files) + len(extra)} file(s)")
+            self._unsent = []
             self.stats["shards"] += [remote for _, remote in files]
             self._last_upload = time.monotonic()
+            self._uploads["uploads"] += 1
+            self._uploads["seconds_total"] += self._last_upload - began
 
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
         """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
@@ -230,6 +239,7 @@ class Engine:
             self.stats.update(
                 {
                     "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
+                    "flush": {"uploads": self._uploads["uploads"], "seconds_total": round(self._uploads["seconds_total"], 1)},
                     "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
                     "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
                     **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
@@ -244,57 +254,63 @@ class Engine:
     # ------------------------------------------------------------ fetching
 
     async def run(self, targets: Sequence[Target], observer: Optional[Observer] = None) -> None:
-        """Fetch a batch. observer(target, row, answers) is called once per fetch row, after judging."""
-
-        used: Dict[str, float] = {}
+        """Fetch a batch, judging each page in its fetch slot. observer(target, row, answers) is called once per fetch row, after judging."""
 
         async def one(target: Target) -> None:
             async with self._semaphore:
-                with timed(used, "slots"):
-                    await work(target)
-
-        async def work(target: Target) -> None:
-            took: Dict[str, float] = {}
-            with timed(took, "fetch"):
-                row = await self._fetch_row(target)
-            with contextlib.suppress(Exception):
-                tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
-                self._fetch_seconds.setdefault(tier, []).append(took["fetch"])
-            # The row is buffered before judging starts, so a judging fault cannot drop it.
-            self._writer("fetches", self._day).add(row)
-            self.stats["total"] += 1
-            counted = {"stored": "stored", "unchanged": "unchanged", "duplicate": "duplicate",
-                       "error_page": "error_pages", "too_large": "too_large"}
-            self.stats[counted.get(row["outcome"], "errors")] += 1
-            if row["block_marker"] is not None and row["outcome"] == "stored":
-                self.stats["blocked"] += 1
-            answers: Optional[JevResult] = None
-            if judgeable(row):
-                self._judgeable_seen += 1
-                # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
-                if int(row["sha256"][:8], 16) / 2**32 < self._sample_rate:
-                    with timed(self._slot, "jev"):
-                        answers = await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
-                else:
-                    self.stats["not_sampled"] += 1
-            if observer is not None:
-                try:
-                    with timed(self._slot, "observe"):
-                        observer(target, row, answers)
-                except Exception:
-                    # The row is stored. A fault in what follows it must not stop the batch.
-                    logger.exception("observer failed for %s", target.url)
-            with timed(self._slot, "flush"):
+                row = await self.fetch(target)
+                answers = await self.judge(row)
+                if observer is not None:
+                    try:
+                        with timed(self._slot, "observe"):
+                            observer(target, row, answers)
+                    except Exception:
+                        # The row is stored. A fault in what follows it must not stop the batch.
+                        logger.exception("observer failed for %s", target.url)
                 await self.flush()
 
-        started = time.monotonic()
         await asyncio.gather(*(one(target) for target in targets))
-        # Slot time the round paid for but did not use: the cost of waiting for its slowest pages.
-        with contextlib.suppress(Exception):
-            idle = (time.monotonic() - started) * self._concurrency - used.get("slots", 0.0)
-            self._slot["idle"] = self._slot.get("idle", 0.0) + max(0.0, idle)
 
-    async def _fetch_row(self, target: Target) -> Dict[str, Any]:
+    def slot_timer(self, key: str) -> Any:
+        """Add the seconds a block takes to the run's slot_seconds under key."""
+        return timed(self._slot, key)
+
+    async def fetch(self, target: Target, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Fetch one target, buffer its row and count it. Returns the row; row["timed_out"], not a stored
+        column, is set when nothing was served because of a timeout. timeout goes to the fetcher when given."""
+        took: Dict[str, float] = {}
+        with timed(took, "fetch"):
+            row, timed_out = await self._fetch_row(target, timeout)
+        with contextlib.suppress(Exception):
+            tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
+            self._fetch_seconds.setdefault(tier, []).append(took["fetch"])
+        # The row is buffered before judging starts, so a judging fault cannot drop it.
+        self._writer("fetches", self._day).add(row)
+        self.stats["total"] += 1
+        counted = {"stored": "stored", "unchanged": "unchanged", "duplicate": "duplicate",
+                   "error_page": "error_pages", "too_large": "too_large"}
+        self.stats[counted.get(row["outcome"], "errors")] += 1
+        if row["block_marker"] is not None and row["outcome"] == "stored":
+            self.stats["blocked"] += 1
+        if judgeable(row):
+            self._judgeable_seen += 1
+            if not self.sampled(row):
+                self.stats["not_sampled"] += 1
+        return {**row, "timed_out": True} if timed_out else row
+
+    def sampled(self, row: Dict[str, Any]) -> bool:
+        """Whether judge() will ask Jev about this row: new readable content within the run's sample."""
+        # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
+        return judgeable(row) and int(row["sha256"][:8], 16) / 2**32 < self._sample_rate
+
+    async def judge(self, row: Dict[str, Any]) -> Optional[JevResult]:
+        """Jev's answers about a row from fetch(), or None: not sampled, or left pending."""
+        if not self.sampled(row):
+            return None
+        return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+
+    async def _fetch_row(self, target: Target, timeout: Optional[float] = None) -> Tuple[Dict[str, Any], bool]:
+        """(the row, whether nothing was served because of a timeout)."""
         row: Dict[str, Any] = {
             "fetch_id": str(uuid.uuid4()),
             "run_id": self.run_id,
@@ -311,10 +327,10 @@ class Engine:
             "engine_version": ENGINE_VERSION,
         }
         try:
-            scraped = await self._fetcher.fetch(target.url)
+            scraped = await (self._fetcher.fetch(target.url) if timeout is None else self._fetcher.fetch(target.url, timeout=timeout))
         except Exception as exc:
             logger.warning("fetch failed for %s: %s: %s", target.url, type(exc).__name__, exc)
-            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}
+            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, False
         when = self._now()
         body = scraped.raw_payload or b""
         row.update(
@@ -327,9 +343,9 @@ class Engine:
             }
         )
         if scraped.too_large_bytes is not None:
-            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}
+            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}, False
         if not body:
-            return {**row, "error": scraped.error_message or "nothing was served"}
+            return {**row, "error": scraped.error_message or "nothing was served"}, scraped.timed_out
         text = scraped.markdown_content or ""
         digest = hashlib.sha256(body).hexdigest()
         key = row["url_final"]
@@ -367,7 +383,7 @@ class Engine:
                 sizes["n"] += 1
                 sizes["body"] += len(body)
                 sizes["text"] += len(text.encode("utf-8"))
-        return row
+        return row, False
 
     # ------------------------------------------------------------ judging
 

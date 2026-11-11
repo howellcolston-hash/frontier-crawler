@@ -23,7 +23,7 @@ def _fetch(handler: Any, url: str = "https://a.test/x", browser: Optional[List[s
     async def run() -> ScrapeResult:
         fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
         if browser is not None:
-            async def fake_browser(url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
+            async def fake_browser(url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None) -> ScrapeResult:
                 browser.append(url)
                 return ScrapeResult(url, 0, b"", None, 0, "HEADLESS_PLAYWRIGHT", "browser got nothing")
 
@@ -148,6 +148,23 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
     assert fetcher.counts == {"http_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0, "browser_relaunches": 0}
 
 
+def test_a_timeout_is_flagged_and_one_call_can_ask_for_a_longer_limit() -> None:
+    limits: List[float] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        limits.append(request.extensions["timeout"]["read"])
+        if request.url.path == "/slow":
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(404, text="gone")
+
+    async def run() -> List[ScrapeResult]:
+        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+        return [await fetcher.fetch("https://a.test/slow"), await fetcher.fetch("https://a.test/slow", timeout=90), await fetcher.fetch("https://a.test/gone")]
+
+    slow, slower, gone = asyncio.run(run())
+    assert slow.timed_out and slower.timed_out and not gone.timed_out and limits == [30.0, 90.0, 30.0]
+
+
 def test_a_timer_fault_does_not_break_a_fetch() -> None:
     class Broken(dict):
         def __setitem__(self, key: Any, value: Any) -> None:
@@ -203,6 +220,8 @@ class FakeChromium:
                         raise fake.Error("Target page, context or browser has been closed")
                     if "bad" in url:
                         raise fake.Error("net::ERR_NAME_NOT_RESOLVED")
+                    if "timesout" in url:
+                        raise fake.TimeoutError(f"Timeout {timeout}ms exceeded")
                     self.url = url
                     return type("Response", (), {"status": 200})()
                 finally:
@@ -298,6 +317,12 @@ def test_one_browser_serves_every_page_and_each_context_is_closed(chromium: Fake
     assert "ERR_NAME_NOT_RESOLVED" in results[4].error_message
     assert len(chromium.browsers) == 1 and len(chromium.contexts) == 5 and all(c.closed for c in chromium.contexts)
     assert _browser_counts(fetcher) == {"browser_timeouts": 0, "browser_launches": 1, "browser_pages": 5, "browser_relaunches": 0}
+
+
+def test_a_page_load_timeout_is_flagged_and_leaves_the_browser_running(chromium: FakeChromium) -> None:
+    results, fetcher = _render(["https://a.test/timesout https://a.test/1"])
+    assert results[0].timed_out and "Timeout 30000ms" in results[0].error_message and not results[1].timed_out
+    assert len(chromium.browsers) == 1 and fetcher.counts["browser_timeouts"] == 1
 
 
 def test_closing_the_cascade_closes_browser_and_playwright(chromium: FakeChromium) -> None:

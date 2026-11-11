@@ -1,7 +1,8 @@
 """Fetch one URL: plain HTTP first (JSON, PDF, HTML), then a browser when the page needs one.
 
-Input contract: result = await cascade.fetch(url). Network and parse failures come back in
-the result. Only BlockedAddress is raised, for a URL the engine must never request.
+Input contract: result = await cascade.fetch(url, timeout=None). Network and parse failures come back
+in the result; result.timed_out says the page timed out with nothing served. Only BlockedAddress is
+raised, for a URL the engine must never request.
 """
 
 from __future__ import annotations
@@ -36,8 +37,10 @@ _BROWSER_RETRY_STATUS = (403, 503)
 CREDENTIAL_HEADERS = ("cookie", "authorization", "x-api-key", "x-csrf-token", "x-xsrf-token")
 PDF_SECONDS = 60.0  # PROVISIONAL: text reading stops here; the stored PDF is complete either way
 # PROVISIONAL. A page attempt still running after this long means the shared browser has stopped
-# answering; it is discarded. Above the sum of a page's own Playwright timeouts (two loads and inner_text's 30 s).
+# answering; it is discarded. Above the sum of a page's own Playwright timeouts (two loads and inner_text's 30 s);
+# a longer per-call timeout adds its two loads' worth.
 BROWSER_HUNG_SECONDS = 120.0
+TIMEOUT_SECONDS = 30.0  # PROVISIONAL: HTTP and browser page timeout, unless a call asks for another
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,7 @@ class ScrapeResult:
     error_message: Optional[str]
     content_type: str = ""
     too_large_bytes: Optional[int] = None
+    timed_out: bool = False  # nothing was served because the request or the page load timed out
 
 
 @contextlib.contextmanager
@@ -234,7 +238,7 @@ class HarvesterCascade:
 
     def __init__(
         self,
-        timeout_s: float = 15.0,
+        timeout_s: float = TIMEOUT_SECONDS,
         client: Optional[httpx.AsyncClient] = None,
         throttle: Optional[HostThrottle] = None,
         browser_slots: int = 4,  # PROVISIONAL: pages rendering at once in the shared browser
@@ -276,32 +280,37 @@ class HarvesterCascade:
             )
         return self._owned
 
-    async def fetch(self, url: str) -> ScrapeResult:
+    async def fetch(self, url: str, timeout: Optional[float] = None) -> ScrapeResult:
+        """timeout: seconds for the request and for each browser page load; the cascade's own when None."""
         check_public(url)
+        timeout = timeout or self._timeout_s
         try:
-            result, wants_browser = await self._http(url)
+            result, wants_browser = await self._http(url, timeout)
         except httpx.HTTPError as exc:
             # A dead host or a timeout. A browser would meet the same wall.
+            failed = _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
             if isinstance(exc, httpx.TimeoutException):
                 self.counts["http_timeouts"] += 1
-            return _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
+                failed.timed_out = True
+            return failed
         if not wants_browser:
             return result
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
-            rendered = await self._browser(url, result.error_message, result.http_status)
+            rendered = await self._browser(url, result.error_message, result.http_status, timeout)
         if rendered.raw_payload:
             return rendered
         # The browser got nothing. Keep what the plain request was served.
         result.error_message = rendered.error_message
+        result.timed_out = rendered.timed_out and not result.raw_payload
         return result
 
-    async def _http(self, url: str) -> Tuple[ScrapeResult, bool]:
+    async def _http(self, url: str, timeout: float) -> Tuple[ScrapeResult, bool]:
         """One GET. Returns (what was served, whether the browser tier should try)."""
         if self._throttle is not None:
             with timed(self.timings, "throttle_wait"):
                 await self._throttle.wait(url)
         with timed(self.timings, "http"):
-            async with self._http_client().stream("GET", url) as response:
+            async with self._http_client().stream("GET", url, timeout=timeout) as response:
                 status = response.status_code
                 content_type = response.headers.get("content-type", "")
                 final_url = str(response.url)
@@ -340,7 +349,8 @@ class HarvesterCascade:
             return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words"), True
         return served(text, "DOM_TRAFILATURA"), False
 
-    async def _browser(self, url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
+    async def _browser(self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None) -> ScrapeResult:
+        timeout = timeout or self._timeout_s
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeout
             from playwright.async_api import async_playwright
@@ -354,11 +364,13 @@ class HarvesterCascade:
             async with self._browser_slots:
                 try:
                     browser = await self._shared_browser(async_playwright)
-                    return await asyncio.wait_for(self._render(browser, url, prior_note, prior_status), BROWSER_HUNG_SECONDS)
+                    hung = BROWSER_HUNG_SECONDS + 2 * max(0.0, timeout - self._timeout_s)
+                    return await asyncio.wait_for(self._render(browser, url, prior_note, prior_status, timeout), hung)
                 except Exception as exc:
+                    failed = _failed(url, "HEADLESS_PLAYWRIGHT", f"{prior_note or ''}; browser: {type(exc).__name__}: {exc}".lstrip("; "), prior_status)
                     if isinstance(exc, PlaywrightTimeout):
                         self.counts["browser_timeouts"] += 1
-                    failed = _failed(url, "HEADLESS_PLAYWRIGHT", f"{prior_note or ''}; browser: {type(exc).__name__}: {exc}".lstrip("; "), prior_status)
+                        failed.timed_out = True
                     # Navigation errors and page timeouts leave the browser fine. A failed launch, a lost
                     # connection to it or a hang (asyncio's TimeoutError, not Playwright's) do not.
                     if browser is not None and browser.is_connected() and "Connection closed" not in str(exc) and not isinstance(exc, TimeoutError):
@@ -367,11 +379,11 @@ class HarvesterCascade:
                         await self._discard(browser)
         return failed
 
-    async def _render(self, browser: Any, url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
+    async def _render(self, browser: Any, url: str, prior_note: Optional[str], prior_status: int, timeout: float) -> ScrapeResult:
         """One page in a fresh context, so no cookies or storage carry from one site to the next."""
         from playwright.async_api import Error as PlaywrightError
 
-        timeout_ms = int(self._timeout_s * 1000)
+        timeout_ms = int(timeout * 1000)
         context = await browser.new_context(user_agent=USER_AGENT)
         try:
             page = await context.new_page()

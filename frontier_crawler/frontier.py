@@ -31,21 +31,28 @@ http(s) link can be followed.
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links.
 
+A page that timed out is retried once, with a longer limit, through take()'s retry lane; a second timeout fails it.
+
 Input contract:
     frontier = Frontier.load(store, workdir); frontier.add_seeds(seeds, now)
     picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
+    # or in two phases, so nothing waits on Jev: frontier.expect_judgement(fetch_id, line_id), mark and add_links with
+    # answers None, then frontier.judged(fetch_id, answers or None, now) when the judgement arrives
     files = frontier.save(workdir)          # upload with store.put_many
-    stats = await crawl(store, engine, seeds, workdir=..., max_fetches=..., batch=...)
+    stats = await crawl(store, engine, seeds, workdir=..., max_fetches=...)
 Every constant below is PROVISIONAL.
 """
 
 from __future__ import annotations
 
+import asyncio
 import bisect
+import contextlib
 import datetime as dt
 import heapq
 import json
+import logging
 import math
 import time
 from collections import Counter
@@ -80,6 +87,14 @@ MAX_LINKS_PER_PAGE = 300
 MAX_QUEUED_PER_HOST = 2000
 MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
 PORTAL_THRESHOLD = 0.7          # Jev's data_portal answer at which a page is listed as a candidate for a derived client
+MAX_RETRY_IN_FLIGHT = 2         # timed-out pages being fetched again at once, so slow hosts cannot take over a run
+RETRY_TIMEOUT_SECONDS = 90.0    # the limit for that second attempt
+JEV_SLOTS = 8                   # judgements running at once in a crawl
+JUDGE_GRACE_SECONDS = 60.0      # how long the end of a crawl waits for judgements still running; the rest stay unjudged
+FLUSH_EVERY_SECONDS = 5.0       # how often a crawl asks the engine to upload what it has buffered
+TAKE_WAIT_SECONDS = 0.05        # how long a crawl worker with nothing to take waits before asking again
+
+logger = logging.getLogger("frontier_crawler.frontier")
 
 FRONTIER_PATH = "state/frontier.parquet"
 HOSTS_PATH = "state/hosts.parquet"
@@ -97,7 +112,7 @@ _FRONTIER_SCHEMA = pa.schema(
         ("parent_fetch_id", pa.string()),
         ("anchor", pa.string()),
         ("base", pa.float64()),
-        # queued | fetched | failed | alias (a redirect target of a fetched URL) |
+        # queued | fetched | failed | retry (timed out once; fetched again later) | alias (a redirect target of a fetched URL) |
         # unparseable (a link as written on its page that could not be read as a URL; never fetched)
         ("status", pa.string()),
         ("discovered_at", _TS),
@@ -240,17 +255,19 @@ def link_base(answers: Optional[JevResult]) -> float:
     return max(MIN_LINK_BASE, min(1.0, 0.5 * leads + 0.5 * (relevance(nouls) or 0.0)))
 
 
+def judged_yield(answers: JevResult) -> float:
+    """What a judged page was worth to its line: its relevance, or 1 when the questions give none."""
+    judged = relevance(answers.nouls())
+    return 1.0 if judged is None else max(0.0, min(1.0, judged))
+
+
 def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[float]:
     """What one fetch was worth to its line: 0 to 1, or None for new content Jev would read but did not."""
     if row.get("outcome") != "stored" or row.get("block_marker"):
         return 0.0
     if answers is not None:
-        judged = relevance(answers.nouls())
-        if judged is not None:
-            return max(0.0, min(1.0, judged))
-    elif judgeable(row):
-        return None
-    return 1.0
+        return judged_yield(answers)
+    return None if judgeable(row) else 1.0
 
 
 def _static(entry: Dict[str, Any], weight: float) -> float:
@@ -309,12 +326,18 @@ class Frontier:
         self._flight_host: Dict[str, int] = {}
         self._flight_line: Dict[str, int] = {}
         self._takes = 0
+        self._retry: Dict[str, Dict[str, Any]] = {}   # entries waiting for their second attempt, oldest first
+        self._retry_flight = 0
+        # fetch_id -> (the line credited, the urls add_links() queued from it), for pages whose judgement is awaited
+        self._judging: Dict[str, Tuple[str, List[str]]] = {}
         # seq is the order entries were queued in: select() has always broken ties within a never-fetched host by it.
         for seq, entry in enumerate(self._entries.values()):
             entry["seq"] = seq
             if entry["status"] == "queued":
                 self._queued_per_host[entry["host"]] = self._queued_per_host.get(entry["host"], 0) + 1
                 (self._groups.get((entry["line_id"], entry["host"], entry["seed_id"])) or self._group(entry)).members.append(entry)
+            elif entry["status"] == "retry":
+                self._retry[entry["url"]] = entry
             if entry.get("crossing"):
                 self._crossing.setdefault(entry["host"], []).append(entry)
             elif entry["host"]:
@@ -399,6 +422,10 @@ class Frontier:
         line["fetches"] += 1
         line["content"] += value is None or value > 0
         line["since_thaw"] += 1
+        self._move_yield(line, value, now)
+
+    def _move_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
+        """One step of the line's running yield toward value (none for None), then freeze it if it stopped paying."""
         if value is not None:
             before = line["yield"]
             line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
@@ -508,6 +535,7 @@ class Frontier:
         base = link_base(answers)
         own_line = entry["line_id"]
         added = 0
+        awaited = self._judging.get(row.get("fetch_id") or "")
         links, unparseable = extract_links(row["body"], row.get("url_final") or entry["url"])
         for href in unparseable:
             # Kept as written, with the page it came from, so it can be looked at and repaired later.
@@ -538,6 +566,8 @@ class Frontier:
                 continue
             if self._add(url, self._lines[line_id]["seed_id"], line_id, hops, base, now, row["fetch_id"], anchor, crossing):
                 added += 1
+                if awaited is not None:
+                    awaited[1].append(url)
                 if covering is not None and covering != own_line:
                     self._note_inbound(self._entries[url], own_line)
         return added
@@ -549,12 +579,20 @@ class Frontier:
         if flight is not None:
             self._flight_host[flight[0]] -= 1
             self._flight_line[flight[1]] -= 1
+            self._retry_flight -= entry["status"] == "retry"
         elif entry["status"] == "queued":
             self._dequeue(entry)
+        self._retry.pop(entry["url"], None)
         if entry["status"] == "queued":
             self._queued_per_host[entry["host"]] = max(0, self._queued_per_host.get(entry["host"], 0) - 1)
         outcome = row.get("outcome")
-        self._set_status(entry, "failed" if outcome == "error" else "fetched")
+        if outcome != "error":
+            self._set_status(entry, "fetched")
+        elif row.get("timed_out") and entry["status"] != "retry":
+            self._set_status(entry, "retry")
+            self._retry[entry["url"]] = entry
+        else:
+            self._set_status(entry, "failed")
         entry["fetched_at"] = now
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
@@ -581,6 +619,35 @@ class Frontier:
         final = normalise(row.get("url_final") or "")
         if final and final not in self._entries:
             self._insert({**entry, "url": final, "host": urlsplit(final).netloc, "anchor": None, "status": "alias"})
+
+    # ------------------------------------------------------------ when a judgement arrives
+
+    def expect_judgement(self, fetch_id: str, line_id: str) -> None:
+        """Call before mark() for a page that will be judged later. Its fetch counts now, its yield when judged() is
+        called, and the links add_links() queues from it are remembered until then, to be re-scored."""
+        self._judging[fetch_id] = (line_id, [])
+
+    def judged(self, fetch_id: str, answers: Optional[JevResult], now: dt.datetime) -> None:
+        """The judgement of a page passed to expect_judgement(), or None when none will come. Moves the line's yield
+        by the page's relevance, as mark() does, and re-scores the links queued from it that are still waiting."""
+        line_id, urls = self._judging.pop(fetch_id, ("", []))
+        if not line_id or answers is None:
+            return
+        self._move_yield(self._lines[line_id], judged_yield(answers), now)
+        base = link_base(answers)
+        for url in urls:
+            self.rebase(self._entries[url], base)
+
+    def rebase(self, entry: Dict[str, Any], base: float) -> None:
+        """Change a queued entry's link score, keeping its group's order and the heaps right."""
+        if entry["status"] != "queued" or entry["base"] == base:
+            return
+        waiting = entry["url"] not in self._in_flight
+        if waiting:
+            self._dequeue(entry)
+        entry["base"] = base
+        if waiting:
+            self._enqueue(entry)
 
     # ------------------------------------------------------------ the ranked queue
     #
@@ -817,8 +884,17 @@ class Frontier:
     def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
         and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
-        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Nothing calls this yet."""
+        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Before any of that, a page
+        waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are; its status is still "retry"."""
         self._ready(seeds, today)
+        if self._retry_flight < MAX_RETRY_IN_FLIGHT:
+            entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
+                          and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
+            if entry is not None:
+                del self._retry[entry["url"]]
+                self._retry_flight += 1
+                self._hold(entry)
+                return entry
         self._takes += 1
         heaps = [(self._heap, False)]
         if self._takes % round(1 / NEW_HOST_SHARE) == 0:
@@ -835,18 +911,25 @@ class Frontier:
             if item is not None:
                 entry = self._entries[item[1]]
                 self._dequeue(entry)
-                self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
-                self._flight_host[entry["host"]] = self._flight_host.get(entry["host"], 0) + 1
-                self._flight_line[entry["line_id"]] = self._flight_line.get(entry["line_id"], 0) + 1
+                self._hold(entry)
                 return entry
         return None
 
+    def _hold(self, entry: Dict[str, Any]) -> None:
+        self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
+        self._flight_host[entry["host"]] = self._flight_host.get(entry["host"], 0) + 1
+        self._flight_line[entry["line_id"]] = self._flight_line.get(entry["line_id"], 0) + 1
+
     def release(self, entry: Dict[str, Any]) -> None:
-        """Return an entry from take() that was not fetched to the queue."""
+        """Return an entry from take() that was not fetched to the queue (or to the retry lane)."""
         host, line = self._in_flight.pop(entry["url"])
         self._flight_host[host] -= 1
         self._flight_line[line] -= 1
-        self._enqueue(entry)
+        if entry["status"] == "retry":
+            self._retry_flight -= 1
+            self._retry[entry["url"]] = entry
+        else:
+            self._enqueue(entry)
         self._push_all(self._groups_by_host.get(host, []) + self._groups_by_line.get(line, []))
 
 
@@ -857,14 +940,17 @@ async def crawl(
     *,
     workdir: Path,
     max_fetches: int,
-    batch: int = 50,
     max_minutes: Optional[float] = None,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     clock: Callable[[], float] = time.monotonic,
 ) -> Dict[str, Any]:
-    """Fetch in rounds until max_fetches is reached, max_minutes has passed, or nothing is queued.
-    The queue is re-ranked between rounds. The time limit is checked between rounds, so a run
-    can overshoot it by one round; scheduled runs use it to spend a set share of Actions minutes.
+    """Fetch in a rolling stream until max_fetches are taken, max_minutes has passed, or nothing is left to take.
+
+    engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
+    one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
+    yield and the score of the links found on it follow when the judgement arrives. A background task uploads rows
+    every FLUSH_EVERY_SECONDS. At the time limit no new URL is taken; pages in flight finish, and judgements still
+    running get JUDGE_GRACE_SECONDS, after which they are abandoned and their pages stay unjudged.
 
     The queue is uploaded once, in the engine's final commit. A run that dies before then
     keeps its fetched rows (the engine uploads them as it goes) and loses its queue updates,
@@ -873,7 +959,7 @@ async def crawl(
     workdir = Path(workdir)
     # Wall-clock seconds by phase, for the run record. time.monotonic, not `clock`, which only drives the deadline.
     began = time.monotonic()
-    seconds: Dict[str, float] = dict.fromkeys(("load_state", "select", "fetch_rounds", "final_save"), 0.0)
+    seconds: Dict[str, float] = dict.fromkeys(("load_state", "take", "fetching", "judge_wait", "final_save"), 0.0)
     with timed(seconds, "load_state"):
         frontier = Frontier.load(store, workdir)
     by_id = {seed.id: seed for seed in seeds}
@@ -882,59 +968,143 @@ async def crawl(
     stored_by_seed = {seed.id: 0 for seed in seeds}
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
+    counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
+    judging: set = set()
+    jev_slots = asyncio.Semaphore(JEV_SLOTS)
+    stopped_by = "queue_empty"
 
-    def observe(target: Target, row: Dict[str, Any], answers: Optional[JevResult]) -> None:
+    def record(entry: Dict[str, Any], row: Dict[str, Any], awaited: bool) -> None:
+        """Phase 1, as soon as the page is fetched: everything that needs no judgement."""
         nonlocal links_added
-        entry = frontier.entry(target.url)
-        frontier.mark(entry, row, answers, now())
-        links_added += frontier.add_links(entry, row, answers, now())
-        portal = answers.nouls().get("data_portal", 0.0) if answers is not None else 0.0
-        if portal >= PORTAL_THRESHOLD:
-            data_portals[row["url_final"]] = round(portal, 2)
+        if awaited:
+            frontier.expect_judgement(row["fetch_id"], entry["line_id"])
+        frontier.mark(entry, row, None, now())
+        links_added += frontier.add_links(entry, row, None, now())
         if row["outcome"] == "stored" and not row["block_marker"]:
             stored_by_seed[entry["seed_id"]] = stored_by_seed.get(entry["seed_id"], 0) + 1
         elif entry["parent_fetch_id"] is None:  # a seed's own starting URL
             reason = row.get("error") or row.get("block_marker") or row.get("tier_note") or ""
-            seed_url_problems[target.url] = f"{row['outcome']}, status {row['http_status']}: {reason}"[:300]
+            seed_url_problems[entry["url"]] = f"{row['outcome']}, status {row['http_status']}: {reason}"[:300]
+
+    async def judge(row: Dict[str, Any]) -> None:
+        """Phase 2, in its own task: the page's relevance and its links' scores."""
+        answers = None
+        try:
+            async with jev_slots:
+                answers = await engine.judge(row)
+        except Exception:
+            logger.exception("judging failed; the page stays unjudged")
+        finally:  # also when abandoned at the end of the run
+            try:
+                frontier.judged(row["fetch_id"], answers, now())
+                portal = answers.nouls().get("data_portal", 0.0) if answers is not None else 0.0
+                if portal >= PORTAL_THRESHOLD:
+                    data_portals[row["url_final"]] = round(portal, 2)
+            except Exception:
+                logger.exception("a judgement was not applied to the queue")
+
+    async def fetch_one(entry: Dict[str, Any]) -> None:
+        retry = entry["status"] == "retry"
+        fetch_id = None
+        try:
+            target = Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
+            row = await engine.fetch(target, RETRY_TIMEOUT_SECONDS if retry else None)
+            if engine.sampled(row):
+                fetch_id = row["fetch_id"]
+            with engine.slot_timer("observe"):
+                record(entry, row, fetch_id is not None)
+            if retry:
+                counts["retries"] += 1
+                counts["retry_recovered"] += row["outcome"] in ("stored", "unchanged", "duplicate")
+            if fetch_id is not None:
+                task = asyncio.create_task(judge({**row, "body": None}))  # the body is not needed to judge; free it with its shard
+                judging.add(task)
+                task.add_done_callback(judging.discard)
+        except Exception:
+            logger.exception("a fetch slot failed; its page is marked failed")
+            with contextlib.suppress(Exception):  # the worker must outlive any one page
+                frontier._judging.pop(fetch_id or "", None)
+                if entry["url"] in frontier._in_flight:
+                    frontier.mark(entry, {"outcome": "error"}, None, now())
+
+    async def worker() -> None:
+        nonlocal stopped_by
+        while True:
+            if counts["taken"] >= max_fetches:
+                stopped_by = "max_fetches"
+                return
+            if deadline is not None and clock() >= deadline:
+                stopped_by = "max_minutes"
+                return
+            with timed(seconds, "take"):
+                entry = frontier.take(seeds, now().date())
+            if entry is None:
+                if not counts["in_flight"]:
+                    return
+                with engine.slot_timer("waiting"):  # pages in flight may bring links, or free a host
+                    await asyncio.sleep(TAKE_WAIT_SECONDS)
+                continue
+            counts["taken"] += 1
+            counts["in_flight"] += 1
+            counts["peak_in_flight"] = max(counts["peak_in_flight"], counts["in_flight"])
+            try:
+                await fetch_one(entry)
+            finally:
+                counts["in_flight"] -= 1
+
+    done = asyncio.Event()
+
+    async def uploads() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(done.wait(), FLUSH_EVERY_SECONDS)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await engine.flush()  # uploads only full or old buffers
+            except Exception:
+                logger.exception("upload failed; the rows are kept and sent with the next one")
 
     with timed(seconds, "load_state"):
         await engine.start()
-    rounds = 0
-    stopped_by = "queue_empty"
     deadline = None if max_minutes is None else clock() + max_minutes * 60
+    uploader = asyncio.create_task(uploads())
+    workers: List[asyncio.Task] = []
+    abandoned = 0
     try:
-        while True:
-            if engine.stats["total"] >= max_fetches:
-                stopped_by = "max_fetches"
-                break
-            if deadline is not None and clock() >= deadline:
-                stopped_by = "max_minutes"
-                break
-            with timed(seconds, "select"):
-                picks = frontier.select(min(batch, max_fetches - engine.stats["total"]), seeds, now().date())
-            if not picks:
-                break
-            with timed(seconds, "fetch_rounds"):
-                await engine.run(
-                    [
-                        Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
-                        for entry in picks
-                    ],
-                    observe,
-                )
-            rounds += 1
+        with timed(seconds, "fetching"):
+            workers = [asyncio.create_task(worker()) for _ in range(engine.concurrency)]
+            await asyncio.gather(*workers)
+        with timed(seconds, "judge_wait"):
+            if judging:
+                _, unfinished = await asyncio.wait(list(judging), timeout=JUDGE_GRACE_SECONDS)
+                for task in unfinished:
+                    task.cancel()
+                await asyncio.gather(*unfinished, return_exceptions=True)
+                abandoned = len(unfinished)
     except BaseException:
+        running = workers + list(judging)
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        done.set()
+        await asyncio.gather(uploader, return_exceptions=True)
         await engine.flush(force=True)  # keep the rows already fetched
         raise
+    done.set()
+    await uploader
     with timed(seconds, "final_save"):
         stats = dict(await engine.finish(frontier.save(workdir)))
     seconds["total"] = time.monotonic() - began
     stats.update(
         {
-            "rounds": rounds, "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
+            "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": frontier.count_lines("active"), "lines_frozen": frontier.count_lines("frozen"),
             "lines_spawned": frontier.spawned, "lines_thawed": frontier.thawed,
+            "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
+            "retries": counts["retries"], "retry_recovered": counts["retry_recovered"],
             "stored_by_seed": stored_by_seed,
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "seed_url_problems": seed_url_problems,

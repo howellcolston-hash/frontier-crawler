@@ -478,7 +478,8 @@ def test_a_run_records_where_its_time_and_bytes_went(tmp_path: Path) -> None:
     stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run(
         [_job("https://a.test/x"), _job("https://a.test/api"), _job("https://a.test/missing")]))
     slot = stats["slot_seconds"]
-    assert set(slot) >= {"jev", "observe", "flush", "idle"} and all(isinstance(v, float) and v >= 0 for v in slot.values())
+    assert set(slot) >= {"observe", "waiting"} and all(isinstance(v, float) and v >= 0 for v in slot.values())
+    assert stats["flush"]["uploads"] == 1 and stats["flush"]["seconds_total"] >= 0
     tiers = stats["fetch_seconds_by_tier"]
     assert set(tiers) == {"DOM_TRAFILATURA", "API", "error"} and tiers["error"]["n"] == 1
     assert all(0 <= t["p50"] <= t["p90"] <= t["max"] for t in tiers.values())
