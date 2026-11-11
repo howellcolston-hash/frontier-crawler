@@ -10,12 +10,14 @@ If fetching it yields content, that site becomes a new line and the parent line 
 A new line starts at its parent's yield x HOP_DECAY, one step from the line that found it,
 and earns its own yield from there: a branch is not handed full strength for being new.
 
-Freezing. Every line keeps a running yield: 1 for a fetch that brought new content (Jev's
-relevance for it once judged), 0 for a dead link, a duplicate, an unchanged page or a
-refusal. A line whose yield stays under FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is
-frozen: its queue is kept and nothing in it is fetched. A frozen line thaws when other
-lines link into it THAW_INBOUND times. Growth is bounded by the fetches per run, so lines
-compete for a fixed capacity.
+Freezing. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
+new content Jev does not read (structured data, a scan with no text, a very short page), 0 for
+a dead link, a duplicate, an unchanged page or a refusal. A page Jev would read but did not
+(out of the sample, the ceiling, an outage) leaves the yield as it was: it says nothing about
+the line's worth, though it counts as a fetch with content. A line whose yield stays under
+FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is frozen: its queue is kept and nothing in
+it is fetched. A frozen line thaws when other lines link into it THAW_INBOUND times. Growth is
+bounded by the fetches per run, so lines compete for a fixed capacity.
 
     priority = seed weight x base x HOP_DECAY^hops x line yield
                / (1 + fetched from this host / HOST_HALF)
@@ -56,6 +58,7 @@ import pyarrow.parquet as pq
 from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
+from frontier_crawler.pipeline import judgeable
 from frontier_crawler.storage.store import Store
 
 MAX_HOPS = 5                    # links this many steps from the start of a line are the last ones queued
@@ -234,14 +237,16 @@ def link_base(answers: Optional[JevResult]) -> float:
     return max(MIN_LINK_BASE, min(1.0, 0.5 * leads + 0.5 * (relevance(nouls) or 0.0)))
 
 
-def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> float:
-    """What one fetch was worth to its line: 0 to 1."""
+def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[float]:
+    """What one fetch was worth to its line: 0 to 1, or None for new content Jev would read but did not."""
     if row.get("outcome") != "stored" or row.get("block_marker"):
         return 0.0
     if answers is not None:
         judged = relevance(answers.nouls())
         if judged is not None:
             return max(0.0, min(1.0, judged))
+    elif judgeable(row):
+        return None
     return 1.0
 
 
@@ -340,11 +345,13 @@ class Frontier:
         self._lines[line_id] = line
         return line
 
-    def _record_yield(self, line: Dict[str, Any], value: float, now: dt.datetime) -> None:
+    def _record_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
+        """value None: new content not yet judged. It counts as content and leaves the yield where it was."""
         line["fetches"] += 1
-        line["content"] += value > 0
+        line["content"] += value is None or value > 0
         line["since_thaw"] += 1
-        line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
+        if value is not None:
+            line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
         if line["status"] == "active" and line["since_thaw"] >= MIN_FETCHES_TO_FREEZE and line["yield"] < FREEZE_YIELD:
             line["status"] = "frozen"
             line["frozen_at"] = now
@@ -482,7 +489,7 @@ class Frontier:
         # The fetch counts toward the line that found it, so a line is credited for reaching new ground.
         value = fetch_yield(row, answers)
         self._record_yield(self._lines[entry["line_id"]], value, now)
-        if entry.get("crossing") and value > 0:
+        if entry.get("crossing") and (value is None or value > 0):
             self._spawn(entry, now)
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")

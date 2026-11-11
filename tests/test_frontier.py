@@ -7,7 +7,8 @@ import datetime as dt
 from pathlib import Path
 from typing import Any, Dict
 
-from frontier_crawler.frontier import Frontier, Seed, crawl, extract_links, load_seeds, normalise
+from frontier_crawler.frontier import Frontier, Seed, crawl, extract_links, fetch_yield, load_seeds, normalise
+from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 from frontier_crawler.harvester.cascade import ScrapeResult
@@ -283,3 +284,46 @@ def test_lines_spawned_at_full_strength_before_the_change_are_caught_up_on_load(
     frontier = Frontier(lines=[{**line, "seed_id": "s", "status": "active"} for line in lines])
     assert abs(frontier.line("s:b")["yield"] - 0.56) < 1e-9 and abs(frontier.line("s:c")["yield"] - 0.392) < 1e-9
     assert frontier.line("s:d")["yield"] == 1.0                 # fetched since it started: its yield is its own
+
+
+class _Answers:
+    """Stands in for a JevResult: only nouls() is read."""
+
+    def __init__(self, value: float) -> None:
+        self.values = {q.id: value for q in judging.active() if q.type == "noul"}
+
+    def nouls(self) -> Dict[str, float]:
+        return self.values
+
+
+def _readable(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The row with text Jev would read."""
+    return {**row, "text": TEXT, "word_count": len(TEXT.split())}
+
+
+def test_what_a_fetch_is_worth_to_its_line() -> None:
+    assert fetch_yield(DEAD, None) == 0.0
+    assert fetch_yield(_content(), None) == 1.0                              # not something Jev reads
+    assert fetch_yield(_content(tier="API"), None) == 1.0
+    assert fetch_yield(_readable(_content()), None) is None                  # Jev would read it but did not
+    answers = _Answers(0.4)
+    assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
+
+
+def test_an_unjudged_page_leaves_the_yield_but_counts_as_content_and_still_spawns() -> None:
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    frontier.line("s")["yield"] = 0.6
+    root = frontier.entry("https://a.test/")
+    row = _readable(_page_row("https://a.test/", '<a href="https://b.test/x">b</a>'))
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    frontier.mark(frontier.entry("https://b.test/x"), _readable(_content("https://b.test/x")), None, NOW)
+    line = frontier.line("s")
+    assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2 and line["since_thaw"] == 2
+    assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6 * 0.7
+    # Once judged, the same kind of page moves the yield as before.
+    frontier._add("https://a.test/j", "s", "s", 1, 1.0, NOW)
+    answers = _Answers(0.4)
+    frontier.mark(frontier.entry("https://a.test/j"), _readable(_content("https://a.test/j")), answers, NOW)  # type: ignore[arg-type]
+    assert line["yield"] == 0.85 * 0.6 + 0.15 * judging.relevance(answers.nouls())  # type: ignore[operator]
