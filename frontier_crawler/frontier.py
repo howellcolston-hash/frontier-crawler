@@ -19,7 +19,7 @@ it out instead would let the zeros outweigh the judged pages by one over the sam
 page whose judgement is still coming leaves the yield until it arrives. Priority carries the yield, so a
 line that stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
 data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT of the way
-toward that line's (once per page and line, and only upward), and every 1/RETEST_SHARE-th take() fetches the
+toward that line's (only upward, and only on the first link from that line into it in a run), and every 1/RETEST_SHARE-th take() fetches the
 best entry of a group drawn at random, so cold groups are tried again. Growth is bounded by the fetches per
 run, so lines compete for a fixed capacity.
 
@@ -43,7 +43,7 @@ Input contract:
     picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
     # or in two phases, so nothing waits on Jev: frontier.expect_judgement(fetch_id, line_id), mark and add_links with
-    # answers None, then frontier.judged(fetch_id, answers or None, now) when the judgement arrives
+    # answers None, then frontier.judged(fetch_id, answers or None) when the judgement arrives
     files = frontier.save(workdir)          # upload with store.put_many
     stats = await crawl(store, engine, seeds, workdir=..., max_fetches=...)
 Every constant below is PROVISIONAL.
@@ -369,6 +369,8 @@ class Frontier:
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
         self.lifts = 0
+        self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
+        self.lines_lifted: set = set()
 
     # ------------------------------------------------------------ persistence
 
@@ -453,13 +455,18 @@ class Frontier:
         line["relevance"] = (1.0 - YIELD_ALPHA) * line["relevance"] + YIELD_ALPHA * value
 
     def _note_inbound(self, line_id: str, from_line: str) -> None:
-        """A page of from_line linked into line_id: its yield moves INBOUND_LIFT of the way toward from_line's, if higher."""
+        """A page of from_line linked into line_id. The first such link in a run moves line_id's yield INBOUND_LIFT of the
+        way toward from_line's, if higher; later ones do nothing, so a much-linked site cannot be held up by the links alone."""
+        if (from_line, line_id) in self._linked:
+            return
+        self._linked.add((from_line, line_id))
         line = self._lines[line_id]
         gap = self._lines[from_line]["yield"] - line["yield"]
         if gap > 0:
             self._set_yield(line, line["yield"] + INBOUND_LIFT * gap)
             line["inbound"] += 1
             self.lifts += 1
+            self.lines_lifted.add(line_id)
 
     def _spawn(self, entry: Dict[str, Any], now: dt.datetime) -> None:
         """A crossing link yielded content: its site becomes a line, and the queued links to that site move into it."""
@@ -556,13 +563,11 @@ class Frontier:
                     "anchor": None, "status": "unparseable", "discovered_at": now, "fetched_at": None,
                 })
                 self.skipped["unparseable_link"] += 1
-        lifted = set()
         for url, anchor in links:
             host = urlsplit(url).netloc
             covering = self._host_line.get(host)
-            # A link into another line's site lifts that line once per page, queued, fetched or new: the host map knows it either way.
-            if covering is not None and covering != own_line and covering not in lifted:
-                lifted.add(covering)
+            # A link into another line's site, queued, fetched or new: the host map knows its line either way.
+            if covering is not None and covering != own_line:
                 self._note_inbound(covering, own_line)
             if url in self._entries:
                 continue
@@ -648,7 +653,7 @@ class Frontier:
         called, and the links add_links() queues from it are remembered until then, to be re-scored."""
         self._judging[fetch_id] = (line_id, [])
 
-    def judged(self, fetch_id: str, answers: Optional[JevResult], now: dt.datetime) -> None:
+    def judged(self, fetch_id: str, answers: Optional[JevResult]) -> None:
         """The judgement of a page passed to expect_judgement(), or None when none will come. Moves the line's yield
         as mark() does (by the page's relevance, or by the line's when none came), and re-scores the links queued
         from it that are still waiting."""
@@ -1084,7 +1089,7 @@ async def crawl(
             logger.exception("judging failed; the page stays unjudged")
         finally:  # also when abandoned at the end of the run
             try:
-                frontier.judged(row["fetch_id"], answers, now())
+                frontier.judged(row["fetch_id"], answers)
                 portal = answers.nouls().get("data_portal", 0.0) if answers is not None else 0.0
                 if portal >= PORTAL_THRESHOLD:
                     data_portals[row["url_final"]] = round(portal, 2)
@@ -1194,6 +1199,7 @@ async def crawl(
             "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
+            "lines_lifted": len(frontier.lines_lifted),
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,

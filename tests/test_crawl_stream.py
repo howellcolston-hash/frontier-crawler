@@ -307,7 +307,7 @@ def test_re_tests_and_ordinary_takes_are_reported_apart_and_add_up(tmp_path: Pat
     assert retest["taken"] == 2 and retest["taken"] + ordinary["taken"] == stats["total"] == 121   # takes 50 and 100
     assert retest["stored"] + ordinary["stored"] == stats["stored"] and retest["judged"] + ordinary["judged"] == stats["judged"] == 121
     expected = round(frontier_module.judged_yield(_answers(0.6)), 4)
-    assert retest["mean_relevance"] == ordinary["mean_relevance"] == expected and stats["inbound_lifts"] == 0
+    assert retest["mean_relevance"] == ordinary["mean_relevance"] == expected and stats["inbound_lifts"] == stats["lines_lifted"] == 0
     assert "lines_frozen" not in stats and "lines_thawed" not in stats
 
 

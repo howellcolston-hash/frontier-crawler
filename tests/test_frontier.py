@@ -170,30 +170,29 @@ def _two_lines(yields: Dict[str, float]) -> Frontier:
     return frontier
 
 
-def test_a_link_from_a_better_line_lifts_once_per_page_and_never_lowers() -> None:
-    frontier = _two_lines({"a": 0.2, "b": 0.6})
-    b = frontier.entry("https://b.test/0")
-    # Into a: a fetched page, a queued one, a new one; and the same again. One lift for the page.
-    links = "".join(f'<a href="https://a.test/{p}">x</a>' for p in ("", "1", "new", "1"))
-    row = _page_row(b["url"], links)
-    frontier.mark(b, row, None, NOW)
-    b_yield = frontier.line("b")["yield"]
-    frontier.add_links(b, row, None, NOW)
+def test_a_better_line_lifts_another_once_per_run_and_never_lowers_it() -> None:
+    frontier = _two_lines({"a": 0.2, "b": 0.6, "c": 0.9})
+
+    def fetch(url: str, links: str) -> None:
+        entry, row = frontier.entry(url), _page_row(url, links)
+        frontier.mark(entry, row, None, NOW)
+        frontier.add_links(entry, row, None, NOW)
+
+    # Into a: a fetched page, a queued one, a new one; and the same again. One lift.
+    b_yield = 0.85 * 0.6 + 0.15   # b after the page itself is marked
+    fetch("https://b.test/0", "".join(f'<a href="https://a.test/{p}">x</a>' for p in ("", "1", "new", "1")))
     assert frontier.line("a")["yield"] == 0.2 + 0.05 * (b_yield - 0.2)
     assert frontier.line("a")["inbound"] == 1 and frontier.lifts == 1
-    # A link into a fetched page alone lifts too: the host map knows its line.
+    # Another page of b into a, in the same run: nothing.
     before = frontier.line("a")["yield"]
-    page = frontier.entry("https://b.test/1")
-    row = _page_row(page["url"], '<a href="https://a.test/">x</a>')
-    frontier.mark(page, row, None, NOW)
-    frontier.add_links(page, row, None, NOW)
-    assert frontier.line("a")["yield"] > before and frontier.lifts == 2
-    # From the worse line into the better one: nothing.
-    a = frontier.entry("https://a.test/2")
-    row = _page_row(a["url"], '<a href="https://b.test/2">x</a>')
-    frontier.mark(a, row, None, NOW)
+    fetch("https://b.test/1", '<a href="https://a.test/2">x</a>')
+    assert frontier.line("a")["yield"] == before and frontier.lifts == 1
+    # Another line's link into a fetched page alone lifts: the host map knows its line.
+    fetch("https://c.test/0", '<a href="https://a.test/">x</a>')
+    assert frontier.line("a")["yield"] > before and frontier.lifts == 2 and frontier.lines_lifted == {"a"}
+    # From the worse line into a better one: nothing.
     b_now = frontier.line("b")["yield"]
-    frontier.add_links(a, row, None, NOW)
+    fetch("https://a.test/2", '<a href="https://b.test/2">x</a>')
     assert frontier.line("b")["yield"] == b_now and frontier.line("b")["inbound"] == 0 and frontier.lifts == 2
 
 
@@ -421,11 +420,11 @@ def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_
     frontier.mark(frontier.entry("https://b.test/x"), x, None, NOW)
     assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2
     assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6 * 0.7
-    frontier.judged(row["fetch_id"], None, NOW)                       # no judgement came: the line's relevance stands in
+    frontier.judged(row["fetch_id"], None)                       # no judgement came: the line's relevance stands in
     assert line["yield"] == 0.85 * 0.6 + 0.15 * 0.8 and line["relevance"] == 0.8
     answers = _Answers(0.4)
     judged = judging.relevance(answers.nouls())  # type: ignore[arg-type]
-    frontier.judged(x["fetch_id"], answers, NOW)  # type: ignore[arg-type]
+    frontier.judged(x["fetch_id"], answers)  # type: ignore[arg-type]
     assert line["relevance"] == 0.85 * 0.8 + 0.15 * judged
     # A page Jev will not read, marked at once, counts the same way.
     frontier._add("https://a.test/n", "s", "s", 1, 1.0, NOW)
@@ -470,7 +469,7 @@ def test_under_sampling_a_line_settles_near_its_live_share_times_its_relevance()
             if rng.random() < 0.1:
                 frontier.expect_judgement(url, "s")
                 frontier.mark(frontier.entry(url), row, None, NOW)
-                frontier.judged(url, answers, NOW)  # type: ignore[arg-type]
+                frontier.judged(url, answers)  # type: ignore[arg-type]
             else:
                 frontier.mark(frontier.entry(url), row, None, NOW)
         seen.append(line["yield"])
@@ -608,7 +607,7 @@ def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random, later: Opt
     changed directly."""
     if later is not None:
         for fetch_id, answers in [later.pop(rng.randrange(len(later))) for _ in range(rng.randint(0, len(later)))]:
-            frontier.judged(fetch_id, answers, NOW)
+            frontier.judged(fetch_id, answers)
         queued = [e for e in frontier._entries.values() if e["status"] == "queued"]
         for entry in rng.sample(queued, min(3, len(queued))):
             frontier.rebase(entry, rng.choice([0.05, 0.3, 0.49, 1.0, entry["base"]]))
@@ -777,7 +776,7 @@ def test_judging_in_two_phases_ends_where_one_call_did() -> None:
                 frontier.mark(entry, row, None, NOW)
                 frontier.add_links(entry, row, None, NOW)
                 assert {frontier.entry(f"{url}/{k}")["base"] for k in range(3)} == {0.3}   # the default until judged
-                frontier.judged(row["fetch_id"], answers, NOW)  # type: ignore[arg-type]
+                frontier.judged(row["fetch_id"], answers)  # type: ignore[arg-type]
             else:
                 frontier.mark(entry, row, answers, NOW)  # type: ignore[arg-type]
                 frontier.add_links(entry, row, answers, NOW)  # type: ignore[arg-type]
@@ -801,12 +800,12 @@ def test_a_judgement_after_its_links_were_fetched_is_harmless() -> None:
     x = frontier.take(seeds, NOW.date())
     frontier.mark(x, _content(x["url"]), None, NOW)
     y = frontier.take(seeds, NOW.date())                          # out, not yet fetched
-    frontier.judged(row["fetch_id"], _Answers(0.9), NOW)  # type: ignore[arg-type]
+    frontier.judged(row["fetch_id"], _Answers(0.9))  # type: ignore[arg-type]
     assert x["base"] == 0.3 and x["status"] == "fetched"          # already fetched: left as it was
     assert y["base"] != 0.3                                       # in flight: the new score goes back with it
     frontier.release(y)
     assert frontier.take(seeds, NOW.date()) is y and frontier.count("queued") == 1
-    frontier.judged(row["fetch_id"], _Answers(0.1), NOW)  # type: ignore[arg-type]   # a second answer for it is ignored
+    frontier.judged(row["fetch_id"], _Answers(0.1))  # type: ignore[arg-type]   # a second answer for it is ignored
     assert y["base"] != link_base(_Answers(0.1))  # type: ignore[arg-type]
 
 
