@@ -65,12 +65,13 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from frontier_crawler.harvester.cascade import Target, timed
+from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
 from frontier_crawler.pipeline import judgeable
@@ -88,7 +89,6 @@ RETEST_SHARE = 0.02             # share of take() calls spent on a group drawn a
 RETEST_DRAWS = 5                # draws a re-test makes past blocked groups before it falls back to the ranked take
 NEW_HOST_SHARE = 0.2            # part of each round kept for hosts never fetched before
 HOST_ROUND_SHARE = 0.1          # most of one round that one host may take (at least 2)
-MAX_LINKS_PER_PAGE = 300
 MAX_QUEUED_PER_HOST = 2000
 MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
 PORTAL_THRESHOLD = 0.7          # Jev's data_portal answer at which a page is listed as a candidate for a derived client
@@ -145,13 +145,6 @@ _LINES_SCHEMA = pa.schema(
     ]
 )
 
-# Files that are never documents. Everything else, including PDFs and spreadsheets, is followed.
-_SKIP_EXTENSIONS = (
-    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp", ".css", ".js", ".mjs", ".map",
-    ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".avi", ".mov", ".webm", ".wav", ".exe", ".dmg", ".apk",
-)
-# Share buttons point at a form on a social site, not at a source.
-_SHARE_MARKERS = ("/sharer", "/share?", "/intent/tweet", "/shareArticle", "wa.me/?text", "api.whatsapp.com/send?text")
 _REFUSED_STATUS = {401, 403, 407, 429, 451, 503}
 _HEAVY_TIERS = {"PDF", "HEADLESS_PLAYWRIGHT"}
 
@@ -197,58 +190,6 @@ def load_seeds(path: Path) -> List[Seed]:
         seen.add(seed.id)
         seeds.append(seed)
     return seeds
-
-
-def normalise(url: str) -> str:
-    """Lower-case scheme and host, drop the fragment. Empty when the URL is not http(s) or does not parse.
-
-    A link that is dropped here is not lost: the page it was on is stored, so a better reader can pick it up later.
-    """
-    try:
-        parts = urlsplit(urldefrag(url.strip())[0])
-    except ValueError:
-        return ""
-    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
-        return ""
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, ""))
-
-
-def extract_links(body: bytes, base_url: str, limit: int = MAX_LINKS_PER_PAGE) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """((url, anchor text) for each distinct link in an HTML page, in page order; links that did not parse, as written)."""
-    from lxml import html as lxml_html
-
-    try:
-        tree = lxml_html.fromstring(body)
-    except Exception:
-        return [], []
-    own = normalise(base_url)
-    found: Dict[str, str] = {}
-    unparseable: List[str] = []
-    for anchor in tree.iter("a"):
-        href = (anchor.get("href") or "").strip()
-        if not href:
-            continue
-        try:
-            url = normalise(urljoin(base_url, href))
-        except ValueError:
-            unparseable.append(href[:500])
-            continue
-        if not url or url == own or url in found:
-            continue
-        lowered = url.lower()
-        if urlsplit(lowered).path.endswith(_SKIP_EXTENSIONS) or any(marker.lower() in lowered for marker in _SHARE_MARKERS):
-            continue
-        found[url] = " ".join((anchor.text_content() or "").split())[:200]
-        if len(found) >= limit:
-            break
-    return list(found.items()), unparseable
-
-
-def looks_like_html(content_type: Optional[str], body: bytes) -> bool:
-    content_type = (content_type or "").lower()
-    if "html" in content_type:
-        return True
-    return not content_type and body.lstrip()[:1] == b"<"
 
 
 def link_base(answers: Optional[JevResult]) -> float:

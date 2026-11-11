@@ -16,6 +16,7 @@ from frontier_crawler import frontier as frontier_module
 from frontier_crawler import pipeline
 from frontier_crawler.frontier import Frontier, Seed, crawl
 from frontier_crawler.harvester.cascade import ScrapeResult
+from frontier_crawler.harvester.readers import extract_links
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
 from frontier_crawler.pipeline import Engine
@@ -59,7 +60,7 @@ class Site:
             links = "".join(f'<a href="{page}">p</a>' for page in self.dead + self.pages) if url == ROOT else ""
             text = f"{url} {TEXT}"
             body = f"<html><body>{links}<p>{text}</p></body></html>".encode()
-            return ScrapeResult(url, 200, body, text, len(text.split()), "DOM_TRAFILATURA", None, "text/html")
+            return ScrapeResult(url, 200, body, text, len(text.split()), "DOM_TRAFILATURA", None, "text/html", links=extract_links(body, url))
         finally:
             self.finished.append(url)
 
@@ -229,7 +230,16 @@ def test_a_failed_periodic_upload_loses_no_rows(tmp_path: Path, monkeypatch: pyt
             super().put_many(files, message)
 
     store = FlakyStore(tmp_path / "store")
-    stats = _crawl(tmp_path, Site(30, delay=0.003), store=store, concurrency=2)
+    site = Site(30)
+
+    async def after_failed_uploads(site: Site, url: str) -> None:
+        # Pages past the first wait until the uploader has failed twice and then sent the first page's row,
+        # so the failures fall on periodic uploads however fast this machine writes.
+        while url != ROOT and store.calls < 3:
+            await asyncio.sleep(0.005)
+
+    site.on_start = after_failed_uploads
+    stats = _crawl(tmp_path, site, store=store, concurrency=2)
     rows = _rows(tmp_path, "fetches")
     assert store.calls > 3 and stats["total"] == 31 == len(rows) == len({row["fetch_id"] for row in rows})
     assert len(stats["shards"]) == sum(len(list((tmp_path / "store" / table).rglob("*.parquet"))) for table in ("fetches", "bodies", "links"))
@@ -337,11 +347,8 @@ def test_every_link_of_a_stored_page_is_written_once_in_page_order_including_tho
     class Linked:
         async def fetch(self, url: str, timeout: Any = None, connect: Any = None) -> ScrapeResult:
             body = f"<html><body>{pages.get(url, '')}<p>{url} {TEXT}</p></body></html>".encode()
-            return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html")
+            return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html", links=extract_links(body, url))
 
-    calls: List[str] = []
-    extract = frontier_module.extract_links
-    monkeypatch.setattr(frontier_module, "extract_links", lambda body, base: calls.append(base) or extract(body, base))
     stats = _crawl(tmp_path, Linked())
     fetches = {row["fetch_id"]: row["url_final"] for row in _rows(tmp_path, "fetches")}
     links: Dict[str, List[tuple]] = {}
@@ -354,5 +361,3 @@ def test_every_link_of_a_stored_page_is_written_once_in_page_order_including_tho
     frontier = _frontier(tmp_path)
     assert frontier.entry("https://a.test/deep") is None and stats["skipped"]["hop_limit"] == 1   # declined, still written
     assert stats["links_written"] == 5 and stats["shard_bytes"]["links"] > 0 and stats["shard_bytes"]["bodies"] > 0
-    # Extracted once per stored page, by the engine; the queue used that result.
-    assert sorted(calls) == sorted(fetches.values()) and len(calls) == stats["stored"] == 4

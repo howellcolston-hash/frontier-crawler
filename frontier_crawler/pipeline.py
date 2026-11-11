@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 import pyarrow.parquet as pq
 
 from frontier_crawler.harvester.cascade import MIN_WORDS as THIN_HTML_WORDS, ScrapeResult, Target, timed
+from frontier_crawler.harvester.readers import ReaderPool
 from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
@@ -69,6 +70,9 @@ _MAX_REJECTIONS = 3
 _MIN_FORECAST_PAGES = 500
 # Top-level key in the spend file for that count. The file's other keys are months ("2026-11").
 FORECAST_KEY = "judgeable_pages_last_crawl_run"
+# PROVISIONAL: a scan's reader process is killed after this long: past read_scan's own limit, which the page in
+# progress can overrun by its two Tesseract calls of up to 120 s each.
+_OCR_LIMIT_S = ocr.OCR_SECONDS + 300.0
 # Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
 _UPLOAD_EVERY_S = 600.0
 
@@ -181,7 +185,7 @@ class Engine:
             "not_sampled": 0, "jev_sample_rate": 1.0,
             "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
             "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
-            "links_written": 0,
+            "links_written": 0, "reader_crashes": 0, "reader_timeouts": 0,
         }
 
     async def start(self) -> None:
@@ -271,6 +275,8 @@ class Engine:
                 "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
                 "timeouts": {"connect": counts.get("connect_timeouts", 0), "read": counts.get("read_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
                 **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8")},
+                # Pages whose reader process died or hung: the fetcher's, and the OCR command's own.
+                **{key: self.stats[key] + counts.get(key, 0) for key in ("reader_crashes", "reader_timeouts")},
                 "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                         "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
                 # shortcut: ru_maxrss is KB on Linux only; macOS reports bytes
@@ -304,7 +310,7 @@ class Engine:
 
     async def fetch(self, target: Target, **limits: float) -> Dict[str, Any]:
         """Fetch one target, buffer its row and count it. Returns the row with two keys that are not stored columns:
-        row["links"], (links, unparseable hrefs) as frontier.extract_links gives them for a stored HTML page, else None;
+        row["links"], (links, unparseable hrefs) of a stored HTML page as its reader found them, else None;
         and row["timed_out"], set when nothing was served because of a timeout. limits (timeout=, connect=) go to the fetcher."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
@@ -403,7 +409,7 @@ class Engine:
         links = None
         if outcome == "stored":
             self._keep_body(row, body)
-            links = self._links(row, body)
+            links = self._links(row, scraped.links)
             self.stats["stored_bytes"] += len(body)
             tier = scraped.tier_used
             self.stats["stored_by_tier"][tier] = self.stats["stored_by_tier"].get(tier, 0) + 1
@@ -431,13 +437,10 @@ class Engine:
         self.stats["bodies_written"] += 1
         self.stats["bodies_written_bytes"] += len(body)
 
-    def _links(self, row: Dict[str, Any], body: bytes) -> Any:
-        """Extract a stored HTML page's links once, write them to the links table and hand them on for the queue."""
-        from frontier_crawler.frontier import extract_links, looks_like_html  # frontier imports this module
-
-        if not looks_like_html(row["content_type"], body):
+    def _links(self, row: Dict[str, Any], links: Any) -> Any:
+        """Write a stored HTML page's links, as the fetcher's reader found them, to the links table; hand them on for the queue."""
+        if links is None:
             return None
-        links = extract_links(body, row["url_final"])
         writer = self._writer("links", self._day)
         for position, (url, anchor) in enumerate(links[0]):
             writer.add({"fetch_id": row["fetch_id"], "url": url, "anchor": anchor or None, "position": position})
@@ -541,6 +544,13 @@ class Engine:
         Stops starting new scans after max_minutes; scans already read are skipped by the next run.
         """
         deadline = None if max_minutes is None else time.monotonic() + max_minutes * 60
+        readers = ReaderPool(self.stats, workers=1)
+        try:
+            await self._ocr_days(days, deadline, readers)
+        finally:
+            readers.close()
+
+    async def _ocr_days(self, days: Sequence[dt.date], deadline: Optional[float], readers: ReaderPool) -> None:
         for day in days:
             done = {row["fetch_id"] for row in await self._read_day("ocr_text", day, ["fetch_id"])}
             columns = ["fetch_id", "sha256", "outcome", "tier_used", "word_count", "body"]
@@ -557,7 +567,7 @@ class Engine:
                     logger.warning("no stored body for %s", row["fetch_id"])
                     continue
                 try:
-                    text, pages_read, pages_total, langs = await asyncio.to_thread(ocr.read_scan, body)
+                    text, pages_read, pages_total, langs = await readers.run(_OCR_LIMIT_S, ocr.read_scan, body)
                 except Exception as exc:
                     logger.warning("scan not read for %s: %s: %s", row["fetch_id"], type(exc).__name__, exc)
                     continue

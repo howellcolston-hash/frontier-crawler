@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from frontier_crawler.harvester.cascade import ScrapeResult, Target
+from frontier_crawler.harvester.readers import extract_links
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge.excerpt import build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevUnavailable
@@ -47,7 +48,8 @@ class FakeCascade:
 
 def _page(url: str, text: str = DOC, status: int = 200, tier: str = "DOM_TRAFILATURA", body: Optional[bytes] = None) -> ScrapeResult:
     raw = body if body is not None else f"<html>{text}</html>".encode()
-    return ScrapeResult(url, status, raw, text or None, len(text.split()), tier, None, "text/html")  # type: ignore[arg-type]
+    links = None if tier == "API" else extract_links(raw, url)  # as the fetcher's reader finds them
+    return ScrapeResult(url, status, raw, text or None, len(text.split()), tier, None, "text/html", links=links)  # type: ignore[arg-type]
 
 
 def _rows(store_root: Path, table: str) -> List[Dict[str, Any]]:
@@ -540,8 +542,24 @@ def test_a_fault_after_a_row_is_stored_does_not_stop_the_batch(tmp_path: Path) -
     assert asyncio.run(go())["stored"] == 3 and len(_rows(tmp_path / "store", "fetches")) == 3
 
 
+class InProcessReaders:
+    """Runs a reader in this process, so a test can replace ocr.read_scan with a closure. test_readers covers the processes."""
+
+    def __init__(self, counts: Dict[str, Any], workers: int = 1) -> None:
+        pass
+
+    async def run(self, limit: float, fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    def close(self) -> None:
+        pass
+
+
 def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch: Any) -> None:
     from frontier_crawler import ocr
+    from frontier_crawler import pipeline
+
+    monkeypatch.setattr(pipeline, "ReaderPool", InProcessReaders)
 
     scan = ScrapeResult("https://a.test/scan.pdf", 200, b"%PDF scan", None, 0, "PDF", None, "application/pdf")
     texty = ScrapeResult("https://a.test/text.pdf", 200, b"%PDF text", DOC, len(DOC.split()), "PDF", None, "application/pdf")
@@ -580,6 +598,9 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
 
 def test_scans_are_read_from_inline_bodies_and_from_bodies_stored_on_an_earlier_day(tmp_path: Path, monkeypatch: Any) -> None:
     from frontier_crawler import ocr
+    from frontier_crawler import pipeline
+
+    monkeypatch.setattr(pipeline, "ReaderPool", InProcessReaders)
 
     _old_format_shard(tmp_path, [{"fetch_id": "old-scan", "outcome": "stored", "tier_used": "PDF", "word_count": 0,
                                   "sha256": "ab" * 32, "body": b"%PDF old"}], DAY)

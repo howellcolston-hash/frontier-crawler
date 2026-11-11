@@ -81,7 +81,7 @@ BODY_SCHEMA = pa.schema(
     ]
 )
 
-# Every distinct link on a stored HTML page (up to the queue's per-page limit), normalised as the queue normalises it,
+# Every distinct link on a stored HTML page (up to readers.MAX_LINKS_PER_PAGE), normalised as the queue normalises it,
 # whether or not the queue took it. position is its order on the page, from 0.
 LINK_SCHEMA = pa.schema(
     [
