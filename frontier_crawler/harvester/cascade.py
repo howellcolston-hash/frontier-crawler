@@ -7,13 +7,14 @@ the result. Only BlockedAddress is raised, for a URL the engine must never reque
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import ssl
 import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 from urllib.parse import urlsplit
 
 import certifi
@@ -61,6 +62,17 @@ class ScrapeResult:
     error_message: Optional[str]
     content_type: str = ""
     too_large_bytes: Optional[int] = None
+
+
+@contextlib.contextmanager
+def timed(into: Dict[str, float], key: str) -> Iterator[None]:
+    """Add the seconds the block took to into[key]. Measuring must never break what it measures, so its own faults are dropped."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            into[key] = into.get(key, 0.0) + time.monotonic() - start
 
 
 class BlockedAddress(Exception):
@@ -228,6 +240,9 @@ class HarvesterCascade:
         self._owned: Optional[httpx.AsyncClient] = None
         self._throttle = throttle
         self._pdf_lock = asyncio.Lock()  # the PDF library must not run in two threads at once
+        # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
+        self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
+        self.counts: Dict[str, int] = dict.fromkeys(("http_timeouts", "browser_timeouts", "browser_launches"), 0)
 
     async def __aenter__(self) -> "HarvesterCascade":
         return self
@@ -256,10 +271,13 @@ class HarvesterCascade:
             result, wants_browser = await self._http(url)
         except httpx.HTTPError as exc:
             # A dead host or a timeout. A browser would meet the same wall.
+            if isinstance(exc, httpx.TimeoutException):
+                self.counts["http_timeouts"] += 1
             return _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
         if not wants_browser:
             return result
-        rendered = await self._browser(url, result.error_message, result.http_status)
+        with timed(self.timings, "browser"):  # includes the browser's own throttle wait
+            rendered = await self._browser(url, result.error_message, result.http_status)
         if rendered.raw_payload:
             return rendered
         # The browser got nothing. Keep what the plain request was served.
@@ -269,12 +287,14 @@ class HarvesterCascade:
     async def _http(self, url: str) -> Tuple[ScrapeResult, bool]:
         """One GET. Returns (what was served, whether the browser tier should try)."""
         if self._throttle is not None:
-            await self._throttle.wait(url)
-        async with self._http_client().stream("GET", url) as response:
-            status = response.status_code
-            content_type = response.headers.get("content-type", "")
-            final_url = str(response.url)
-            body, size = await read_capped(response)
+            with timed(self.timings, "throttle_wait"):
+                await self._throttle.wait(url)
+        with timed(self.timings, "http"):
+            async with self._http_client().stream("GET", url) as response:
+                status = response.status_code
+                content_type = response.headers.get("content-type", "")
+                final_url = str(response.url)
+                body, size = await read_capped(response)
         if body is None:
             # Not cut short and kept: half a PDF or archive is unreadable.
             result = _failed(final_url, "DOM_TRAFILATURA", "too large", status)
@@ -289,16 +309,18 @@ class HarvesterCascade:
             return served(body.decode("utf-8", errors="replace"), "API"), False
         if "application/pdf" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".pdf"):
             try:
-                async with self._pdf_lock:
-                    text, note = await asyncio.to_thread(_pdf_text, body)
+                with timed(self.timings, "pdf_text"):  # includes waiting for the lock
+                    async with self._pdf_lock:
+                        text, note = await asyncio.to_thread(_pdf_text, body)
             except Exception as exc:  # encrypted, damaged, or not a PDF at all
                 return served(None, "PDF", f"pdf not read: {exc}"), False
             return served(text, "PDF", note), False
         try:
             html = body.decode("utf-8", errors="replace")
-            text = await asyncio.to_thread(
-                trafilatura.extract, html, output_format="markdown", include_comments=False, include_tables=True
-            )
+            with timed(self.timings, "extract_html"):
+                text = await asyncio.to_thread(
+                    trafilatura.extract, html, output_format="markdown", include_comments=False, include_tables=True
+                )
         except Exception:
             text = None
         words = word_count(text or "")
@@ -310,6 +332,7 @@ class HarvesterCascade:
     async def _browser(self, url: str, prior_note: Optional[str], prior_status: int) -> ScrapeResult:
         try:
             from playwright.async_api import Error as PlaywrightError
+            from playwright.async_api import TimeoutError as PlaywrightTimeout
             from playwright.async_api import async_playwright
         except ImportError as exc:
             return _failed(url, "HEADLESS_PLAYWRIGHT", f"playwright is not installed: {exc}", prior_status)
@@ -320,6 +343,7 @@ class HarvesterCascade:
         timeout_ms = int(self._timeout_s * 1000)
         try:
             playwright = await async_playwright().start()
+            self.counts["browser_launches"] += 1
             browser = await playwright.chromium.launch(headless=True)
             page = await (await browser.new_context(user_agent=USER_AGENT)).new_page()
             try:
@@ -336,6 +360,8 @@ class HarvesterCascade:
                 "HEADLESS_PLAYWRIGHT", prior_note, "text/html; rendered",
             )
         except Exception as exc:
+            if isinstance(exc, PlaywrightTimeout):
+                self.counts["browser_timeouts"] += 1
             return _failed(url, "HEADLESS_PLAYWRIGHT", f"{prior_note or ''}; browser: {type(exc).__name__}: {exc}".lstrip("; "), prior_status)
         finally:
             # A leaked Chromium uses up a small machine's memory.

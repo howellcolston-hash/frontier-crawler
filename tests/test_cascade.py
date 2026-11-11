@@ -129,3 +129,33 @@ def test_a_redirect_to_a_private_address_is_refused() -> None:
 
     with pytest.raises(BlockedAddress):
         asyncio.run(run())
+
+
+def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/slow":
+            raise httpx.ReadTimeout("slow", request=request)
+        return _html(f"<p>{WORDS}</p>")(request)
+
+    async def run() -> HarvesterCascade:
+        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+        assert (await fetcher.fetch("https://a.test/x")).word_count > 100
+        assert (await fetcher.fetch("https://a.test/slow")).raw_payload == b""
+        return fetcher
+
+    fetcher = asyncio.run(run())
+    assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
+    assert fetcher.counts == {"http_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0}
+
+
+def test_a_timer_fault_does_not_break_a_fetch() -> None:
+    class Broken(dict):
+        def __setitem__(self, key: Any, value: Any) -> None:
+            raise RuntimeError("timer fault")
+
+    async def run() -> ScrapeResult:
+        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(_html(f"<p>{WORDS}</p>"))))
+        fetcher.timings = Broken()
+        return await fetcher.fetch("https://a.test/x")
+
+    assert asyncio.run(run()).word_count > 100
