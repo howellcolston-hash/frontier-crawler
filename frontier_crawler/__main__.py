@@ -96,7 +96,7 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         _configure_questions(store, Path(workdir))
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=HostThrottle(args.min_interval)) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
-            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, batch=args.batch, max_minutes=args.max_minutes)
+            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes)
     _report(ctx, stats)
     if stats["errors"] or stats["seeds_with_nothing"]:
         ctx["status"] = "partial"
@@ -210,10 +210,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     crawler = sub.add_parser("crawl", help="follow the crawl queue from the seeds")
     crawler.add_argument("--max-fetches", type=int, default=200, help="most fetches in this run")
-    crawler.add_argument("--max-minutes", type=float, default=None, help="stop starting new rounds after this many minutes")
-    crawler.add_argument("--batch", type=int, default=50, help="fetches per round; the queue is re-ranked between rounds")
+    crawler.add_argument("--max-minutes", type=float, default=None, help="stop taking new URLs after this many minutes")
     crawler.add_argument("--min-interval", type=float, default=1.0, help="seconds between requests to one host")
-    crawler.add_argument("--concurrency", type=int, default=4)
+    # PROVISIONAL. Not higher until the queue and storage stages make a faster pace safe.
+    crawler.add_argument("--concurrency", type=int, default=12, help="pages fetched at once")
     for name, text in (("judge", "judge stored documents that have no Jev answers"), ("ocr", "read stored scanned PDFs with Tesseract")):
         later = sub.add_parser(name, help=text)
         later.add_argument("--start")

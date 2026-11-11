@@ -1,4 +1,4 @@
-"""Checks for the crawl queue: link extraction, how a round is chosen, and a crawl against a fake site. No network."""
+"""Checks for the crawl queue: link extraction, how the next URLs are chosen, and a crawl against a fake site. No network."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from frontier_crawler.frontier import (
-    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, Frontier, Seed, crawl, extract_links, fetch_yield, load_seeds, normalise,
+    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, Frontier, Seed, crawl, extract_links, fetch_yield, link_base, load_seeds,
+    normalise,
 )
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
@@ -189,7 +190,7 @@ class FakeSite:
         return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html")
 
 
-def test_crawl_follows_links_round_by_round_and_keeps_its_queue(tmp_path: Path) -> None:
+def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     site = FakeSite({
         "https://a.test/": '<a href="/one">one</a> <a href="/two">two</a> <a href="https://b.test/">b</a> <a href="http://[bad">x</a>',
         "https://a.test/one": '<a href="/deep">deep</a>',
@@ -201,11 +202,11 @@ def test_crawl_follows_links_round_by_round_and_keeps_its_queue(tmp_path: Path) 
 
     def go(run: str, max_fetches: int) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=max_fetches, batch=2, now=lambda: NOW))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW))
 
     first = go("r1", 2)
     assert first["total"] == 2 and first["links_added"] == 3 and first["queued"] == 3   # the broken link is skipped, not fatal
-    assert first["skipped"] == {"unparseable_link": 1, "hop_limit": 0, "host_queue_full": 0, "too_large": 0}
+    assert first["skipped"] == {"unparseable_link": 1, "hop_limit": 0, "host_queue_full": 0, "too_large": 0, "host_cooled": 0}
     assert sorted(site.fetched) == ["https://a.test/", "https://dead.test/"]
     assert first["stored_by_seed"] == {"a": 1, "dead": 0} and first["seeds_with_nothing"] == ["dead"]
     assert first["seed_url_problems"] == {"https://dead.test/": "error_page, status 404: http 404"}
@@ -213,7 +214,7 @@ def test_crawl_follows_links_round_by_round_and_keeps_its_queue(tmp_path: Path) 
     second = go("r2", 10)
     assert second["seeds_added"] == 0 and second["stored"] == 3 and second["error_pages"] == 2   # /deep, and the dead seed again
     assert sorted(set(site.fetched[2:]) - {"https://dead.test/"}) == ["https://a.test/deep", "https://a.test/one", "https://a.test/two", "https://b.test/"]
-    assert second["queued"] == 0 and second["rounds"] >= 2
+    assert second["queued"] == 0
     assert second["lines_spawned"] == 1 and second["lines_frozen"] == 0   # b.test became a line
     assert second["seeds_with_nothing"] == ["dead"]            # still reported in a later run
     assert site.fetched.count("https://dead.test/") == 2 and "https://dead.test/" in second["seed_url_problems"]   # and tried again
@@ -241,23 +242,31 @@ def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
     store = CountingStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, batch=2, now=lambda: NOW))
-    assert stats["rounds"] >= 3 and stats["total"] == 7 and store.queue_uploads == 1
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
+    assert stats["total"] == 7 and store.queue_uploads == 1
+
+
+def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
+    store = LocalStore(tmp_path / "store")
+    engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
     seconds = stats["seconds"]
-    assert set(seconds) == {"load_state", "select", "fetch_rounds", "final_save", "total"}
-    assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetch_rounds"]
-    assert stats["slot_seconds"]["idle"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
+    assert set(seconds) == {"load_state", "take", "fetching", "judge_wait", "final_save", "total"}
+    assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
+    assert stats["slot_seconds"]["waiting"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
+    assert stats["workers"] == 4 and 1 <= stats["peak_in_flight"] <= 2   # one host: at most MAX_IN_FLIGHT_PER_HOST at once
     assert set(stats["state_bytes"]) >= {"frontier", "hosts", "lines", "url_state"} and all(stats["state_bytes"].values())
 
 
-def test_crawl_stops_starting_rounds_after_max_minutes(tmp_path: Path) -> None:
+def test_crawl_stops_taking_urls_after_max_minutes(tmp_path: Path) -> None:
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(8)), **{f"https://a.test/p{i}": "" for i in range(8)}})
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     ticks = iter(range(0, 10_000, 60))   # each clock reading is one minute later than the last
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=100, batch=2,
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=100,
                               max_minutes=2, now=lambda: NOW, clock=lambda: float(next(ticks))))
-    assert stats["stopped_by"] == "max_minutes" and stats["rounds"] == 1 and stats["total"] == 1 and stats["queued"] == 8
+    assert stats["stopped_by"] == "max_minutes" and stats["total"] == 1 and stats["queued"] == 8
 
 
 def test_example_seed_file_loads_with_unique_ids() -> None:
@@ -317,23 +326,76 @@ def test_what_a_fetch_is_worth_to_its_line() -> None:
     assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
 
 
-def test_an_unjudged_page_leaves_the_yield_but_counts_as_content_and_still_spawns() -> None:
+def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_at_the_lines_relevance() -> None:
     frontier = Frontier()
     frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
-    frontier.line("s")["yield"] = 0.6
+    line = frontier.line("s")
+    line.update({"yield": 0.6, "relevance": 0.8})
     root = frontier.entry("https://a.test/")
     row = _readable(_page_row("https://a.test/", '<a href="https://b.test/x">b</a>'))
+    frontier.expect_judgement(row["fetch_id"], "s")
     frontier.mark(root, row, None, NOW)
     frontier.add_links(root, row, None, NOW)
-    frontier.mark(frontier.entry("https://b.test/x"), _readable(_content("https://b.test/x")), None, NOW)
-    line = frontier.line("s")
+    x = _readable({**_content("https://b.test/x"), "fetch_id": "f-x"})
+    frontier.expect_judgement(x["fetch_id"], "s")
+    frontier.mark(frontier.entry("https://b.test/x"), x, None, NOW)
     assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2 and line["since_thaw"] == 2
     assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6 * 0.7
-    # Once judged, the same kind of page moves the yield as before.
-    frontier._add("https://a.test/j", "s", "s", 1, 1.0, NOW)
+    frontier.judged(row["fetch_id"], None, NOW)                       # no judgement came: the line's relevance stands in
+    assert line["yield"] == 0.85 * 0.6 + 0.15 * 0.8 and line["relevance"] == 0.8
     answers = _Answers(0.4)
-    frontier.mark(frontier.entry("https://a.test/j"), _readable(_content("https://a.test/j")), answers, NOW)  # type: ignore[arg-type]
-    assert line["yield"] == 0.85 * 0.6 + 0.15 * judging.relevance(answers.nouls())  # type: ignore[operator]
+    judged = judging.relevance(answers.nouls())  # type: ignore[arg-type]
+    frontier.judged(x["fetch_id"], answers, NOW)  # type: ignore[arg-type]
+    assert line["relevance"] == 0.85 * 0.8 + 0.15 * judged
+    # A page Jev will not read, marked at once, counts the same way.
+    frontier._add("https://a.test/n", "s", "s", 1, 1.0, NOW)
+    before = line["yield"]
+    frontier.mark(frontier.entry("https://a.test/n"), _readable(_content("https://a.test/n")), None, NOW)
+    assert line["yield"] == 0.85 * before + 0.15 * line["relevance"]
+
+
+def test_lines_saved_without_a_relevance_start_it_at_their_yield_and_new_lines_at_one() -> None:
+    lines = [{"line_id": "s", "seed_id": "s", "parent_line": None, "created_at": NOW, "since_thaw": 5, "yield": 0.4, "status": "active"}]
+    frontier = Frontier(lines=lines)
+    frontier.add_seeds([_seed("t", "https://t.test/")], NOW)
+    assert frontier.line("s")["relevance"] == 0.4 and frontier.line("t")["relevance"] == 1.0
+
+
+class _Nouls:
+    def __init__(self, **values: float) -> None:
+        self.values = values
+
+    def nouls(self) -> Dict[str, float]:
+        return self.values
+
+
+def test_under_sampling_a_line_settles_near_its_live_share_times_its_relevance() -> None:
+    """A line of which a share of pages is dead and the rest worth r, with one live page in ten judged: its yield must
+    settle near (1 - dead share) x r, not be dragged toward the zeros as when unjudged pages were left out."""
+    rng = random.Random(5)
+    answers = _Nouls(has_specifics=0.8, junk_page=0.1)
+    r = judging.relevance(answers.nouls())
+    assert r is not None and abs(r - 0.72) < 1e-9
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    line = frontier.line("s")
+    seen = []
+    for i in range(3000):
+        url = f"https://a.test/{i}"
+        frontier._add(url, "s", "s", 1, 1.0, NOW)
+        if rng.random() < 0.3:
+            frontier.mark(frontier.entry(url), DEAD, None, NOW)
+        else:
+            row = _readable({**_content(url), "fetch_id": url})
+            if rng.random() < 0.1:
+                frontier.expect_judgement(url, "s")
+                frontier.mark(frontier.entry(url), row, None, NOW)
+                frontier.judged(url, answers, NOW)  # type: ignore[arg-type]
+            else:
+                frontier.mark(frontier.entry(url), row, None, NOW)
+        seen.append(line["yield"])
+    settled = sum(seen[1000:]) / len(seen[1000:])
+    assert line["status"] == "active" and abs(settled - 0.7 * 0.72) < 0.03
 
 
 # ---------------------------------------------------------------- the ranked queue against scoring every entry
@@ -345,6 +407,7 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
     queued = [
         entry for entry in self._entries.values()
         if entry["status"] == "queued" and entry["seed_id"] in weights and self._lines[entry["line_id"]]["status"] == "active"
+        and entry["host"] not in self.cooled   # hosts that served nothing COOL_AFTER times in a row in this run
     ]
     if n <= 0 or not queued:
         return []
@@ -401,6 +464,7 @@ def reference_take(frontier: Frontier, seeds: Sequence[Seed], today: dt.date, ne
         entry for entry in frontier._entries.values()
         if entry["status"] == "queued" and entry["url"] not in frontier._in_flight and entry["seed_id"] in weights
         and frontier._lines[entry["line_id"]]["status"] == "active" and out_host[entry["host"]] < MAX_IN_FLIGHT_PER_HOST
+        and entry["host"] not in frontier.cooled
     ]
     if new_turn:
         waiting = [entry for entry in waiting if frontier._hosts.get(entry["host"], {}).get("fetches", 0) == 0] or waiting
@@ -452,9 +516,16 @@ def _random_frontier(rng: random.Random) -> tuple:
     return Frontier(entries, host_rows, lines), seeds
 
 
-def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random) -> None:
+def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random, later: Optional[list] = None) -> None:
     """Fetches of every kind: pages with links (new, known, into frozen lines), crossing finds that spawn lines,
-    dead runs that freeze a line, errors, redirects, and seeds that have stored nothing being queued again."""
+    dead runs that freeze a line, errors, redirects, and seeds that have stored nothing being queued again.
+    With `later`, also judgements in two phases, some arriving in a later call, and link scores changed directly."""
+    if later is not None:
+        for fetch_id, answers in [later.pop(rng.randrange(len(later))) for _ in range(rng.randint(0, len(later)))]:
+            frontier.judged(fetch_id, answers, NOW)
+        queued = [e for e in frontier._entries.values() if e["status"] == "queued"]
+        for entry in rng.sample(queued, min(3, len(queued))):
+            frontier.rebase(entry, rng.choice([0.05, 0.3, 0.49, 1.0, entry["base"]]))
     for _ in range(rng.randint(1, 6)):
         waiting = [e for e in frontier._entries.values() if e["status"] == "queued" and e["url"] not in frontier._in_flight]
         if not waiting:
@@ -471,6 +542,12 @@ def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random) -> None:
             answers = rng.choice([None, _Answers(rng.choice([0.1, 0.5, 0.9]))])
             if answers is not None:
                 row = _readable(row)
+            if answers is not None and later is not None and rng.random() < 0.6:
+                frontier.expect_judgement(row["fetch_id"], entry["line_id"])
+                frontier.mark(entry, row, None, NOW)
+                frontier.add_links(entry, row, None, NOW)
+                later.append((row["fetch_id"], answers))
+                continue
             frontier.mark(entry, row, answers, NOW)  # type: ignore[arg-type]
             frontier.add_links(entry, row, answers, NOW)  # type: ignore[arg-type]
         elif kind < 0.5:
@@ -501,6 +578,7 @@ def test_select_picks_exactly_what_scoring_every_entry_picked() -> None:
     today = NOW.date()
     for case in range(60):
         frontier, seeds = _random_frontier(rng)
+        later: list = []
         for step in range(8):
             now_seeds = seeds
             if rng.random() < 0.2:   # the config changes between rounds: a seed reweighted or dropped
@@ -509,7 +587,7 @@ def test_select_picks_exactly_what_scoring_every_entry_picked() -> None:
                 expected = [e["url"] for e in reference_select(frontier, n, now_seeds, today)]
                 assert [e["url"] for e in frontier.select(n, now_seeds, today)] == expected, (case, step, n)
             _check_counts(frontier)
-            _churn(frontier, seeds, rng)
+            _churn(frontier, seeds, rng, later if case % 2 else None)
 
 
 def test_take_hands_out_what_scoring_every_entry_would() -> None:
@@ -517,6 +595,7 @@ def test_take_hands_out_what_scoring_every_entry_would() -> None:
     today = NOW.date()
     for case in range(40):
         frontier, seeds = _random_frontier(rng)
+        later: list = []
         out: List[Dict[str, Any]] = []
         for step in range(60):
             roll = rng.random()
@@ -531,7 +610,7 @@ def test_take_hands_out_what_scoring_every_entry_would() -> None:
             elif out and roll < 0.9:
                 frontier.release(out.pop(rng.randrange(len(out))))
             else:
-                _churn(frontier, seeds, rng)
+                _churn(frontier, seeds, rng, later if case % 2 else None)
         _check_counts(frontier)
 
 
@@ -583,3 +662,122 @@ def test_an_entry_that_rounds_to_its_groups_best_score_is_ranked_by_url() -> Non
     frontier._add("https://b.test/a", "s", "s", 2, 1.0, NOW)   # joins z's group behind it
     assert [e["url"] for e in frontier.select(1, seeds, NOW.date())] == ["https://b.test/a"]
     assert [e["url"] for e in reference_select(frontier, 3, seeds, NOW.date())] == [e["url"] for e in frontier.select(3, seeds, NOW.date())]
+
+
+# ---------------------------------------------------------------- two phases: fetched now, judged later
+
+def test_judging_in_two_phases_ends_where_one_call_did() -> None:
+    """A scripted crawl of one line, each page judged once its fetch is recorded: the same yields and link scores."""
+    pages = [(f"https://a.test/{i}", "".join(f'<a href="https://a.test/{i}/{k}">x</a>' for k in range(3)), 0.2 + 0.15 * i) for i in range(5)]
+    frontiers = []
+    for two_phase in (False, True):
+        frontier = Frontier()
+        frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+        for url, _, _ in pages:
+            frontier._add(url, "s", "s", 1, 1.0, NOW)
+        for url, links, value in pages:
+            entry, row, answers = frontier.entry(url), _readable(_page_row(url, links)), _Answers(value)
+            if two_phase:
+                frontier.expect_judgement(row["fetch_id"], entry["line_id"])
+                frontier.mark(entry, row, None, NOW)
+                frontier.add_links(entry, row, None, NOW)
+                assert {frontier.entry(f"{url}/{k}")["base"] for k in range(3)} == {0.3}   # the default until judged
+                frontier.judged(row["fetch_id"], answers, NOW)  # type: ignore[arg-type]
+            else:
+                frontier.mark(entry, row, answers, NOW)  # type: ignore[arg-type]
+                frontier.add_links(entry, row, answers, NOW)  # type: ignore[arg-type]
+        frontiers.append(frontier)
+    old, new = frontiers
+    assert old._lines == new._lines and old._judging == new._judging == {}
+    assert {u: (e["base"], e["status"]) for u, e in old._entries.items()} == {u: (e["base"], e["status"]) for u, e in new._entries.items()}
+    assert [e["url"] for e in old.select(10, [_seed("s", "https://a.test/")], NOW.date())] == [
+        e["url"] for e in new.select(10, [_seed("s", "https://a.test/")], NOW.date())]
+
+
+def test_a_judgement_after_its_links_were_fetched_is_harmless() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    root = frontier.take(seeds, NOW.date())
+    row = _readable(_page_row("https://a.test/", '<a href="/x">x</a> <a href="/y">y</a>'))
+    frontier.expect_judgement(row["fetch_id"], "s")
+    frontier.mark(root, row, None, NOW)
+    assert frontier.add_links(root, row, None, NOW) == 2
+    x = frontier.take(seeds, NOW.date())
+    frontier.mark(x, _content(x["url"]), None, NOW)
+    y = frontier.take(seeds, NOW.date())                          # out, not yet fetched
+    frontier.judged(row["fetch_id"], _Answers(0.9), NOW)  # type: ignore[arg-type]
+    assert x["base"] == 0.3 and x["status"] == "fetched"          # already fetched: left as it was
+    assert y["base"] != 0.3                                       # in flight: the new score goes back with it
+    frontier.release(y)
+    assert frontier.take(seeds, NOW.date()) is y and frontier.count("queued") == 1
+    frontier.judged(row["fetch_id"], _Answers(0.1), NOW)  # type: ignore[arg-type]   # a second answer for it is ignored
+    assert y["base"] != link_base(_Answers(0.1))  # type: ignore[arg-type]
+
+
+def _timed_out(url: str = "") -> Dict[str, Any]:
+    return {"outcome": "error", "http_status": 0, "url_final": url, "timed_out": True}
+
+
+def test_a_timed_out_page_is_retried_once_through_its_own_lane(tmp_path: Path) -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i in range(4):
+        frontier._add(f"https://h{i}.test/", "s", "s", 1, 1.0, NOW)
+    first = [frontier.take(seeds, NOW.date()) for _ in range(5)]
+    for entry in first[:3]:
+        frontier.mark(entry, _timed_out(), None, NOW)
+    for entry in first[3:]:
+        frontier.mark(entry, _content(), None, NOW)
+    assert frontier.count("retry") == 3 and frontier.count("queued") == 0
+    frontier._add("https://h9.test/", "s", "s", 1, 1.0, NOW)
+    retries = [frontier.take(seeds, NOW.date()) for _ in range(3)]
+    # At most MAX_RETRY_IN_FLIGHT at once while there is other work; with none left, the rest too.
+    assert [e["status"] for e in retries] == ["retry", "retry", "queued"]
+    assert frontier.take(seeds, NOW.date())["url"] == first[2]["url"]
+    frontier.release(frontier.entry(first[2]["url"]))
+    frontier.mark(retries[2], _content(), None, NOW)
+    frontier.mark(retries[0], _timed_out(), None, NOW)                  # a second timeout fails it
+    frontier.mark(retries[1], _content(), None, NOW)                    # this one recovered
+    assert retries[0]["status"] == "failed" and retries[1]["status"] == "fetched"
+    store = LocalStore(tmp_path / "store")
+    store.put_many(frontier.save(tmp_path / "w"), "state")
+    again = Frontier.load(store, tmp_path / "w2")                       # the one left waiting is kept for the next run
+    assert again.count("retry") == 1 and again.expire_retries(NOW + dt.timedelta(days=1)) == 0
+    left = again.take(seeds, NOW.date())
+    assert left["status"] == "retry" and left["url"] == first[2]["url"]
+    again.release(left)
+    assert again.take(seeds, NOW.date()) is left
+
+
+def test_a_retry_that_waits_too_long_is_failed() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i, age in enumerate((3, 1)):
+        frontier._add(f"https://h{i}.test/", "s", "s", 1, 1.0, NOW)
+        frontier.mark(frontier.entry(f"https://h{i}.test/"), _timed_out(), None, NOW - dt.timedelta(days=age))
+    assert frontier.expire_retries(NOW) == 1 and frontier.count("retry") == 1 and frontier.count("failed") == 1
+    assert frontier.entry("https://h0.test/")["status"] == "failed"
+    assert frontier.take_retry(seeds, NOW.date())["url"] == "https://h1.test/" and frontier.take_retry(seeds, NOW.date()) is None
+
+
+def test_a_host_that_serves_nothing_three_times_in_a_row_is_left_alone_for_the_run() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://a.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i in range(6):
+        frontier._add(f"https://a.test/{i}", "s", "s", 1, 1.0, NOW)
+    for row in ({"outcome": "error"}, {"outcome": "error"}, _content(), {"outcome": "error"}, _timed_out()):
+        frontier.mark(frontier.take(seeds, NOW.date()), row, None, NOW)
+    assert frontier.cooled == set()                                   # a success in between clears the count
+    frontier.mark(frontier.take(seeds, NOW.date()), {"outcome": "error"}, None, NOW)
+    frontier._add("https://b.test/", "s", "s", 1, 0.01, NOW)
+    assert frontier.cooled == {"a.test"} and frontier.count("queued") == 3   # left queued, not failed (the sixth take was the retry)
+    b = frontier.take(seeds, NOW.date())
+    assert b["host"] == "b.test" and frontier.take(seeds, NOW.date()) is None
+    frontier.mark(b, _content(), None, NOW)
+    assert frontier.select(5, seeds, NOW.date()) == []
+    queued, top = frontier.by_seed(seeds, NOW.date())
+    assert queued == {"s": 2} and top == {}                           # a.test entries queued, none takeable now

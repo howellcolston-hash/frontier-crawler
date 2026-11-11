@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.questions import relevance
 
 QUESTIONS_V1 = judging.active()  # the built-in example set
-from frontier_crawler.pipeline import FORECAST_KEY, Engine, block_marker
+from frontier_crawler.pipeline import FORECAST_KEY, Engine, _spread, block_marker
 from frontier_crawler.storage.shards import day_folder
 from frontier_crawler.storage.store import HubStore, LocalStore
 
@@ -478,17 +479,31 @@ def test_a_run_records_where_its_time_and_bytes_went(tmp_path: Path) -> None:
     stats = asyncio.run(_engine(tmp_path, cascade, "r1", jev=jev, monthly_usd=8).run(
         [_job("https://a.test/x"), _job("https://a.test/api"), _job("https://a.test/missing")]))
     slot = stats["slot_seconds"]
-    assert set(slot) >= {"jev", "observe", "flush", "idle"} and all(isinstance(v, float) and v >= 0 for v in slot.values())
+    assert set(slot) >= {"observe", "waiting"} and all(isinstance(v, float) and v >= 0 for v in slot.values())
+    assert stats["flush"]["uploads"] == 1 and stats["flush"]["seconds_total"] >= 0
     tiers = stats["fetch_seconds_by_tier"]
     assert set(tiers) == {"DOM_TRAFILATURA", "API", "error"} and tiers["error"]["n"] == 1
-    assert all(0 <= t["p50"] <= t["p90"] <= t["max"] for t in tiers.values())
-    assert stats["bytes_by_tier"]["DOM_TRAFILATURA"] == {"n": 1, "body": len(f"<html>{DOC}</html>"), "text": len(DOC.encode())}
+    assert stats["bytes_by_tier"]["DOM_TRAFILATURA"] == {"body": len(f"<html>{DOC}</html>"), "text": len(DOC.encode())}
     assert stats["shard_bytes"]["fetches"] > 0 and stats["shard_bytes"]["judgements"] > 0
     assert stats["state_bytes"]["url_state"] > 0 and stats["state_bytes"]["jev_spend"] > 0
     assert stats["jev"]["calls"] == 1 and stats["jev"]["ceiling_usd_today"] > 0 and stats["jev"]["seconds_mean"] >= 0
-    assert stats["timeouts"] == {"http": 0, "browser": 0} and stats["browser_launches"] == 0
+    assert stats["timeouts"] == {"connect": 0, "read": 0, "browser": 0} and stats["browser_launches"] == 0
     assert stats["peak_rss_mb"] > 0
     json.dumps(stats)   # the run record is JSON
+
+
+def test_spread_reads_the_90th_percentile_by_nearest_rank() -> None:
+    assert _spread([float(i) for i in range(10, 0, -1)]) == {"n": 10, "mean": 5.5, "p50": 6.0, "p90": 9.0, "max": 10.0}
+
+
+def test_fetch_seconds_leave_out_the_wait_for_the_hosts_turn(tmp_path: Path) -> None:
+    class Polite:
+        async def fetch(self, url: str) -> ScrapeResult:
+            await asyncio.sleep(0.05)   # all of it spent waiting for the host's turn
+            return dataclasses.replace(_page(url), throttle_wait=0.05)
+
+    stats = asyncio.run(_engine(tmp_path, Polite(), "r1").run([_job("https://a.test/x")]))
+    assert stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["max"] < 0.03
 
 
 def test_a_fault_in_measuring_does_not_break_a_fetch(tmp_path: Path) -> None:
@@ -531,7 +546,7 @@ def test_the_ceiling_accrues_through_the_month_not_by_whole_days(tmp_path: Path)
 def test_every_document_is_judged_with_no_forecast_or_with_budget_to_spare(tmp_path: Path) -> None:
     pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(3)}
     jev = lambda: _jev(lambda request: httpx.Response(200, json=_jev_body()))  # noqa: E731
-    # A forecast is on file but no call this month: nothing to price it with.
+    # A forecast is on file but no call in any month: nothing to price it with.
     _write_spend(tmp_path / "store", {FORECAST_KEY: 1000})
     first = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=jev(), monthly_usd=8).run([_job(url) for url in pages]))
     assert first["jev_sample_rate"] == 1.0 and first["judged"] == 3 and first["not_sampled"] == 0
@@ -555,6 +570,14 @@ def test_a_run_the_budget_cannot_cover_judges_an_even_sample_and_leaves_none_pen
     assert stats["judged"] == len(picked) and 30 <= len(picked) <= 70
     assert stats["not_sampled"] == 200 - len(picked) and stats["pending"] == 0
     assert {call["fetch_id"] for call in _rows(tmp_path / "store", "judgement_calls")} == {row["fetch_id"] for row in picked}
+
+
+def test_the_first_run_of_a_month_is_priced_by_the_last_month_with_calls(tmp_path: Path) -> None:
+    # As above, but the one call was last month: the sample rate is still a quarter, not everything.
+    _write_spend(tmp_path / "store", {"2026-09": {"input_tokens": 9000, "calls": 1}, "2026-10": {"input_tokens": 700, "calls": 1}, FORECAST_KEY: 1000})
+    engine = _engine(tmp_path, FakeCascade({}), "r1", monthly_usd=_usd_for((175_700 - 700) * 720 / 212))
+    asyncio.run(engine.engine.start())
+    assert engine.engine.stats["jev_sample_rate"] == pytest.approx(0.25, abs=1e-4)
 
 
 def test_the_forecast_is_kept_from_the_last_sizeable_crawl_run(tmp_path: Path) -> None:
