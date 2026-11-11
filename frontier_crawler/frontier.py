@@ -12,19 +12,20 @@ starts at its parent's yield and earns its own yield from there; the generation 
 priority keeps the step down for good, so a line many sites from its seed stays discounted
 however well its own pages pay.
 
-Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
-new content Jev does not read (structured data, a scan with no text, a very short page), 0 for
-a dead link, a duplicate, an unchanged page or a refusal. A page Jev would read but does not
-(out of the sample, no key, the ceiling, an outage, a judgement abandoned at the end of a run)
-counts at the line's relevance: the running mean of the relevance of its judged pages. Leaving
-it out instead would let the zeros outweigh the judged pages by one over the sample rate. A
-page whose judgement is still coming leaves the yield until it arrives. Priority carries the yield, so a
-line that stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
-data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT of the way
-toward that line's yield, capped at its own relevance (only upward, and only on the first link from that line into it
-in a run), and every 1/RETEST_SHARE-th take() fetches the
-best entry of a group drawn at random, so cold groups are tried again (the draw ignores priority, generation included). Growth is bounded by the fetches per
-run, so lines compete for a fixed capacity.
+Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 0 for
+a dead link, a duplicate, an unchanged page or a refusal. New content Jev does not judge counts at
+the line's relevance: the running mean of the relevance of its judged pages. That covers content Jev
+does not read (structured data, a scan with no text, a very short page) and pages Jev would read but
+does not (out of the sample, no key, the ceiling, an outage, a judgement abandoned at the end of a
+run). Leaving them out instead would let the zeros outweigh the judged pages by one over the sample
+rate. A seed line's relevance starts at 1, a spawned line's at its parent's. A page whose judgement
+is still coming leaves the yield until it arrives. Priority carries the yield, so a line that
+stops paying sinks; nothing is ever skipped for a low yield alone. A sunk line recovers through
+data, never through time: a page of another line that links into it moves its yield INBOUND_LIFT
+of the way toward that line's yield, capped at its own relevance (only upward, and only on the
+first link from that line into it in a run), and every 1/RETEST_SHARE-th take() fetches the best
+entry of a group drawn at random, so cold groups are tried again (the draw ignores priority,
+generation included). Growth is bounded by the fetches per run, so lines compete for a fixed capacity.
 
     priority = seed weight x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
                / (1 + fetched from this host / HOST_HALF)
@@ -32,8 +33,9 @@ run, so lines compete for a fixed capacity.
 
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
-not been judged. hops count from the start of the line, generation from the seed. There are no source tiers: any
-http(s) link can be followed.
+not been judged. hops count from the start of the line, generation from the seed. The share of
+each round kept for hosts never fetched ranks them by this priority too. There are no source
+tiers: any http(s) link can be followed.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links.
@@ -77,7 +79,6 @@ from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
-from frontier_crawler.pipeline import judgeable
 from frontier_crawler.storage.store import Store
 
 MAX_HOPS = 5                    # links this many steps from the start of a line are the last ones queued
@@ -216,12 +217,10 @@ def judged_yield(answers: JevResult) -> float:
 
 
 def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[float]:
-    """What one fetch was worth to its line: 0 to 1, or None for new content Jev would read but did not."""
+    """What one fetch was worth to its line: 0 to 1, or None for new content not judged (yet)."""
     if row.get("outcome") != "stored" or row.get("block_marker"):
         return 0.0
-    if answers is not None:
-        return judged_yield(answers)
-    return None if judgeable(row) else 1.0
+    return None if answers is None else judged_yield(answers)
 
 
 def _static(entry: Dict[str, Any], weight: float) -> float:
@@ -260,6 +259,9 @@ class Frontier:
         }
         # Lines saved before 2026-11-11 may carry status "frozen", since_thaw and frozen_at: every line is active, and those are dropped on save.
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
+        for line in self._lines.values():
+            if line.get("relevance") is None:   # lines saved before 2026-11-11 have none: their yield is the best guess
+                line["relevance"] = line["yield"]
         # Lines saved before generations existed get theirs from the parent chain. Chains run past 100 lines, so walk
         # them without recursion; a missing parent or a loop makes the line where the walk stops generation 0.
         legacy = [line for line in self._lines.values() if line.get("generation") is None]
@@ -275,15 +277,13 @@ class Frontier:
             for link in reversed(chain):
                 link["generation"] = generation
                 generation += 1
-        # Those lines not fetched since they were spawned started at their parent's yield x HOP_DECAY. The generation
-        # factor now carries that step, so they restart at their parent's yield, as new lines do. Oldest first, so parents settle first.
+        # Those lines not fetched since they were spawned started at their parent's yield x HOP_DECAY and relevance 1. The
+        # generation factor now carries that step, so they restart at their parent's yield and relevance, as new lines do.
+        # Oldest first, so parents settle first.
         for line in sorted(legacy, key=lambda l: l["created_at"]):
             parent = self._lines.get(line.get("parent_line") or "")
             if parent is not None and line["fetches"] == 0:
-                line["yield"] = parent["yield"]
-        for line in self._lines.values():
-            if line.get("relevance") is None:   # lines saved before 2026-11-11 have none: their yield is the best guess
-                line["relevance"] = line["yield"]
+                line["yield"], line["relevance"] = parent["yield"], parent["relevance"]
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
         # The queue, ranked by group: see select(). The heaps are built by the first select() or take(), which bring the seed weights.
@@ -390,10 +390,12 @@ class Frontier:
     def _new_line(
         self, line_id: str, seed_id: str, parent: Optional[Dict[str, Any]], root_url: str, now: dt.datetime,
     ) -> Dict[str, Any]:
-        """A seed line (parent None) starts at yield 1 and generation 0; a spawned line at its parent's yield, one generation down."""
+        """A seed line (parent None) starts at yield and relevance 1 and generation 0; a spawned line at its parent's
+        yield and relevance, one generation down."""
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent and parent["line_id"], "root_url": root_url,
-            "created_at": now, "fetches": 0, "content": 0, "yield": parent["yield"] if parent else 1.0, "relevance": 1.0,
+            "created_at": now, "fetches": 0, "content": 0, "yield": parent["yield"] if parent else 1.0,
+            "relevance": parent["relevance"] if parent else 1.0,
             "inbound": 0, "generation": parent["generation"] + 1 if parent else 0,
         }
         self._lines[line_id] = line
@@ -601,7 +603,7 @@ class Frontier:
         line = self._lines[entry["line_id"]]
         value = fetch_yield(row, answers)
         if value is None and row.get("fetch_id") not in self._judging:
-            value = line["relevance"]   # Jev would read it but will not: it counts at what the line's judged pages were worth
+            value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
         elif answers is not None and value is not None:
             self._note_relevance(line, value)
         self._record_yield(line, value)

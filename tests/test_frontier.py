@@ -450,7 +450,8 @@ def test_lines_saved_without_a_generation_get_it_from_their_parent_chain() -> No
         line("x", "z"), line("y", "x"), line("z", "y"), line("w", "z"),                 # a loop, and a line hanging off it
         line("k", None, generation=0), line("k1", "k", generation=4), line("k2", "k1"),  # a saved generation is kept
         # Not fetched since spawning (at parent's yield x HOP_DECAY then): they restart at their parent's yield.
-        line("s", None, value=0.8), line("s:b", "s", fetches=0, value=0.56, day=1), line("s:c", "s:b", fetches=0, value=0.392, day=2),
+        line("s", None, value=0.8, relevance=0.4), line("s:b", "s", fetches=0, value=0.56, day=1, relevance=1.0),
+        line("s:c", "s:b", fetches=0, value=0.392, day=2, relevance=1.0),
         line("s:d", "s", value=1.0),
     ]
     frontier = Frontier(lines=lines)
@@ -460,6 +461,7 @@ def test_lines_saved_without_a_generation_get_it_from_their_parent_chain() -> No
     assert sorted(generation[i] for i in "xyz") == [0, 1, 2] and generation["w"] == generation["z"] + 1
     assert generation["k1"] == 4 and generation["k2"] == 5
     assert frontier.line("s:b")["yield"] == frontier.line("s:c")["yield"] == 0.8
+    assert frontier.line("s:b")["relevance"] == frontier.line("s:c")["relevance"] == 0.4
     assert frontier.line("s:d")["yield"] == 1.0                 # fetched since it started: its yield is its own
     assert frontier.line("c1")["yield"] == 0.5
 
@@ -481,8 +483,8 @@ def _readable(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def test_what_a_fetch_is_worth_to_its_line() -> None:
     assert fetch_yield(DEAD, None) == 0.0
-    assert fetch_yield(_content(), None) == 1.0                              # not something Jev reads
-    assert fetch_yield(_content(tier="API"), None) == 1.0
+    assert fetch_yield(_content(), None) is None                             # not something Jev reads
+    assert fetch_yield(_content(tier="API"), None) is None
     assert fetch_yield(_readable(_content()), None) is None                  # Jev would read it but did not
     answers = _Answers(0.4)
     assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
@@ -514,6 +516,25 @@ def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_
     before = line["yield"]
     frontier.mark(frontier.entry("https://a.test/n"), _readable(_content("https://a.test/n")), None, NOW)
     assert line["yield"] == 0.85 * before + 0.15 * line["relevance"]
+
+
+def test_content_jev_does_not_read_counts_at_the_lines_relevance_and_a_new_line_inherits_it() -> None:
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    line = frontier.line("s")
+    line.update({"yield": 0.6, "relevance": 0.3})
+    for i, row in enumerate((_content(tier="API"), _content(), {**_readable(_content()), "word_count": 5})):  # data, no text, very short
+        frontier._add(f"https://a.test/{i}", "s", "s", 1, 1.0, NOW)
+        before = line["yield"]
+        frontier.mark(frontier.entry(f"https://a.test/{i}"), row, None, NOW)
+        assert line["yield"] == 0.85 * before + 0.15 * 0.3 and line["relevance"] == 0.3
+    assert line["content"] == 3
+    root = frontier.entry("https://a.test/")
+    row = _page_row("https://a.test/", '<a href="https://b.test/">b</a>')
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    frontier.mark(frontier.entry("https://b.test/"), _content(), None, NOW)
+    assert frontier.line("s:b.test")["relevance"] == 0.3 and line["relevance"] == 0.3   # a seed line started at 1
 
 
 def test_lines_saved_without_a_relevance_start_it_at_their_yield_and_new_lines_at_one() -> None:
