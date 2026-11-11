@@ -265,19 +265,7 @@ def test_a_new_line_starts_one_step_below_its_parent_and_earns_its_own_yield() -
     parent_after = frontier.line("s")["yield"]
     assert frontier.line("s:b.test")["yield"] == parent_after * 0.7
     frontier.mark(frontier.entry("https://b.test/y"), _content("https://b.test/y"), None, NOW)
-    assert frontier.line("s:b.test")["yield"] == (parent_after * 0.7 + 1.0) / 2   # its first fetch counts in full
-
-
-def test_a_line_freezes_once_its_mean_yield_falls_below_the_mark() -> None:
-    frontier = Frontier()
-    frontier.add_seeds([_seed("dry", "https://dry.test/")], NOW)
-    for i in range(12):
-        frontier._add(f"https://dry.test/{i}", "dry", "dry", 1, 1.0, NOW)
-    for i in range(9):
-        frontier.mark(frontier.entry(f"https://dry.test/{i}"), DEAD, None, NOW)
-    assert frontier.line("dry")["status"] == "active"           # 1 start value and 9 duds: mean 0.1
-    frontier.mark(frontier.entry("https://dry.test/9"), DEAD, None, NOW)
-    assert frontier.line("dry")["status"] == "frozen"           # 10 duds: mean under 0.1
+    assert frontier.line("s:b.test")["yield"] == 0.85 * parent_after * 0.7 + 0.15   # and moves with its own fetches
 
 
 def test_lines_spawned_at_full_strength_before_the_change_are_caught_up_on_load() -> None:

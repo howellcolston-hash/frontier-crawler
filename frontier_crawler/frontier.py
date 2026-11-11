@@ -12,9 +12,7 @@ and earns its own yield from there: a branch is not handed full strength for bei
 
 Freezing. Every line keeps a running yield: 1 for a fetch that brought new content (Jev's
 relevance for it once judged), 0 for a dead link, a duplicate, an unchanged page or a
-refusal. The running yield is a plain mean of the line's start value and its fetches
-until it has about 1/YIELD_ALPHA of them, then a moving average, so a line's first fetches
-count in full. A line whose yield stays under FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is
+refusal. A line whose yield stays under FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is
 frozen: its queue is kept and nothing in it is fetched. A frozen line thaws when other
 lines link into it THAW_INBOUND times. Growth is bounded by the fetches per run, so lines
 compete for a fixed capacity.
@@ -346,9 +344,7 @@ class Frontier:
         line["fetches"] += 1
         line["content"] += value > 0
         line["since_thaw"] += 1
-        # The start value counts as one observation, so early fetches are a plain mean, not a 15% nudge.
-        alpha = max(YIELD_ALPHA, 1.0 / (line["since_thaw"] + 1))
-        line["yield"] = (1.0 - alpha) * line["yield"] + alpha * value
+        line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
         if line["status"] == "active" and line["since_thaw"] >= MIN_FETCHES_TO_FREEZE and line["yield"] < FREEZE_YIELD:
             line["status"] = "frozen"
             line["frozen_at"] = now
