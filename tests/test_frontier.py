@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from frontier_crawler.frontier import (
-    GENERATION_DECAY, HOP_DECAY, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
+    GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
 )
 from frontier_crawler.harvester.readers import extract_links, normalise
 from frontier_crawler.judge import questions as judging
@@ -461,6 +461,25 @@ def test_a_new_line_starts_one_generation_below_its_parent_and_the_step_lasts() 
     held = frontier.priority(z, 1.0)
     child["generation"] = 0
     assert abs(held - frontier.priority(z, 1.0) * GENERATION_DECAY) < 1e-15
+
+
+def test_a_crossing_is_priced_as_the_line_it_would_become() -> None:
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    root = frontier.entry("https://a.test/")
+    row = _page_row(root["url"], '<a href="https://b.test/x">x</a> <a href="https://b.test/y">y</a>')
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    frontier.line("s").update({"yield": 0.6, "relevance": 0.6})
+    y = frontier.entry("https://b.test/y")
+    before = frontier.priority(y, 1.0)
+    assert abs(before - frontier.priority({**y, "crossing": False}, 1.0) * GENERATION_DECAY) < 1e-15   # one generation down
+    frontier.mark(frontier.entry("https://b.test/x"), _content(), None, NOW)   # unread content: counts at relevance 0.6
+    child = frontier.line("s:b.test")
+    assert y["line_id"] == "s:b.test" and not y["crossing"] and y["hops"] == 1 and child["fetches"] == frontier.line("s")["fetches"] == 1
+    # The same yield, generation, hops and line fetches: only the page just fetched from its host lowers it.
+    assert abs(child["yield"] - 0.6) < 1e-15
+    assert abs(frontier.priority(y, 1.0) - before / (1 + 1 / HOST_HALF)) < 1e-12
 
 
 def test_lines_saved_without_a_generation_get_it_from_their_parent_chain() -> None:

@@ -36,7 +36,9 @@ generation included). Growth is bounded by the fetches per run, so lines compete
 
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
-not been judged. hops count from the start of the line, generation from the seed. The share of
+not been judged. hops count from the start of the line, generation from the seed. A crossing
+is priced as the line it would become: at its finder's generation + 1, so its priority does not
+drop when it becomes a line. The share of
 each round kept for hosts never fetched ranks them by this priority too. There are no source
 tiers: any http(s) link can be followed.
 
@@ -227,9 +229,10 @@ def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[f
 
 
 def _static(entry: Dict[str, Any], weight: float) -> float:
-    """The part of priority() fixed for a queued entry, in priority()'s own order of operations: priority() is
-    monotone in it, bit for bit, for one group's shared line and host factors."""
-    return weight * entry["base"] * HOP_DECAY ** entry["hops"]
+    """The part of priority() fixed for a queued entry, which priority() starts from: priority() is monotone in it,
+    bit for bit, for one group's shared line and host factors. A crossing takes one more generation step here, as the
+    line it would become."""
+    return weight * entry["base"] * HOP_DECAY ** entry["hops"] * (GENERATION_DECAY if entry.get("crossing") else 1.0)
 
 
 class _Group:
@@ -383,7 +386,7 @@ class Frontier:
         line = self._lines[entry["line_id"]]
         held_host = self._hosts.get(entry["host"], {}).get("fetches", 0) + extra_host
         return (
-            weight * entry["base"] * HOP_DECAY ** entry["hops"] * line["yield"] * GENERATION_DECAY ** line["generation"]
+            _static(entry, weight) * line["yield"] * GENERATION_DECAY ** line["generation"]
             / (1.0 + held_host / HOST_HALF)
             / (1.0 + (line["fetches"] + extra_line) / LINE_HALF)
         )
