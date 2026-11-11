@@ -29,6 +29,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import resource
 import time
 import uuid
@@ -107,7 +108,7 @@ def _spread(seconds: List[float]) -> Dict[str, Any]:
     s = sorted(seconds)
     n = len(s)
     return {"n": n, "mean": round(sum(s) / n, 3), "p50": round(s[n // 2], 3),
-            "p90": round(s[min(n - 1, int(0.9 * n))], 3), "max": round(s[-1], 3)}
+            "p90": round(s[math.ceil(0.9 * n) - 1], 3), "max": round(s[-1], 3)}
 
 
 def _size(path: Path) -> int:
@@ -163,9 +164,11 @@ class Engine:
         # Measurement only: seconds summed over fetch slots, per-tier fetch durations, Jev call and upload time.
         # finish() summarises them into stats.
         self._slot: Dict[str, float] = dict.fromkeys(("observe", "waiting"), 0.0)
-        self._uploads: Dict[str, float] = {"uploads": 0, "seconds_total": 0.0}
+        self._uploads = 0
+        self._upload_seconds = 0.0
         self._fetch_seconds: Dict[str, List[float]] = {}
-        self._jev_spent: Dict[str, float] = {"calls": 0, "seconds": 0.0}
+        self._jev_calls = 0
+        self._jev_spent: Dict[str, float] = {"seconds": 0.0}
         self.stats: Dict[str, Any] = {
             "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
             "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
@@ -180,11 +183,13 @@ class Engine:
         month = self._spend.setdefault(self._month, {"input_tokens": 0, "calls": 0})
         self.stats["jev_usd_month"] = round(month["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 4)
         # The share of this run's documents Jev can read: what may be spent now over what the last sizeable
-        # crawl run would cost at this month's tokens per call. With no forecast, every document is read.
+        # crawl run would cost at the tokens per call of the latest month with calls, so the first run of a
+        # month is priced too. With no forecast or no call yet, every document is read.
         pages = self._spend.get(FORECAST_KEY)
-        if pages and month["calls"] and month["input_tokens"]:
+        priced = [m for _, m in sorted(self._spend.items()) if isinstance(m, dict) and m.get("calls") and m.get("input_tokens")]
+        if pages and priced:
             available = max(0, self._ceiling_tokens - month["input_tokens"])
-            self._sample_rate = min(1.0, available / (pages * month["input_tokens"] / month["calls"]))
+            self._sample_rate = min(1.0, available / (pages * priced[-1]["input_tokens"] / priced[-1]["calls"]))
         self.stats["jev_sample_rate"] = round(self._sample_rate, 4)
 
     # ------------------------------------------------------------ writing
@@ -216,8 +221,8 @@ class Engine:
             self._unsent = []
             self.stats["shards"] += [remote for _, remote in files]
             self._last_upload = time.monotonic()
-            self._uploads["uploads"] += 1
-            self._uploads["seconds_total"] += self._last_upload - began
+            self._uploads += 1
+            self._upload_seconds += self._last_upload - began
 
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
         """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
@@ -232,24 +237,22 @@ class Engine:
 
     def _measure(self) -> None:
         """Summarise where the run's time went. Counts, seconds and bytes only, never what was fetched."""
-        try:
-            counts = getattr(self._fetcher, "counts", {})
-            calls, seconds = self._jev_spent["calls"], self._jev_spent["seconds"]
-            slot = {**self._slot, **getattr(self._fetcher, "timings", {})}
-            self.stats.update(
-                {
-                    "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
-                    "flush": {"uploads": self._uploads["uploads"], "seconds_total": round(self._uploads["seconds_total"], 1)},
-                    "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
-                    "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
-                    **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
-                    "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
-                            "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
-                    "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),  # Linux reports KB
-                }
-            )
-        except Exception:
-            logger.exception("run measurements not recorded")
+        counts = getattr(self._fetcher, "counts", {})
+        calls, seconds = self._jev_calls, self._jev_spent["seconds"]
+        slot = {**self._slot, **getattr(self._fetcher, "timings", {})}
+        self.stats.update(
+            {
+                "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
+                "flush": {"uploads": self._uploads, "seconds_total": round(self._upload_seconds, 1)},
+                "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
+                "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
+                **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
+                "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
+                        "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
+                # shortcut: ru_maxrss is KB on Linux only; macOS reports bytes
+                "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),
+            }
+        )
 
     # ------------------------------------------------------------ fetching
 
@@ -280,10 +283,11 @@ class Engine:
         column, is set when nothing was served because of a timeout. timeout goes to the fetcher when given."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
-            row, timed_out = await self._fetch_row(target, timeout)
-        with contextlib.suppress(Exception):
+            row, scraped = await self._fetch_row(target, timeout)
+        with contextlib.suppress(Exception):  # measuring must never break a fetch (tested)
             tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
-            self._fetch_seconds.setdefault(tier, []).append(took["fetch"])
+            # Without the wait for the host's turn, which is politeness, not the page.
+            self._fetch_seconds.setdefault(tier, []).append(took["fetch"] - (scraped.throttle_wait if scraped else 0.0))
         # The row is buffered before judging starts, so a judging fault cannot drop it.
         self._writer("fetches", self._day).add(row)
         self.stats["total"] += 1
@@ -296,7 +300,7 @@ class Engine:
             self._judgeable_seen += 1
             if not self.sampled(row):
                 self.stats["not_sampled"] += 1
-        return {**row, "timed_out": True} if timed_out else row
+        return {**row, "timed_out": True} if scraped is not None and scraped.timed_out else row
 
     def sampled(self, row: Dict[str, Any]) -> bool:
         """Whether judge() will ask Jev about this row: new readable content within the run's sample."""
@@ -309,8 +313,8 @@ class Engine:
             return None
         return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
 
-    async def _fetch_row(self, target: Target, timeout: Optional[float] = None) -> Tuple[Dict[str, Any], bool]:
-        """(the row, whether nothing was served because of a timeout)."""
+    async def _fetch_row(self, target: Target, timeout: Optional[float] = None) -> Tuple[Dict[str, Any], Optional[ScrapeResult]]:
+        """(the row, what the fetcher returned: None when it raised)."""
         row: Dict[str, Any] = {
             "fetch_id": str(uuid.uuid4()),
             "run_id": self.run_id,
@@ -330,7 +334,7 @@ class Engine:
             scraped = await (self._fetcher.fetch(target.url) if timeout is None else self._fetcher.fetch(target.url, timeout=timeout))
         except Exception as exc:
             logger.warning("fetch failed for %s: %s: %s", target.url, type(exc).__name__, exc)
-            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, False
+            return {**row, "fetched_at": self._now(), "error": f"{type(exc).__name__}: {exc}"}, None
         when = self._now()
         body = scraped.raw_payload or b""
         row.update(
@@ -343,9 +347,9 @@ class Engine:
             }
         )
         if scraped.too_large_bytes is not None:
-            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}, False
+            return {**row, "outcome": "too_large", "size_bytes": scraped.too_large_bytes, "error": scraped.error_message}, scraped
         if not body:
-            return {**row, "error": scraped.error_message or "nothing was served"}, scraped.timed_out
+            return {**row, "error": scraped.error_message or "nothing was served"}, scraped
         text = scraped.markdown_content or ""
         digest = hashlib.sha256(body).hexdigest()
         key = row["url_final"]
@@ -378,12 +382,10 @@ class Engine:
             if tier == "DOM_TRAFILATURA" and scraped.word_count < THIN_HTML_WORDS:
                 self.stats["thin_html"] += 1
             row["text"] = text or None
-            with contextlib.suppress(Exception):
-                sizes = self.stats["bytes_by_tier"].setdefault(tier, {"n": 0, "body": 0, "text": 0})
-                sizes["n"] += 1
-                sizes["body"] += len(body)
-                sizes["text"] += len(text.encode("utf-8"))
-        return row, False
+            sizes = self.stats["bytes_by_tier"].setdefault(tier, {"body": 0, "text": 0})
+            sizes["body"] += len(body)
+            sizes["text"] += len(text.encode("utf-8"))
+        return row, scraped
 
     # ------------------------------------------------------------ judging
 
@@ -400,7 +402,7 @@ class Engine:
             "relevance_version": judging.relevance_version(),
         }
         calls = self._writer("judgement_calls", day)
-        self._jev_spent["calls"] += 1
+        self._jev_calls += 1
         try:
             with timed(self._jev_spent, "seconds"):
                 result = await self._jev.ask(excerpt, self._questions)

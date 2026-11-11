@@ -23,7 +23,7 @@ def _fetch(handler: Any, url: str = "https://a.test/x", browser: Optional[List[s
     async def run() -> ScrapeResult:
         fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
         if browser is not None:
-            async def fake_browser(url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None) -> ScrapeResult:
+            async def fake_browser(url: str, prior_note: Optional[str], prior_status: int, *_: Any) -> ScrapeResult:
                 browser.append(url)
                 return ScrapeResult(url, 0, b"", None, 0, "HEADLESS_PLAYWRIGHT", "browser got nothing")
 
@@ -163,6 +163,17 @@ def test_a_timeout_is_flagged_and_one_call_can_ask_for_a_longer_limit() -> None:
 
     slow, slower, gone = asyncio.run(run())
     assert slow.timed_out and slower.timed_out and not gone.timed_out and limits == [30.0, 90.0, 30.0]
+
+
+def test_each_fetch_reports_its_own_wait_for_the_hosts_turn() -> None:
+    from frontier_crawler.harvester.throttle import HostThrottle
+
+    async def run() -> List[ScrapeResult]:
+        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(_html(f"<p>{WORDS}</p>"))), throttle=HostThrottle(0.05))
+        return [await fetcher.fetch("https://a.test/x"), await fetcher.fetch("https://a.test/y")]
+
+    first, second = asyncio.run(run())
+    assert first.throttle_wait < 0.02 and second.throttle_wait > 0.03
 
 
 def test_a_timer_fault_does_not_break_a_fetch() -> None:

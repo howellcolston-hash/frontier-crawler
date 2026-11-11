@@ -12,9 +12,11 @@ and earns its own yield from there: a branch is not handed full strength for bei
 
 Freezing. Every line keeps a running yield: Jev's relevance for new content it judged, 1 for
 new content Jev does not read (structured data, a scan with no text, a very short page), 0 for
-a dead link, a duplicate, an unchanged page or a refusal. A page Jev would read but did not
-(out of the sample, the ceiling, an outage) leaves the yield as it was: it says nothing about
-the line's worth, though it counts as a fetch with content. A line whose yield stays under
+a dead link, a duplicate, an unchanged page or a refusal. A page Jev would read but does not
+(out of the sample, no key, the ceiling, an outage, a judgement abandoned at the end of a run)
+counts at the line's relevance: the running mean of the relevance of its judged pages. Leaving
+it out instead would let the zeros outweigh the judged pages by one over the sample rate. A
+page whose judgement is still coming leaves the yield until it arrives. A line whose yield stays under
 FREEZE_YIELD after MIN_FETCHES_TO_FREEZE fetches is frozen: its queue is kept and nothing in
 it is fetched. A frozen line thaws when other lines link into it THAW_INBOUND times. Growth is
 bounded by the fetches per run, so lines compete for a fixed capacity.
@@ -133,6 +135,7 @@ _LINES_SCHEMA = pa.schema(
         ("content", pa.int64()),   # fetches that brought something new
         ("since_thaw", pa.int64()),
         ("yield", pa.float64()),
+        ("relevance", pa.float64()),  # running mean of Jev's relevance for its judged pages, at YIELD_ALPHA
         ("status", pa.string()),  # active | frozen
         ("frozen_at", _TS),
         ("inbound", pa.int64()),  # links from other lines since it was frozen
@@ -309,6 +312,9 @@ class Frontier:
             parent = self._lines.get(line.get("parent_line") or "")
             if parent is not None and line["since_thaw"] == 0 and line["yield"] == 1.0:
                 line["yield"] = parent["yield"] * HOP_DECAY
+        for line in self._lines.values():
+            if line.get("relevance") is None:   # lines saved before 2026-11-11 have none: their yield is the best guess
+                line["relevance"] = line["yield"]
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
         # The queue, ranked by group: see select(). The heaps are built by the first select() or take(), which bring the seed weights.
@@ -411,14 +417,14 @@ class Frontier:
     ) -> Dict[str, Any]:
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": root_url, "created_at": now,
-            "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "status": "active", "frozen_at": None, "inbound": 0,
+            "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "relevance": 1.0, "status": "active", "frozen_at": None, "inbound": 0,
         }
         self._lines[line_id] = line
         self._line_statuses["active"] += 1
         return line
 
     def _record_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
-        """value None: new content not yet judged. It counts as content and leaves the yield where it was."""
+        """value None: new content whose judgement is still coming. It counts as content and leaves the yield where it was."""
         line["fetches"] += 1
         line["content"] += value is None or value > 0
         line["since_thaw"] += 1
@@ -437,6 +443,10 @@ class Frontier:
             line["frozen_at"] = now
             line["inbound"] = 0
             self.frozen += 1
+
+    @staticmethod
+    def _note_relevance(line: Dict[str, Any], value: float) -> None:
+        line["relevance"] = (1.0 - YIELD_ALPHA) * line["relevance"] + YIELD_ALPHA * value
 
     def _note_inbound(self, target: Dict[str, Any], from_line: str) -> None:
         """Another line linked to a URL of this line. Enough of these thaw a frozen line."""
@@ -609,8 +619,13 @@ class Frontier:
             if row.get("tier_used") in _HEAVY_TIERS:
                 counts["heavy"] += 1
         # The fetch counts toward the line that found it, so a line is credited for reaching new ground.
+        line = self._lines[entry["line_id"]]
         value = fetch_yield(row, answers)
-        self._record_yield(self._lines[entry["line_id"]], value, now)
+        if value is None and row.get("fetch_id") not in self._judging:
+            value = line["relevance"]   # Jev would read it but will not: it counts at what the line's judged pages were worth
+        elif answers is not None and value is not None:
+            self._note_relevance(line, value)
+        self._record_yield(line, value, now)
         if flight is not None and flight[1] != entry["line_id"]:
             self._push_all(self._groups_by_line.get(flight[1], ()))   # the line it was taken from has one fewer in flight
         if entry.get("crossing") and (value is None or value > 0):
@@ -629,11 +644,18 @@ class Frontier:
 
     def judged(self, fetch_id: str, answers: Optional[JevResult], now: dt.datetime) -> None:
         """The judgement of a page passed to expect_judgement(), or None when none will come. Moves the line's yield
-        by the page's relevance, as mark() does, and re-scores the links queued from it that are still waiting."""
+        as mark() does (by the page's relevance, or by the line's when none came), and re-scores the links queued
+        from it that are still waiting."""
         line_id, urls = self._judging.pop(fetch_id, ("", []))
-        if not line_id or answers is None:
+        if not line_id:
             return
-        self._move_yield(self._lines[line_id], judged_yield(answers), now)
+        line = self._lines[line_id]
+        if answers is None:
+            self._move_yield(line, line["relevance"], now)   # it will not be judged: it counts as mark() counts such a page
+            return
+        value = judged_yield(answers)
+        self._note_relevance(line, value)
+        self._move_yield(line, value, now)
         base = link_base(answers)
         for url in urls:
             self.rebase(self._entries[url], base)

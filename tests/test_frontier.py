@@ -244,10 +244,18 @@ def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
     assert stats["total"] == 7 and store.queue_uploads == 1
+
+
+def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
+    store = LocalStore(tmp_path / "store")
+    engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
     seconds = stats["seconds"]
     assert set(seconds) == {"load_state", "take", "fetching", "judge_wait", "final_save", "total"}
     assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
     assert stats["slot_seconds"]["waiting"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
+    assert stats["workers"] == 4 and 1 <= stats["peak_in_flight"] <= 2   # one host: at most MAX_IN_FLIGHT_PER_HOST at once
     assert set(stats["state_bytes"]) >= {"frontier", "hosts", "lines", "url_state"} and all(stats["state_bytes"].values())
 
 
@@ -318,23 +326,76 @@ def test_what_a_fetch_is_worth_to_its_line() -> None:
     assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
 
 
-def test_an_unjudged_page_leaves_the_yield_but_counts_as_content_and_still_spawns() -> None:
+def test_a_page_awaiting_judgement_leaves_the_yield_and_one_never_judged_counts_at_the_lines_relevance() -> None:
     frontier = Frontier()
     frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
-    frontier.line("s")["yield"] = 0.6
+    line = frontier.line("s")
+    line.update({"yield": 0.6, "relevance": 0.8})
     root = frontier.entry("https://a.test/")
     row = _readable(_page_row("https://a.test/", '<a href="https://b.test/x">b</a>'))
+    frontier.expect_judgement(row["fetch_id"], "s")
     frontier.mark(root, row, None, NOW)
     frontier.add_links(root, row, None, NOW)
-    frontier.mark(frontier.entry("https://b.test/x"), _readable(_content("https://b.test/x")), None, NOW)
-    line = frontier.line("s")
+    x = _readable({**_content("https://b.test/x"), "fetch_id": "f-x"})
+    frontier.expect_judgement(x["fetch_id"], "s")
+    frontier.mark(frontier.entry("https://b.test/x"), x, None, NOW)
     assert line["yield"] == 0.6 and line["fetches"] == 2 and line["content"] == 2 and line["since_thaw"] == 2
     assert frontier.spawned == 1 and frontier.line("s:b.test")["yield"] == 0.6 * 0.7
-    # Once judged, the same kind of page moves the yield as before.
-    frontier._add("https://a.test/j", "s", "s", 1, 1.0, NOW)
+    frontier.judged(row["fetch_id"], None, NOW)                       # no judgement came: the line's relevance stands in
+    assert line["yield"] == 0.85 * 0.6 + 0.15 * 0.8 and line["relevance"] == 0.8
     answers = _Answers(0.4)
-    frontier.mark(frontier.entry("https://a.test/j"), _readable(_content("https://a.test/j")), answers, NOW)  # type: ignore[arg-type]
-    assert line["yield"] == 0.85 * 0.6 + 0.15 * judging.relevance(answers.nouls())  # type: ignore[operator]
+    judged = judging.relevance(answers.nouls())  # type: ignore[arg-type]
+    frontier.judged(x["fetch_id"], answers, NOW)  # type: ignore[arg-type]
+    assert line["relevance"] == 0.85 * 0.8 + 0.15 * judged
+    # A page Jev will not read, marked at once, counts the same way.
+    frontier._add("https://a.test/n", "s", "s", 1, 1.0, NOW)
+    before = line["yield"]
+    frontier.mark(frontier.entry("https://a.test/n"), _readable(_content("https://a.test/n")), None, NOW)
+    assert line["yield"] == 0.85 * before + 0.15 * line["relevance"]
+
+
+def test_lines_saved_without_a_relevance_start_it_at_their_yield_and_new_lines_at_one() -> None:
+    lines = [{"line_id": "s", "seed_id": "s", "parent_line": None, "created_at": NOW, "since_thaw": 5, "yield": 0.4, "status": "active"}]
+    frontier = Frontier(lines=lines)
+    frontier.add_seeds([_seed("t", "https://t.test/")], NOW)
+    assert frontier.line("s")["relevance"] == 0.4 and frontier.line("t")["relevance"] == 1.0
+
+
+class _Nouls:
+    def __init__(self, **values: float) -> None:
+        self.values = values
+
+    def nouls(self) -> Dict[str, float]:
+        return self.values
+
+
+def test_under_sampling_a_line_settles_near_its_live_share_times_its_relevance() -> None:
+    """A line of which a share of pages is dead and the rest worth r, with one live page in ten judged: its yield must
+    settle near (1 - dead share) x r, not be dragged toward the zeros as when unjudged pages were left out."""
+    rng = random.Random(5)
+    answers = _Nouls(has_specifics=0.8, junk_page=0.1)
+    r = judging.relevance(answers.nouls())
+    assert r is not None and abs(r - 0.72) < 1e-9
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
+    line = frontier.line("s")
+    seen = []
+    for i in range(3000):
+        url = f"https://a.test/{i}"
+        frontier._add(url, "s", "s", 1, 1.0, NOW)
+        if rng.random() < 0.3:
+            frontier.mark(frontier.entry(url), DEAD, None, NOW)
+        else:
+            row = _readable({**_content(url), "fetch_id": url})
+            if rng.random() < 0.1:
+                frontier.expect_judgement(url, "s")
+                frontier.mark(frontier.entry(url), row, None, NOW)
+                frontier.judged(url, answers, NOW)  # type: ignore[arg-type]
+            else:
+                frontier.mark(frontier.entry(url), row, None, NOW)
+        seen.append(line["yield"])
+    settled = sum(seen[1000:]) / len(seen[1000:])
+    assert line["status"] == "active" and abs(settled - 0.7 * 0.72) < 0.03
 
 
 # ---------------------------------------------------------------- the ranked queue against scoring every entry

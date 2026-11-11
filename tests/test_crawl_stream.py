@@ -31,8 +31,9 @@ class Site:
     """A root page linking to one page on each of n hosts. A page can wait on a gate, sleep, or time out its first
     attempts; fetch records the order pages start and finish, and the timeout each was given."""
 
-    def __init__(self, n: int, delay: float = 0.0, timeouts: Optional[Dict[str, int]] = None) -> None:
+    def __init__(self, n: int, delay: float = 0.0, timeouts: Optional[Dict[str, int]] = None, dead: int = 0) -> None:
         self.pages = [f"https://h{i}.test/" for i in range(n)]
+        self.dead = [f"https://d{i}.test/" for i in range(dead)]
         self.delay = delay
         self.timeouts = dict(timeouts or {})
         self.started: List[str] = []
@@ -51,7 +52,9 @@ class Site:
             if self.timeouts.get(url, 0) > 0:
                 self.timeouts[url] -= 1
                 return ScrapeResult(url, 0, b"", None, 0, "DOM_TRAFILATURA", "ReadTimeout: slow", timed_out=True)
-            links = "".join(f'<a href="{page}">p</a>' for page in self.pages) if url == ROOT else ""
+            if url in self.dead:
+                return ScrapeResult(url, 404, b"<html>Not found</html>", "Not found", 2, "DOM_TRAFILATURA", None, "text/html")
+            links = "".join(f'<a href="{page}">p</a>' for page in self.dead + self.pages) if url == ROOT else ""
             text = f"{url} {TEXT}"
             body = f"<html><body>{links}<p>{text}</p></body></html>".encode()
             return ScrapeResult(url, 200, body, text, len(text.split()), "DOM_TRAFILATURA", None, "text/html")
@@ -248,3 +251,11 @@ def test_a_retry_left_at_the_end_of_a_run_is_taken_by_the_next(tmp_path: Path) -
     site.limits.clear()
     second = _crawl(tmp_path, site, run="r2", max_fetches=1, concurrency=1)
     assert site.limits == [(late, frontier_module.RETRY_TIMEOUT_SECONDS)] and second["retry_recovered"] == 1
+
+
+def test_with_no_jev_a_line_of_good_pages_keeps_a_high_yield(tmp_path: Path) -> None:
+    # Four dead links are taken first (their hosts sort first), then twelve good pages Jev cannot read: those count
+    # at the line's relevance, so the yield climbs back. Left out, as before, they would leave it at 0.85^4 = 0.52.
+    stats = _crawl(tmp_path, Site(12, dead=4), concurrency=1)
+    line = _frontier(tmp_path).line("a")
+    assert stats["pending"] == 13 and stats["error_pages"] == 4 and line["fetches"] == 17 and line["yield"] > 0.85

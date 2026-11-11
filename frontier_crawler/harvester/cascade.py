@@ -69,6 +69,7 @@ class ScrapeResult:
     content_type: str = ""
     too_large_bytes: Optional[int] = None
     timed_out: bool = False  # nothing was served because the request or the page load timed out
+    throttle_wait: float = 0.0  # seconds this fetch waited for its host's turn
 
 
 @contextlib.contextmanager
@@ -282,10 +283,15 @@ class HarvesterCascade:
 
     async def fetch(self, url: str, timeout: Optional[float] = None) -> ScrapeResult:
         """timeout: seconds for the request and for each browser page load; the cascade's own when None."""
+        waited: Dict[str, float] = {}
+        result = await self._fetch(url, timeout or self._timeout_s, waited)
+        result.throttle_wait = waited.get("throttle_wait", 0.0)
+        return result
+
+    async def _fetch(self, url: str, timeout: float, waited: Dict[str, float]) -> ScrapeResult:
         check_public(url)
-        timeout = timeout or self._timeout_s
         try:
-            result, wants_browser = await self._http(url, timeout)
+            result, wants_browser = await self._http(url, timeout, waited)
         except httpx.HTTPError as exc:
             # A dead host or a timeout. A browser would meet the same wall.
             failed = _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
@@ -296,7 +302,7 @@ class HarvesterCascade:
         if not wants_browser:
             return result
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
-            rendered = await self._browser(url, result.error_message, result.http_status, timeout)
+            rendered = await self._browser(url, result.error_message, result.http_status, timeout, waited)
         if rendered.raw_payload:
             return rendered
         # The browser got nothing. Keep what the plain request was served.
@@ -304,10 +310,10 @@ class HarvesterCascade:
         result.timed_out = rendered.timed_out and not result.raw_payload
         return result
 
-    async def _http(self, url: str, timeout: float) -> Tuple[ScrapeResult, bool]:
+    async def _http(self, url: str, timeout: float, waited: Dict[str, float]) -> Tuple[ScrapeResult, bool]:
         """One GET. Returns (what was served, whether the browser tier should try)."""
         if self._throttle is not None:
-            with timed(self.timings, "throttle_wait"):
+            with timed(self.timings, "throttle_wait"), timed(waited, "throttle_wait"):
                 await self._throttle.wait(url)
         with timed(self.timings, "http"):
             async with self._http_client().stream("GET", url, timeout=timeout) as response:
@@ -349,8 +355,11 @@ class HarvesterCascade:
             return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words"), True
         return served(text, "DOM_TRAFILATURA"), False
 
-    async def _browser(self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None) -> ScrapeResult:
+    async def _browser(
+        self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None, waited: Optional[Dict[str, float]] = None,
+    ) -> ScrapeResult:
         timeout = timeout or self._timeout_s
+        waited = {} if waited is None else waited
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeout
             from playwright.async_api import async_playwright
@@ -359,7 +368,8 @@ class HarvesterCascade:
         self.counts["browser_pages"] += 1
         for _ in range(2):  # a second try only after the browser itself was found dead
             if self._throttle is not None:
-                await self._throttle.wait(url)
+                with timed(waited, "throttle_wait"):
+                    await self._throttle.wait(url)
             browser = None
             async with self._browser_slots:
                 try:
