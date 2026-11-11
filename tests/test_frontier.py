@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from frontier_crawler.frontier import (
-    GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, RETEST_SHARE, Frontier, Seed, crawl, fetch_yield, link_base, load_seeds,
+    DOMAIN_HALF, GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl,
+    fetch_yield, link_base, load_seeds, registered_domain,
 )
 from frontier_crawler.harvester.readers import extract_links, normalise
 from frontier_crawler.judge import questions as judging
@@ -81,11 +82,37 @@ def test_priority_falls_with_what_is_already_held_and_with_a_fading_yield() -> N
     frontier._add("https://a.test/1", "s", "s", 1, 1.0, NOW)
     entry = frontier.entry("https://a.test/1")
     full = frontier.priority(entry, 1.0)
-    assert frontier.priority(entry, 1.0, extra_host=25) == full / 2
+    assert frontier.priority(entry, 1.0, extra_host=100) == full / 2
     assert frontier.priority(entry, 1.0, extra_line=100) == full / 2
     assert frontier.priority(entry, 3.0) == 3 * full
     frontier.line("s")["yield"] = 0.5
     assert frontier.priority(entry, 1.0) == full / 2
+
+
+def test_registered_domains_damp_together_and_a_new_subdomain_is_not_new_ground() -> None:
+    assert registered_domain("www.example.com") == registered_domain("example.com") == "example.com"
+    assert registered_domain("a.b.example.co.uk") == "example.co.uk"
+    assert registered_domain("192.0.2.1") == "192.0.2.1" and registered_domain("a.test") == "a.test"   # no answer: the host
+    frontier = Frontier(hosts=[{"host": "www.example.com", "fetches": 200}])
+    seeds = [_seed("s", "https://www.example.com/")]
+    frontier.add_seeds(seeds, NOW)
+    frontier._add("https://docs.example.com/", "s", "s", 1, 1.0, NOW)
+    frontier._add("https://example.org/", "s", "s", 1, 0.3, NOW)
+    docs, org = frontier.entry("https://docs.example.com/"), frontier.entry("https://example.org/")
+    # docs.example.com was never fetched itself, but its domain has DOMAIN_HALF fetches: its priority halves.
+    assert frontier.priority(docs, 1.0) == frontier.priority({**docs, "host": "docs.example.net"}, 1.0) / 2
+    # The share kept for new domains goes to example.org, though the new subdomain ranks higher.
+    assert [e["url"] for e in frontier.select(1, seeds, NOW.date())] == ["https://example.org/"]
+    assert frontier.take(seeds, NOW.date()) is docs
+    # A fetch only lowers the groups of its domain, so it pushes nothing: they are re-scored when they reach the top.
+    for i in range(300):
+        frontier._add(f"https://sub{i}.example.com/", "s", "s", 1, 1.0, NOW)
+    frontier.take(seeds, NOW.date())
+    pushed = len(frontier._heap)
+    frontier.mark(docs, _content(), None, NOW)
+    assert len(frontier._heap) == pushed and frontier._domain_fetches["example.com"] == 201
+    expected = reference_take(frontier, seeds, NOW.date(), False)
+    assert frontier.take(seeds, NOW.date()) is expected
 
 
 def test_expired_or_removed_seeds_are_not_followed() -> None:
@@ -479,7 +506,7 @@ def test_a_crossing_is_priced_as_the_line_it_would_become() -> None:
     assert y["line_id"] == "s:b.test" and not y["crossing"] and y["hops"] == 1 and child["fetches"] == frontier.line("s")["fetches"] == 1
     # The same yield, generation, hops and line fetches: only the page just fetched from its host lowers it.
     assert abs(child["yield"] - 0.6) < 1e-15
-    assert abs(frontier.priority(y, 1.0) - before / (1 + 1 / HOST_HALF)) < 1e-12
+    assert abs(frontier.priority(y, 1.0) - before / (1 + 1 / HOST_HALF) / (1 + 1 / DOMAIN_HALF)) < 1e-12
 
 
 def test_lines_saved_without_a_generation_get_it_from_their_parent_chain() -> None:
@@ -630,7 +657,7 @@ def test_under_sampling_a_line_settles_near_its_live_share_times_its_relevance()
 # ---------------------------------------------------------------- the ranked queue against scoring every entry
 
 # select() as it was before the queue was grouped, kept as the reference the grouped version must match. Changed since
-# only where the rules changed: crossings are not held against their line.
+# only where the rules changed: crossings are not held against their line, and the reserve is per registered domain.
 def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> List[Dict[str, Any]]:
     """Up to n queued entries for the next round, from active lines, spread across hosts and lines."""
     weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
@@ -654,14 +681,14 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
         if not entry.get("crossing"):   # a crossing's fetch will not count toward the line that found it
             in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
-    # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
+    # First, the share kept for registered domains never fetched: the best entry of each, best domains first.
     best_new: Dict[str, Dict[str, Any]] = {}
     for entry in queued:
-        if self._hosts.get(entry["host"], {}).get("fetches", 0) == 0:
-            current = best_new.get(entry["host"])
+        if _domain_fetches(self, entry["host"]) == 0:
+            current = best_new.get(registered_domain(entry["host"]))
             if current is None or self.priority(entry, weights[entry["seed_id"]]) > self.priority(current, weights[current["seed_id"]]):
-                best_new[entry["host"]] = entry
-    reserve = math.ceil(n * NEW_HOST_SHARE)
+                best_new[registered_domain(entry["host"])] = entry
+    reserve = math.ceil(n * NEW_DOMAIN_SHARE)
     ranked = sorted(best_new.values(), key=lambda e: (-self.priority(e, weights[e["seed_id"]]), e["url"]))
     for entry in ranked[:reserve]:
         take(entry)
@@ -686,6 +713,11 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
     return picked
 
 
+def _domain_fetches(frontier: Frontier, host: str) -> int:
+    """Fetches from every host of host's registered domain, summed from the hosts table."""
+    return sum(c["fetches"] for h, c in frontier._hosts.items() if registered_domain(h) == registered_domain(host))
+
+
 def reference_bests(frontier: Frontier, seeds: Sequence[Seed], today: dt.date) -> List[tuple]:
     """((-priority, url), entry) of the best waiting entry of each group take() may hand out, by scoring every entry."""
     weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
@@ -706,13 +738,14 @@ def reference_take(frontier: Frontier, seeds: Sequence[Seed], today: dt.date, ne
     """take() by scoring every waiting entry: the best of the groups' bests."""
     bests = reference_bests(frontier, seeds, today)
     if new_turn:
-        bests = [b for b in bests if frontier._hosts.get(b[1]["host"], {}).get("fetches", 0) == 0] or bests
+        bests = [b for b in bests if _domain_fetches(frontier, b[1]["host"]) == 0] or bests
     return min(bests, key=lambda b: b[0], default=(None, None))[1]
 
 
 def _random_frontier(rng: random.Random) -> tuple:
-    """A loaded queue with few distinct values, so equal priorities are common: hosts with and without fetches,
-    crossing entries, lines saved frozen by the old code (loaded active), inactive and removed seeds, weights."""
+    """A loaded queue with few distinct values, so equal priorities are common: hosts with and without fetches, several
+    hosts sharing a registered domain, crossing entries, lines saved frozen by the old code (loaded active), inactive and
+    removed seeds, weights."""
     today = NOW.date()
     seeds = [
         Seed(id=f"s{i}", entity=f"s{i}", urls=(f"https://h{i}.test/",), weight=rng.choice([1.0, 1.0, 2.5, 0.4, 0.0]),
@@ -735,7 +768,10 @@ def _random_frontier(rng: random.Random) -> tuple:
         lines.append(line(f"{parent['seed_id']}:x{i}", parent["seed_id"], rng.choice([parent["line_id"]] * 4 + ["gone"])))
         if rng.random() < 0.3:
             lines[-1]["generation"] = rng.randint(0, 9)
-    hosts = [f"h{i}.test" for i in range(rng.randint(1, 60))]
+    # .test is no public suffix, so each such host is its own domain; the others share example.com, .org or .net.
+    hosts = [f"h{i}.test" if rng.random() < 0.4 else f"h{i}.example.{rng.choice(['com', 'org', 'net'])}" for i in range(rng.randint(1, 60))]
+    if rng.random() < 0.5:
+        hosts.append("example.com")   # the registered domain itself, as a host
     host_rows = [
         {"host": host, "fetches": rng.choice([0, 1, 1, 2, 5, 25]), "content": 0, "heavy": 0, "refused": 0, "errors": 0, "error_pages": 0}
         for host in hosts if rng.random() < 0.5
@@ -782,7 +818,7 @@ def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random, later: Opt
             others = [e["url"] for e in waiting if e["line_id"] != entry["line_id"]]
             hosts = [e["host"] for e in waiting]
             targets = known + rng.sample(others, min(3, len(others))) + [f"https://{rng.choice(hosts)}/n{rng.getrandbits(24)}" for _ in range(3)]
-            targets += [f"https://new{rng.getrandbits(16)}.test/" for _ in range(2)]
+            targets += [f"https://new{rng.getrandbits(16)}.test/" for _ in range(2)] + [f"https://n{rng.getrandbits(16)}.example.org/"]
             row = _page_row(entry["url"], "".join(f'<a href="{url}">x</a>' for url in targets))
             answers = rng.choice([None, _Answers(rng.choice([0.1, 0.5, 0.9]))])
             if answers is not None:
@@ -814,6 +850,10 @@ def _check_counts(frontier: Frontier) -> None:
     statuses = Counter(e["status"] for e in frontier._entries.values())
     for status in ("queued", "fetched", "failed", "alias", "unparseable"):
         assert frontier.count(status) == statuses[status]
+    domains: Counter = Counter()
+    for host, counts in frontier._hosts.items():
+        domains[registered_domain(host)] += counts["fetches"]
+    assert +frontier._domain_fetches == +domains
     filled = [g for g in frontier._groups.values() if g.members]
     assert sorted(map(id, frontier._filled)) == sorted(map(id, filled)) and all(frontier._filled[g.slot] is g for g in filled)
 
@@ -845,7 +885,7 @@ def test_take_hands_out_what_scoring_every_entry_would() -> None:
         for step in range(60):
             roll = rng.random()
             if roll < 0.55:
-                expected = reference_take(frontier, seeds, today, (frontier._takes + 1) % round(1 / NEW_HOST_SHARE) == 0)
+                expected = reference_take(frontier, seeds, today, (frontier._takes + 1) % round(1 / NEW_DOMAIN_SHARE) == 0)
                 drawn = [b[1] for b in reference_bests(frontier, seeds, today)]
                 retest = (frontier._takes + 1) % round(1 / RETEST_SHARE) == 0
                 taken = frontier.take(seeds, today)
@@ -897,9 +937,9 @@ def test_a_line_whose_yield_rises_is_ranked_up_for_the_next_take() -> None:
 
 
 def test_an_entry_that_rounds_to_its_groups_best_score_is_ranked_by_url() -> None:
-    # Base 0.49 at hop 0 and base 1.0 at hop 2 differ by one ulp, and at yield 0.14 round to one priority: the url decides.
+    # Base 0.49 at hop 0 and base 1.0 at hop 2 differ by one ulp, and at yield 0.16 round to one priority: the url decides.
     lines = [
-        {"line_id": sid, "seed_id": sid, "parent_line": None, "created_at": NOW, "fetches": 0, "since_thaw": 5, "yield": 0.14, "status": "active"}
+        {"line_id": sid, "seed_id": sid, "parent_line": None, "created_at": NOW, "fetches": 0, "since_thaw": 5, "yield": 0.16, "status": "active"}
         for sid in ("s", "t")
     ]
     frontier = Frontier(hosts=[{"host": "b.test", "fetches": 1}], lines=lines)

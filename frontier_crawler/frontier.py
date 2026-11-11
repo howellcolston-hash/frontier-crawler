@@ -32,15 +32,19 @@ generation included). Growth is bounded by the fetches per run, so lines compete
 
     priority = seed weight x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
                / (1 + fetched from this host / HOST_HALF)
+               / (1 + fetched from this registered domain, all its hosts / DOMAIN_HALF)
                / (1 + fetched in this line / LINE_HALF)
 
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
 not been judged. hops count from the start of the line, generation from the seed. A crossing
 is priced as the line it would become: at its finder's generation + 1, so its priority does not
-drop when it becomes a line. The share of
-each round kept for hosts never fetched ranks them by this priority too. There are no source
-tiers: any http(s) link can be followed.
+drop when it becomes a line. The registered domain is the name a person registers (example.com
+for www.example.com), so a site's subdomains share one damping; it counts fetches done, not
+pages out with take() as the host and line factors do. The share of each round kept for
+registered domains never fetched (a new subdomain of a fetched one does not qualify) takes the
+best entry of each, ranked by this priority too. There are no source tiers: any http(s) link
+can be followed.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links.
@@ -65,6 +69,7 @@ import asyncio
 import bisect
 import contextlib
 import datetime as dt
+import functools
 import heapq
 import json
 import logging
@@ -79,6 +84,7 @@ from urllib.parse import urlsplit
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tld import get_fld
 
 from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import normalise
@@ -91,13 +97,14 @@ HOP_DECAY = 0.7
 GENERATION_DECAY = 0.7          # PROVISIONAL: priority factor per line between a line and its seed; it does not wear off
 DEFAULT_LINK_BASE = 0.3         # for links from a page Jev has not judged
 MIN_LINK_BASE = 0.05
-HOST_HALF = 25.0                # fetches from one host at which its priority halves
+HOST_HALF = 100.0               # PROVISIONAL: fetches from one host at which its priority halves
+DOMAIN_HALF = 200.0             # PROVISIONAL: fetches from one registered domain, all its hosts, at which its priority halves
 LINE_HALF = 100.0               # fetches in one line at which its priority halves
 YIELD_ALPHA = 0.15              # weight of the newest fetch in a line's running yield
 INBOUND_LIFT = 0.05             # share of the gap a link from a better line closes on the yield of the line it links into
 RETEST_SHARE = 0.02             # share of take() calls spent on a group drawn at random
 RETEST_DRAWS = 5                # draws a re-test makes past blocked groups before it falls back to the ranked take
-NEW_HOST_SHARE = 0.2            # part of each round kept for hosts never fetched before
+NEW_DOMAIN_SHARE = 0.05         # PROVISIONAL: part of each round kept for registered domains never fetched before
 HOST_ROUND_SHARE = 0.1          # most of one round that one host may take (at least 2)
 MAX_QUEUED_PER_HOST = 2000
 MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
@@ -205,6 +212,13 @@ def load_seeds(path: Path) -> List[Seed]:
     return seeds
 
 
+@functools.lru_cache(maxsize=None)
+def registered_domain(host: str) -> str:
+    """The name a person registers (example.com for www.example.com), from tld's bundled public suffix list, offline.
+    The host itself where the list cannot say: an IP address, an unknown suffix."""
+    return get_fld(host, fix_protocol=True, fail_silently=True) or host
+
+
 def link_base(answers: Optional[JevResult]) -> float:
     if answers is None:
         return DEFAULT_LINK_BASE
@@ -296,9 +310,15 @@ class Frontier:
         self._groups: Dict[Tuple[str, str, str], _Group] = {}
         self._groups_by_line: Dict[str, List[_Group]] = {}
         self._groups_by_host: Dict[str, List[_Group]] = {}
+        self._groups_by_domain: Dict[str, List[_Group]] = {}
+        # Fetches per registered domain, from the hosts table, kept current by mark(). A fetch only lowers the groups of
+        # its domain, so like a host's own it leaves them for _top() to re-score.
+        self._domain_fetches: Counter = Counter()
+        for host, host_counts in self._hosts.items():
+            self._domain_fetches[registered_domain(host)] += host_counts["fetches"]
         self._weights: Optional[Dict[str, float]] = None      # the active seeds' weights the heaps were built with
         self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
-        self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on hosts never fetched
+        self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on registered domains never fetched
         self._version = 0
         self._crossing: Dict[str, List[Dict[str, Any]]] = {}  # host -> its entries still marked crossing, any status
         self._statuses = Counter(entry["status"] for entry in self._entries.values())
@@ -313,7 +333,7 @@ class Frontier:
         self.cooled: set = set()
         # fetch_id -> (the line credited, the urls add_links() queued from it), for pages whose judgement is awaited
         self._judging: Dict[str, Tuple[str, List[str]]] = {}
-        # seq is the order entries were queued in: select() has always broken ties within a never-fetched host by it.
+        # seq is the order entries were queued in: select() breaks ties within a never-fetched domain by it.
         for seq, entry in enumerate(self._entries.values()):
             entry["seq"] = seq
             if entry["status"] == "queued":
@@ -388,6 +408,7 @@ class Frontier:
         return (
             _static(entry, weight) * line["yield"] * GENERATION_DECAY ** line["generation"]
             / (1.0 + held_host / HOST_HALF)
+            / (1.0 + self._domain_fetches.get(registered_domain(entry["host"]), 0) / DOMAIN_HALF)
             / (1.0 + (line["fetches"] + extra_line) / LINE_HALF)
         )
 
@@ -592,6 +613,7 @@ class Frontier:
         entry["stored"] = outcome in ("stored", "unchanged", "duplicate") and not row.get("block_marker")
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
+        self._domain_fetches[registered_domain(entry["host"])] += 1
         marker = row.get("block_marker") or ""
         refused = row.get("http_status") in _REFUSED_STATUS or (bool(marker) and not marker.startswith("http "))
         if outcome == "error":
@@ -678,6 +700,7 @@ class Frontier:
             group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0))
             self._groups_by_line.setdefault(key[0], []).append(group)
             self._groups_by_host.setdefault(key[1], []).append(group)
+            self._groups_by_domain.setdefault(registered_domain(key[1]), []).append(group)
         return group
 
     def _enqueue(self, entry: Dict[str, Any]) -> None:
@@ -709,8 +732,8 @@ class Frontier:
         return (bool(group.members) and group.seed in (self._weights or {}) and group.line in self._lines
                 and group.host not in self.cooled)
 
-    def _never_fetched(self, host: str) -> bool:
-        return self._hosts.get(host, {}).get("fetches", 0) == 0
+    def _new_domain(self, host: str) -> bool:
+        return self._domain_fetches[registered_domain(host)] == 0
 
     def _extras(self, group: _Group) -> Tuple[int, int]:
         return self._flight_host.get(group.host, 0), self._flight_line.get(group.line, 0)
@@ -751,7 +774,7 @@ class Frontier:
         group.version = self._version
         item = (-score, entry["url"], self._version, group)
         heapq.heappush(self._heap, item)
-        if self._never_fetched(group.host):
+        if self._new_domain(group.host):
             heapq.heappush(self._new_heap, item)
 
     def _push_all(self, groups: Any) -> None:
@@ -771,11 +794,11 @@ class Frontier:
                 group.members.sort(key=group.key)
             self._push(group)
 
-    def _top(self, heap: List[Tuple[float, str, int, _Group]], new_hosts: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
+    def _top(self, heap: List[Tuple[float, str, int, _Group]], new_domains: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
         """The heap's first item, once it is current and exact; stale items are dropped and high ones re-scored."""
         while heap:
             negative, url, version, group = heap[0]
-            if version != group.version or not self._eligible(group) or (new_hosts and not self._never_fetched(group.host)):
+            if version != group.version or not self._eligible(group) or (new_domains and not self._new_domain(group.host)):
                 heapq.heappop(heap)
                 continue
             score, entry = self._best(group, *self._extras(group))  # type: ignore[misc]
@@ -808,8 +831,8 @@ class Frontier:
             if not entry.get("crossing"):   # held against its line only if its fetch will count toward it, as in take()
                 in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
-        # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
-        for entry in self._new_host_picks(math.ceil(n * NEW_HOST_SHARE)):
+        # First, the share kept for registered domains never fetched: the best entry of each, best domains first.
+        for entry in self._new_domain_picks(math.ceil(n * NEW_DOMAIN_SHARE)):
             take(entry)
 
         # Then the rest by priority. Each pick lowers the priority of what shares its host or line, so an entry is
@@ -871,43 +894,44 @@ class Frontier:
             heapq.heappush(self._heap, item)
         return picked
 
-    def _new_host_picks(self, k: int) -> List[Dict[str, Any]]:
-        """The best entry of each of the k best hosts never fetched, best first. Ties within a host go to the entry
-        queued first, ties between hosts to the url, as select() has always done."""
+    def _new_domain_picks(self, k: int) -> List[Dict[str, Any]]:
+        """The best entry of each of the k best registered domains never fetched, best first. Ties within a domain go
+        to the entry queued first, ties between domains to the url."""
         scores: Dict[str, float] = {}
         order: List[str] = []
         popped = []
         while k > 0:
-            item = self._top(self._new_heap, new_hosts=True)
+            item = self._top(self._new_heap, new_domains=True)
             if item is None or (len(order) >= k and -item[0] < scores[order[k - 1]]):
                 break
             popped.append(heapq.heappop(self._new_heap))
-            if item[3].host not in scores:
-                scores[item[3].host] = -item[0]
-                order.append(item[3].host)
+            domain = registered_domain(item[3].host)
+            if domain not in scores:
+                scores[domain] = -item[0]
+                order.append(domain)
         for item in popped:
             heapq.heappush(self._new_heap, item)
         picks = []
-        for host in order:
+        for domain in order:
             first = None
-            for group in self._groups_by_host[host]:
+            for group in self._groups_by_domain[domain]:
                 if not self._eligible(group):
                     continue
                 extras = self._extras(group)
                 for i, j in self._runs(group, 0):
-                    if self.priority(group.members[i], group.weight, *extras) != scores[host]:
+                    if self.priority(group.members[i], group.weight, *extras) != scores[domain]:
                         break
                     for entry in group.members[i:j]:
                         if first is None or entry["seq"] < first["seq"]:
                             first = entry
             picks.append(first)
-        picks.sort(key=lambda e: (-scores[e["host"]], e["url"]))  # type: ignore[index]
+        picks.sort(key=lambda e: (-scores[registered_domain(e["host"])], e["url"]))  # type: ignore[index]
         return picks[:k]  # type: ignore[return-value]
 
     def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
         and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
-        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Every 1/RETEST_SHARE-th call
+        Every 1/NEW_DOMAIN_SHARE-th call takes from registered domains never fetched while there are any. Every 1/RETEST_SHARE-th call
         is a re-test: the best entry of a group drawn uniformly from the groups with queued entries, under the same
         per-host limits; it falls back to the ranked take after RETEST_DRAWS blocked draws. Before any of that, a page
         waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are, and after it, when nothing else can
@@ -926,12 +950,12 @@ class Frontier:
                     self._hold(entry)
                     return entry
         heaps = [(self._heap, False)]
-        if self._takes % round(1 / NEW_HOST_SHARE) == 0:
+        if self._takes % round(1 / NEW_DOMAIN_SHARE) == 0:
             heaps.insert(0, (self._new_heap, True))
-        for heap, new_hosts in heaps:
+        for heap, new_domains in heaps:
             full = []
             while True:
-                item = self._top(heap, new_hosts)
+                item = self._top(heap, new_domains)
                 if item is None or self._flight_host.get(item[3].host, 0) < MAX_IN_FLIGHT_PER_HOST:
                     break
                 full.append(heapq.heappop(heap))
