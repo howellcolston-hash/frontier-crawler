@@ -278,3 +278,15 @@ def test_a_line_freezes_once_its_mean_yield_falls_below_the_mark() -> None:
     assert frontier.line("dry")["status"] == "active"           # 1 start value and 9 duds: mean 0.1
     frontier.mark(frontier.entry("https://dry.test/9"), DEAD, None, NOW)
     assert frontier.line("dry")["status"] == "frozen"           # 10 duds: mean under 0.1
+
+
+def test_lines_spawned_at_full_strength_before_the_change_are_caught_up_on_load() -> None:
+    lines = [
+        {"line_id": "s", "parent_line": None, "created_at": NOW, "since_thaw": 5, "yield": 0.8},
+        {"line_id": "s:b", "parent_line": "s", "created_at": NOW + dt.timedelta(1), "since_thaw": 0, "yield": 1.0},
+        {"line_id": "s:c", "parent_line": "s:b", "created_at": NOW + dt.timedelta(2), "since_thaw": 0, "yield": 1.0},
+        {"line_id": "s:d", "parent_line": "s", "created_at": NOW, "since_thaw": 3, "yield": 1.0},
+    ]
+    frontier = Frontier(lines=[{**line, "seed_id": "s", "status": "active"} for line in lines])
+    assert abs(frontier.line("s:b")["yield"] - 0.56) < 1e-9 and abs(frontier.line("s:c")["yield"] - 0.392) < 1e-9
+    assert frontier.line("s:d")["yield"] == 1.0                 # fetched since it started: its yield is its own

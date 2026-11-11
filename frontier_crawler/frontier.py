@@ -259,6 +259,12 @@ class Frontier:
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
         }
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
+        # One-time catch-up for lines spawned before 2026-11-11 at full strength and not fetched since:
+        # they start one hop below their parent, as new lines do now. Oldest first, so parents settle first.
+        for line in sorted(self._lines.values(), key=lambda l: l["created_at"]):
+            parent = self._lines.get(line.get("parent_line") or "")
+            if parent is not None and line["since_thaw"] == 0 and line["yield"] == 1.0:
+                line["yield"] = parent["yield"] * HOP_DECAY
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
         for entry in self._entries.values():
