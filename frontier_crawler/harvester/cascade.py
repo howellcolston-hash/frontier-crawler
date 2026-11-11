@@ -8,8 +8,10 @@ raised, for a URL the engine must never request.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import ipaddress
+import re
 import ssl
 import time
 import warnings
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit
 import certifi
 import httpx
 import trafilatura
+from trafilatura.utils import detect_encoding
 
 from frontier_crawler.harvester.throttle import HostThrottle
 
@@ -109,6 +112,40 @@ def check_public(url: str) -> None:
 
 def word_count(text: str) -> int:
     return len(text.split()) if text else 0
+
+
+# Legacy charsets as browsers read them: pages labelled with one routinely use its superset's extra characters.
+_SUPERSETS = {"gb2312": "gb18030", "gbk": "gb18030", "big5": "big5hkscs", "shift_jis": "cp932", "euc_kr": "cp949"}
+
+
+def decode(body: bytes, content_type: str) -> Tuple[str, Optional[str]]:
+    """(text, encoding read in). Valid UTF-8 as it is; else the charset the header declares, the one the page's
+    <meta> declares, then a detected one. Encoding None: nothing fit, so UTF-8 with replacement characters."""
+    try:
+        return body.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    header = re.search(r"charset=[\"']?([\w.:-]+)", content_type, re.I)
+    meta = re.search(r"<meta[^>]+charset\s*=\s*[\"']?([\w.:-]+)", body[:4096].decode("ascii", "ignore"), re.I)
+
+    def candidates() -> Iterator[str]:
+        yield from (found.group(1) for found in (header, meta) if found)
+        yield from detect_encoding(body)  # only reached when no declared charset fits
+
+    for name in candidates():
+        try:
+            codec = codecs.lookup(name).name
+            codec = _SUPERSETS.get(codec, codec)
+            return body.decode(codec), codec
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return body.decode("utf-8", errors="replace"), None
+
+
+def _html_text(body: bytes, content_type: str) -> Tuple[Optional[str], Optional[str]]:
+    """(markdown text, encoding read in), for a worker thread: detecting the encoding of a large page is slow."""
+    html, encoding = decode(body, content_type)
+    return trafilatura.extract(html, output_format="markdown", include_comments=False, include_tables=True), encoding
 
 
 def _pdf_text(body: bytes) -> Tuple[str, Optional[str]]:
@@ -257,7 +294,7 @@ class HarvesterCascade:
         # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
         self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
         self.counts: Dict[str, int] = dict.fromkeys(
-            ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches"), 0
+            ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8"), 0
         )
 
     async def __aenter__(self) -> "HarvesterCascade":
@@ -335,8 +372,15 @@ class HarvesterCascade:
         def served(text: Optional[str], tier: str, note: Optional[str] = None) -> ScrapeResult:
             return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type)
 
+        def undecoded(encoding: Optional[str]) -> Optional[str]:
+            """Count a page read in a legacy encoding; the note when no encoding fit."""
+            if encoding not in (None, "utf-8"):
+                self.counts["decoded_non_utf8"] += 1
+            return None if encoding else "text encoding not detected"
+
         if "json" in content_type.lower() or body.lstrip()[:1] in (b"{", b"["):
-            return served(body.decode("utf-8", errors="replace"), "API"), False
+            text, encoding = await asyncio.to_thread(decode, body, content_type)
+            return served(text, "API", undecoded(encoding)), False
         if "application/pdf" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".pdf"):
             try:
                 with timed(self.timings, "pdf_text"):  # includes waiting for the lock
@@ -345,19 +389,18 @@ class HarvesterCascade:
             except Exception as exc:  # encrypted, damaged, or not a PDF at all
                 return served(None, "PDF", f"pdf not read: {exc}"), False
             return served(text, "PDF", note), False
+        note = None
         try:
-            html = body.decode("utf-8", errors="replace")
-            with timed(self.timings, "extract_html"):
-                text = await asyncio.to_thread(
-                    trafilatura.extract, html, output_format="markdown", include_comments=False, include_tables=True
-                )
+            with timed(self.timings, "extract_html"):  # includes decoding
+                text, encoding = await asyncio.to_thread(_html_text, body, content_type)
+            note = undecoded(encoding)
         except Exception:
             text = None
         words = word_count(text or "")
         shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
         if (status == 200 and shell) or status in _BROWSER_RETRY_STATUS:
             return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words"), True
-        return served(text, "DOM_TRAFILATURA"), False
+        return served(text, "DOM_TRAFILATURA", note), False
 
     async def _browser(
         self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None, waited: Optional[Dict[str, float]] = None,

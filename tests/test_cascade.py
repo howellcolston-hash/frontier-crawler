@@ -62,6 +62,68 @@ def test_an_empty_shell_goes_to_the_browser_and_its_bytes_are_kept_if_that_fails
     assert b'id="app"' in result.raw_payload and result.error_message == "browser got nothing"
 
 
+# One sentence per language, in a legacy encoding its pages are often served in.
+LEGACY = {
+    "gb18030": "港口管理局公布了泊位时间表和散装货物的关税。今年第三季度的进出口贸易总额比去年同期增长了百分之十二。",
+    "big5": "港務局公布了泊位時間表和散裝貨物的關稅。今年第三季度的進出口貿易總額比去年同期增長了百分之十二。",
+    "shift_jis": "港湾局は岸壁の時刻表とばら積み貨物の料金を公表しました。今年の第三四半期の輸出入総額は前年同期比で十二パーセント増加しました。",
+    "euc-kr": "항만청은 선석 일정과 벌크 화물 관세를 발표했습니다. 올해 3분기 수출입 총액은 작년 같은 기간보다 12퍼센트 증가했습니다.",
+    "windows-1251": "Портовое управление опубликовало расписание причалов и тариф на навалочные грузы.",
+    "windows-1256": "نشرت هيئة الميناء جدول الأرصفة والتعريفة الخاصة بالبضائع السائبة.",
+}
+
+
+def _legacy_fetch(encoding: str, header: str, meta: str = "") -> tuple:
+    sentence = LEGACY[encoding]
+    body = f"<html><head>{meta}<title>t</title></head><body><article><p>{sentence}</p><p>{sentence}</p></article></body></html>".encode(encoding)
+
+    async def run() -> tuple:
+        server = lambda request: httpx.Response(200, content=body, headers={"content-type": header})
+        fetcher = HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+        return await fetcher._http("https://a.test/x", httpx.Timeout(5), {}), fetcher.counts["decoded_non_utf8"]
+
+    (result, _), counted = asyncio.run(run())
+    return result, body, sentence, counted
+
+
+@pytest.mark.parametrize("encoding", sorted(LEGACY))
+@pytest.mark.parametrize("declared", ["header", "meta", "http-equiv", "nowhere"])
+def test_a_page_in_a_legacy_encoding_is_read_in_it(encoding: str, declared: str) -> None:
+    header = f"text/html; charset={encoding}" if declared == "header" else "text/html"
+    meta = {"meta": f'<meta charset="{encoding}">',
+            "http-equiv": f'<meta http-equiv="Content-Type" content="text/html; charset={encoding}">'}.get(declared, "")
+    result, body, sentence, counted = _legacy_fetch(encoding, header, meta)
+    assert sentence[:12] in result.markdown_content and "\ufffd" not in result.markdown_content
+    assert result.raw_payload == body and result.word_count >= 1 and counted == 1
+
+
+def test_a_bogus_or_wrong_declared_charset_falls_back_to_detection() -> None:
+    for header in ("text/html; charset=no-such-charset", "text/html; charset=shift_jis"):
+        result, body, sentence, _ = _legacy_fetch("gb18030", header)
+        assert sentence[:12] in result.markdown_content and result.raw_payload == body
+
+
+def test_bytes_no_encoding_fits_are_read_as_utf8_with_a_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cascade_module, "detect_encoding", lambda body: ["no-such-charset"])
+    body = b"<html><body><p>" + b"word \xff " * 200 + b"</p></body></html>"
+    result = _fetch(lambda request: httpx.Response(200, content=body, headers={"content-type": "text/html; charset=bogus"}))
+    assert result.word_count >= 150 and "\ufffd" in result.markdown_content and result.raw_payload == body
+    assert result.error_message == "text encoding not detected"
+
+
+def test_a_utf8_page_is_unchanged_whatever_it_declares() -> None:
+    text = "Портовое управление 港口管理局 " * 80
+    body = f"<html><body><p>{text}</p></body></html>".encode("utf-8")
+    result = _fetch(lambda request: httpx.Response(200, content=body, headers={"content-type": "text/html; charset=windows-1251"}))
+    assert "Портовое управление 港口管理局" in result.markdown_content and result.raw_payload == body and result.error_message is None
+
+
+def test_json_honours_its_declared_charset() -> None:
+    body = '{"name": "Портовое управление"}'.encode("windows-1251")
+    result = _fetch(lambda request: httpx.Response(200, content=body, headers={"content-type": "application/json; charset=windows-1251"}))
+    assert result.tier_used == "API" and "Портовое управление" in result.markdown_content and result.raw_payload == body
+
+
 def test_a_dead_link_does_not_launch_a_browser_but_a_refusal_does(monkeypatch: pytest.MonkeyPatch) -> None:
     browser: List[str] = []
     gone = _fetch(_html("Not found", 404), browser=browser, monkeypatch=monkeypatch)
@@ -145,7 +207,8 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
 
     fetcher = asyncio.run(run())
     assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
-    assert fetcher.counts == {"connect_timeouts": 0, "read_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0, "browser_relaunches": 0}
+    assert fetcher.counts == {"connect_timeouts": 0, "read_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0,
+                              "browser_relaunches": 0, "decoded_non_utf8": 0}
 
 
 def test_a_timeout_is_flagged_and_one_call_can_ask_for_longer_limits() -> None:
