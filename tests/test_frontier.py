@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
+import heapq
+import math
+import random
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
-from frontier_crawler.frontier import Frontier, Seed, crawl, extract_links, fetch_yield, load_seeds, normalise
+from frontier_crawler.frontier import (
+    HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_HOST_SHARE, Frontier, Seed, crawl, extract_links, fetch_yield, load_seeds, normalise,
+)
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
@@ -327,3 +334,252 @@ def test_an_unjudged_page_leaves_the_yield_but_counts_as_content_and_still_spawn
     answers = _Answers(0.4)
     frontier.mark(frontier.entry("https://a.test/j"), _readable(_content("https://a.test/j")), answers, NOW)  # type: ignore[arg-type]
     assert line["yield"] == 0.85 * 0.6 + 0.15 * judging.relevance(answers.nouls())  # type: ignore[operator]
+
+
+# ---------------------------------------------------------------- the ranked queue against scoring every entry
+
+# select() as it was before the queue was grouped, kept verbatim as the reference the grouped version must match.
+def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> List[Dict[str, Any]]:
+    """Up to n queued entries for the next round, from active lines, spread across hosts and lines."""
+    weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
+    queued = [
+        entry for entry in self._entries.values()
+        if entry["status"] == "queued" and entry["seed_id"] in weights and self._lines[entry["line_id"]]["status"] == "active"
+    ]
+    if n <= 0 or not queued:
+        return []
+    host_cap = max(2, math.ceil(n * HOST_ROUND_SHARE))
+    picked: List[Dict[str, Any]] = []
+    taken: set = set()
+    in_host: Dict[str, int] = {}
+    in_line: Dict[str, int] = {}
+
+    def take(entry: Dict[str, Any]) -> None:
+        picked.append(entry)
+        taken.add(entry["url"])
+        in_host[entry["host"]] = in_host.get(entry["host"], 0) + 1
+        in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
+
+    # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
+    best_new: Dict[str, Dict[str, Any]] = {}
+    for entry in queued:
+        if self._hosts.get(entry["host"], {}).get("fetches", 0) == 0:
+            current = best_new.get(entry["host"])
+            if current is None or self.priority(entry, weights[entry["seed_id"]]) > self.priority(current, weights[current["seed_id"]]):
+                best_new[entry["host"]] = entry
+    reserve = math.ceil(n * NEW_HOST_SHARE)
+    ranked = sorted(best_new.values(), key=lambda e: (-self.priority(e, weights[e["seed_id"]]), e["url"]))
+    for entry in ranked[:reserve]:
+        take(entry)
+
+    # Then the rest by priority. Each pick lowers the priority of what shares its host or line,
+    # so the heap is re-scored lazily: an entry is taken only if its fresh score still leads.
+    def score(entry: Dict[str, Any]) -> float:
+        return self.priority(entry, weights[entry["seed_id"]], in_host.get(entry["host"], 0), in_line.get(entry["line_id"], 0))
+
+    heap = [(-score(entry), entry["url"]) for entry in queued if entry["url"] not in taken]
+    heapq.heapify(heap)
+    while heap and len(picked) < n:
+        stale, url = heapq.heappop(heap)
+        entry = self._entries[url]
+        if in_host.get(entry["host"], 0) >= host_cap:
+            continue
+        fresh = -score(entry)
+        if heap and fresh > heap[0][0]:
+            heapq.heappush(heap, (fresh, url))
+            continue
+        take(entry)
+    return picked
+
+
+def reference_take(frontier: Frontier, seeds: Sequence[Seed], today: dt.date, new_turn: bool) -> Optional[Dict[str, Any]]:
+    """take() by scoring every waiting entry."""
+    weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
+    out_host = Counter(host for host, _ in frontier._in_flight.values())
+    out_line = Counter(line for _, line in frontier._in_flight.values())
+    waiting = [
+        entry for entry in frontier._entries.values()
+        if entry["status"] == "queued" and entry["url"] not in frontier._in_flight and entry["seed_id"] in weights
+        and frontier._lines[entry["line_id"]]["status"] == "active" and out_host[entry["host"]] < MAX_IN_FLIGHT_PER_HOST
+    ]
+    if new_turn:
+        waiting = [entry for entry in waiting if frontier._hosts.get(entry["host"], {}).get("fetches", 0) == 0] or waiting
+    return min(
+        waiting, default=None,
+        key=lambda e: (-frontier.priority(e, weights[e["seed_id"]], out_host[e["host"]], out_line[e["line_id"]]), e["url"]),
+    )
+
+
+def _random_frontier(rng: random.Random) -> tuple:
+    """A loaded queue with few distinct values, so equal priorities are common: hosts with and without fetches,
+    crossing entries, frozen lines, inactive and removed seeds, weights."""
+    today = NOW.date()
+    seeds = [
+        Seed(id=f"s{i}", entity=f"s{i}", urls=(f"https://h{i}.test/",), weight=rng.choice([1.0, 1.0, 2.5, 0.4, 0.0]),
+             until=rng.choice([None, None, today, today - dt.timedelta(days=1)]))
+        for i in range(rng.randint(1, 4))
+    ]
+    seed_ids = [seed.id for seed in seeds] + ["gone"]   # a seed since removed from the config keeps its queue
+
+    def line(line_id: str, seed_id: str, parent: Optional[str]) -> Dict[str, Any]:
+        return {
+            "line_id": line_id, "seed_id": seed_id, "parent_line": parent, "root_url": "", "created_at": NOW,
+            "fetches": rng.choice([0, 0, 1, 2, 3, 25, 100, rng.randint(0, 300)]), "content": rng.choice([0, 1, 5]),
+            "since_thaw": rng.choice([0, 3, 12]), "yield": rng.choice([1.0, 0.6, 0.5, 0.3, 0.05, rng.random()]),
+            "status": "frozen" if rng.random() < 0.15 else "active", "frozen_at": None, "inbound": rng.choice([0, 1, 2]),
+        }
+
+    lines = [line(sid, sid, None) for sid in seed_ids]
+    for i in range(rng.randint(0, 8)):
+        sid = rng.choice(seed_ids)
+        lines.append(line(f"{sid}:x{i}", sid, sid))
+    hosts = [f"h{i}.test" for i in range(rng.randint(1, 60))]
+    host_rows = [
+        {"host": host, "fetches": rng.choice([0, 1, 1, 2, 5, 25]), "content": 0, "heavy": 0, "refused": 0, "errors": 0, "error_pages": 0}
+        for host in hosts if rng.random() < 0.5
+    ]
+    entries = []
+    for k in range(rng.choice([0, 1, 5, 40, 300, rng.randint(0, 3000)])):
+        home = rng.choice(lines)
+        host = rng.choice(hosts)
+        entries.append({
+            "url": f"https://{host}/{k}", "host": host, "seed_id": home["seed_id"] if rng.random() < 0.9 else rng.choice(seed_ids),
+            "line_id": home["line_id"], "crossing": rng.random() < 0.3, "hops": rng.randint(0, 6), "parent_fetch_id": "p",
+            "anchor": None, "base": rng.choice([0.3, 0.3, 0.49, 0.5, 0.7, 1.0, 0.05, rng.random()]),   # 0.49 at hop 0 and 1.0 at hop 2 differ by one ulp
+            "status": rng.choices(["queued", "fetched", "failed", "alias"], [85, 8, 4, 3])[0], "discovered_at": NOW, "fetched_at": None,
+        })
+    rng.shuffle(entries)   # queued order differs from url order
+    return Frontier(entries, host_rows, lines), seeds
+
+
+def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random) -> None:
+    """Fetches of every kind: pages with links (new, known, into frozen lines), crossing finds that spawn lines,
+    dead runs that freeze a line, errors, redirects, and seeds that have stored nothing being queued again."""
+    for _ in range(rng.randint(1, 6)):
+        waiting = [e for e in frontier._entries.values() if e["status"] == "queued" and e["url"] not in frontier._in_flight]
+        if not waiting:
+            return
+        entry = rng.choice(waiting)
+        kind = rng.random()
+        if kind < 0.3:
+            known = rng.sample(list(frontier._entries), min(4, len(frontier._entries)))
+            frozen = [e["url"] for e in waiting if frontier.line(e["line_id"])["status"] == "frozen"]
+            hosts = [e["host"] for e in waiting]
+            targets = known + rng.sample(frozen, min(3, len(frozen))) + [f"https://{rng.choice(hosts)}/n{rng.getrandbits(24)}" for _ in range(3)]
+            targets += [f"https://new{rng.getrandbits(16)}.test/" for _ in range(2)]
+            row = _page_row(entry["url"], "".join(f'<a href="{url}">x</a>' for url in targets))
+            answers = rng.choice([None, _Answers(rng.choice([0.1, 0.5, 0.9]))])
+            if answers is not None:
+                row = _readable(row)
+            frontier.mark(entry, row, answers, NOW)  # type: ignore[arg-type]
+            frontier.add_links(entry, row, answers, NOW)  # type: ignore[arg-type]
+        elif kind < 0.5:
+            crossing = [e for e in waiting if e.get("crossing")] or [entry]
+            frontier.mark(rng.choice(crossing), _content(), None, NOW)
+        elif kind < 0.7:
+            dry = [e for e in waiting if e["line_id"] == entry["line_id"]]
+            for other in dry[:12]:
+                frontier.mark(other, DEAD, None, NOW)
+        elif kind < 0.8:
+            frontier.mark(entry, {"outcome": "error"}, None, NOW)
+        elif kind < 0.9:
+            frontier.mark(entry, _content(f"https://{entry['host']}/moved{rng.getrandbits(24)}"), None, NOW)
+        else:
+            frontier.add_seeds(seeds, NOW)
+
+
+def _check_counts(frontier: Frontier) -> None:
+    statuses = Counter(e["status"] for e in frontier._entries.values())
+    lines = Counter(line["status"] for line in frontier._lines.values())
+    for status in ("queued", "fetched", "failed", "alias", "unparseable"):
+        assert frontier.count(status) == statuses[status]
+    assert frontier.count_lines("active") == lines["active"] and frontier.count_lines("frozen") == lines["frozen"]
+
+
+def test_select_picks_exactly_what_scoring_every_entry_picked() -> None:
+    rng = random.Random(20261111)
+    today = NOW.date()
+    for case in range(60):
+        frontier, seeds = _random_frontier(rng)
+        for step in range(8):
+            now_seeds = seeds
+            if rng.random() < 0.2:   # the config changes between rounds: a seed reweighted or dropped
+                now_seeds = [dataclasses.replace(seed, weight=rng.choice([seed.weight, 0.7, 3.0])) for seed in seeds][: rng.randint(1, len(seeds))]
+            for n in (0, 1, 4, 10, 50):
+                expected = [e["url"] for e in reference_select(frontier, n, now_seeds, today)]
+                assert [e["url"] for e in frontier.select(n, now_seeds, today)] == expected, (case, step, n)
+            _check_counts(frontier)
+            _churn(frontier, seeds, rng)
+
+
+def test_take_hands_out_what_scoring_every_entry_would() -> None:
+    rng = random.Random(7)
+    today = NOW.date()
+    for case in range(40):
+        frontier, seeds = _random_frontier(rng)
+        out: List[Dict[str, Any]] = []
+        for step in range(60):
+            roll = rng.random()
+            if roll < 0.55:
+                expected = reference_take(frontier, seeds, today, (frontier._takes + 1) % round(1 / NEW_HOST_SHARE) == 0)
+                taken = frontier.take(seeds, today)
+                assert taken is expected, (case, step)
+                if taken is not None:
+                    out.append(taken)
+            elif out and roll < 0.8:
+                frontier.mark(out.pop(rng.randrange(len(out))), rng.choice([_content(), DEAD, {"outcome": "error"}]), None, NOW)
+            elif out and roll < 0.9:
+                frontier.release(out.pop(rng.randrange(len(out))))
+            else:
+                _churn(frontier, seeds, rng)
+        _check_counts(frontier)
+
+
+def test_take_holds_entries_in_flight_until_mark_or_release() -> None:
+    frontier = Frontier()
+    seeds = [_seed("a", "https://a.test/"), _seed("b", "https://b.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for i in range(3):
+        frontier._add(f"https://a.test/{i}", "a", "a", 0, 1.0, NOW)
+    frontier.line("b")["yield"] = 0.1
+    first, second = frontier.take(seeds, NOW.date()), frontier.take(seeds, NOW.date())
+    assert {first["host"], second["host"]} == {"a.test"} and first is not second
+    third = frontier.take(seeds, NOW.date())
+    assert third["host"] == "b.test"                            # a.test has MAX_IN_FLIGHT_PER_HOST out
+    assert frontier.take(seeds, NOW.date()) is None             # everything else is a.test, which is full
+    frontier.release(second)
+    assert frontier.take(seeds, NOW.date()) is second           # put back, it is the best again
+    frontier.mark(first, _content(), None, NOW)
+    assert frontier.take(seeds, NOW.date())["host"] == "a.test" and frontier.count("queued") == 4   # out, not yet fetched
+
+
+def test_a_line_whose_yield_rises_is_ranked_up_for_the_next_take() -> None:
+    frontier = Frontier()
+    seeds = [_seed("a", "https://a.test/"), _seed("b", "https://b.test/")]
+    frontier.add_seeds(seeds, NOW)
+    for sid in ("a", "b"):
+        for i in range(3):
+            frontier._add(f"https://{sid}.test/{i}", sid, sid, 1, 1.0, NOW)
+    frontier.line("a")["yield"] = 0.3
+    frontier.line("b")["yield"] = 0.32
+    held = frontier.take(seeds, NOW.date())
+    assert held["host"] == "b.test"
+    frontier.release(held)
+    frontier.mark(frontier.entry("https://a.test/0"), _content(), None, NOW)   # a's yield rises to 0.405
+    assert frontier.take(seeds, NOW.date())["host"] == "a.test"
+
+
+def test_an_entry_that_rounds_to_its_groups_best_score_is_ranked_by_url() -> None:
+    # Base 0.49 at hop 0 and base 1.0 at hop 2 differ by one ulp, and at yield 0.14 round to one priority: the url decides.
+    lines = [
+        {"line_id": sid, "seed_id": sid, "parent_line": None, "created_at": NOW, "fetches": 0, "since_thaw": 5, "yield": 0.14, "status": "active"}
+        for sid in ("s", "t")
+    ]
+    frontier = Frontier(hosts=[{"host": "b.test", "fetches": 1}], lines=lines)
+    seeds = [_seed("s", "https://b.test/"), _seed("t", "https://b.test/")]
+    frontier._add("https://b.test/z", "s", "s", 0, 0.49, NOW)
+    frontier._add("https://b.test/m", "t", "t", 0, 0.49, NOW)
+    assert [e["url"] for e in frontier.select(1, seeds, NOW.date())] == ["https://b.test/m"]
+    frontier._add("https://b.test/a", "s", "s", 2, 1.0, NOW)   # joins z's group behind it
+    assert [e["url"] for e in frontier.select(1, seeds, NOW.date())] == ["https://b.test/a"]
+    assert [e["url"] for e in reference_select(frontier, 3, seeds, NOW.date())] == [e["url"] for e in frontier.select(3, seeds, NOW.date())]
