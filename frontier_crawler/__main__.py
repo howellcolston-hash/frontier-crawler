@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import faulthandler
 import json
 import logging
 import os
@@ -225,6 +226,8 @@ def _run(args: argparse.Namespace, params: Dict[str, Any], job: Any) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    # A native crash prints each thread's Python stack (file, line, function; no arguments), safe for a public log.
+    faulthandler.enable()
     parser = argparse.ArgumentParser(prog="python -m frontier_crawler", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     crawler = sub.add_parser("crawl", help="follow the crawl queue from the seeds")
