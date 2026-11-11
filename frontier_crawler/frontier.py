@@ -53,7 +53,7 @@ from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from frontier_crawler.harvester.cascade import Target
+from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
 from frontier_crawler.storage.store import Store
@@ -565,7 +565,11 @@ async def crawl(
     so the next run fetches those URLs again and records them as unchanged.
     """
     workdir = Path(workdir)
-    frontier = Frontier.load(store, workdir)
+    # Wall-clock seconds by phase, for the run record. time.monotonic, not `clock`, which only drives the deadline.
+    began = time.monotonic()
+    seconds: Dict[str, float] = dict.fromkeys(("load_state", "select", "fetch_rounds", "final_save"), 0.0)
+    with timed(seconds, "load_state"):
+        frontier = Frontier.load(store, workdir)
     by_id = {seed.id: seed for seed in seeds}
     seeds_added = frontier.add_seeds(seeds, now())
     links_added = 0
@@ -587,7 +591,8 @@ async def crawl(
             reason = row.get("error") or row.get("block_marker") or row.get("tier_note") or ""
             seed_url_problems[target.url] = f"{row['outcome']}, status {row['http_status']}: {reason}"[:300]
 
-    await engine.start()
+    with timed(seconds, "load_state"):
+        await engine.start()
     rounds = 0
     stopped_by = "queue_empty"
     deadline = None if max_minutes is None else clock() + max_minutes * 60
@@ -599,21 +604,25 @@ async def crawl(
             if deadline is not None and clock() >= deadline:
                 stopped_by = "max_minutes"
                 break
-            picks = frontier.select(min(batch, max_fetches - engine.stats["total"]), seeds, now().date())
+            with timed(seconds, "select"):
+                picks = frontier.select(min(batch, max_fetches - engine.stats["total"]), seeds, now().date())
             if not picks:
                 break
-            await engine.run(
-                [
-                    Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
-                    for entry in picks
-                ],
-                observe,
-            )
+            with timed(seconds, "fetch_rounds"):
+                await engine.run(
+                    [
+                        Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
+                        for entry in picks
+                    ],
+                    observe,
+                )
             rounds += 1
     except BaseException:
         await engine.flush(force=True)  # keep the rows already fetched
         raise
-    stats = dict(await engine.finish(frontier.save(workdir)))
+    with timed(seconds, "final_save"):
+        stats = dict(await engine.finish(frontier.save(workdir)))
+    seconds["total"] = time.monotonic() - began
     stats.update(
         {
             "rounds": rounds, "stopped_by": stopped_by, "seeds_added": seeds_added, "links_added": links_added,
@@ -621,6 +630,7 @@ async def crawl(
             "lines_active": frontier.count_lines("active"), "lines_frozen": frontier.count_lines("frozen"),
             "lines_spawned": frontier.spawned, "lines_thawed": frontier.thawed,
             "stored_by_seed": stored_by_seed,
+            "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "seed_url_problems": seed_url_problems,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
             "data_portals": dict(sorted(data_portals.items(), key=lambda item: -item[1])[:20]),

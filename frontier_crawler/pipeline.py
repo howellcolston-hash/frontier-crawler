@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import contextlib
 import datetime as dt
 import hashlib
 import json
 import logging
+import resource
 import time
 import uuid
 from pathlib import Path
@@ -31,7 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 
 import pyarrow.parquet as pq
 
-from frontier_crawler.harvester.cascade import MIN_WORDS as THIN_HTML_WORDS, ScrapeResult, Target
+from frontier_crawler.harvester.cascade import MIN_WORDS as THIN_HTML_WORDS, ScrapeResult, Target, timed
 from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
@@ -91,6 +93,21 @@ def judgeable(row: Dict[str, Any]) -> bool:
     )
 
 
+def _spread(seconds: List[float]) -> Dict[str, Any]:
+    """n, mean, median, 90th percentile (nearest rank) and max of a list of durations."""
+    s = sorted(seconds)
+    n = len(s)
+    return {"n": n, "mean": round(sum(s) / n, 3), "p50": round(s[n // 2], 3),
+            "p90": round(s[min(n - 1, int(0.9 * n))], 3), "max": round(s[-1], 3)}
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 class Engine:
     def __init__(
         self,
@@ -112,7 +129,8 @@ class Engine:
         self._jev = jev
         self._questions = questions or judging.active()
         self._max_words = max_excerpt_words
-        self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._concurrency = max(1, concurrency)
+        self._semaphore = asyncio.Semaphore(self._concurrency)
         self._now = now
         started = now()
         # The month's Jev budget is spread over its days: by day d, at most d/days of it may be spent,
@@ -127,11 +145,16 @@ class Engine:
         self._last_upload = time.monotonic()
         self._seen: Dict[str, str] = {}
         self._rejections = 0
+        # Measurement only: seconds summed over fetch slots, per-tier fetch durations and Jev call time.
+        # finish() summarises them into stats.
+        self._slot: Dict[str, float] = dict.fromkeys(("jev", "observe", "flush", "idle"), 0.0)
+        self._fetch_seconds: Dict[str, List[float]] = {}
+        self._jev_spent: Dict[str, float] = {"calls": 0, "seconds": 0.0}
         self.stats: Dict[str, Any] = {
             "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
             "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
             "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
-            "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {},
+            "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
         }
 
     async def start(self) -> None:
@@ -157,7 +180,10 @@ class Engine:
             for writer in list(self._writers.values()):
                 batch = writer.take(force)
                 if batch is not None:
-                    files.append(await asyncio.to_thread(writer.write, batch))
+                    local, remote = await asyncio.to_thread(writer.write, batch)
+                    files.append((local, remote))
+                    table = remote.split("/", 1)[0]
+                    self.stats["shard_bytes"][table] = self.stats["shard_bytes"].get(table, 0) + _size(local)
             if not files and not extra:
                 return
             await asyncio.to_thread(self._store.put_many, files + list(extra), f"engine {self.run_id}: {len(files) + len(extra)} file(s)")
@@ -167,38 +193,79 @@ class Engine:
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
         """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row."""
         state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir)]
+        self.stats["state_bytes"] = {Path(remote).stem: _size(local) for local, remote in state_files + list(extra)}
         await self.flush(force=True, extra=state_files + list(extra))
+        self._measure()
         logger.info("engine %s", {key: value for key, value in self.stats.items() if key != "shards"})
         return self.stats
+
+    def _measure(self) -> None:
+        """Summarise where the run's time went. Counts, seconds and bytes only, never what was fetched."""
+        try:
+            counts = getattr(self._fetcher, "counts", {})
+            calls, seconds = self._jev_spent["calls"], self._jev_spent["seconds"]
+            slot = {**self._slot, **getattr(self._fetcher, "timings", {})}
+            self.stats.update(
+                {
+                    "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
+                    "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
+                    "timeouts": {"http": counts.get("http_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
+                    "browser_launches": counts.get("browser_launches", 0),
+                    "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
+                            "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
+                    "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),  # Linux reports KB
+                }
+            )
+        except Exception:
+            logger.exception("run measurements not recorded")
 
     # ------------------------------------------------------------ fetching
 
     async def run(self, targets: Sequence[Target], observer: Optional[Observer] = None) -> None:
         """Fetch a batch. observer(target, row, answers) is called once per fetch row, after judging."""
 
+        used: Dict[str, float] = {}
+
         async def one(target: Target) -> None:
             async with self._semaphore:
+                with timed(used, "slots"):
+                    await work(target)
+
+        async def work(target: Target) -> None:
+            took: Dict[str, float] = {}
+            with timed(took, "fetch"):
                 row = await self._fetch_row(target)
-                # The row is buffered before judging starts, so a judging fault cannot drop it.
-                self._writer("fetches", self._day).add(row)
-                self.stats["total"] += 1
-                counted = {"stored": "stored", "unchanged": "unchanged", "duplicate": "duplicate",
-                           "error_page": "error_pages", "too_large": "too_large"}
-                self.stats[counted.get(row["outcome"], "errors")] += 1
-                if row["block_marker"] is not None and row["outcome"] == "stored":
-                    self.stats["blocked"] += 1
-                answers: Optional[JevResult] = None
-                if judgeable(row):
+            with contextlib.suppress(Exception):
+                tier = "error" if row["outcome"] == "error" else row.get("tier_used") or "error"
+                self._fetch_seconds.setdefault(tier, []).append(took["fetch"])
+            # The row is buffered before judging starts, so a judging fault cannot drop it.
+            self._writer("fetches", self._day).add(row)
+            self.stats["total"] += 1
+            counted = {"stored": "stored", "unchanged": "unchanged", "duplicate": "duplicate",
+                       "error_page": "error_pages", "too_large": "too_large"}
+            self.stats[counted.get(row["outcome"], "errors")] += 1
+            if row["block_marker"] is not None and row["outcome"] == "stored":
+                self.stats["blocked"] += 1
+            answers: Optional[JevResult] = None
+            if judgeable(row):
+                with timed(self._slot, "jev"):
                     answers = await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
-                if observer is not None:
-                    try:
+            if observer is not None:
+                try:
+                    with timed(self._slot, "observe"):
                         observer(target, row, answers)
-                    except Exception:
-                        # The row is stored. A fault in what follows it must not stop the batch.
-                        logger.exception("observer failed for %s", target.url)
+                except Exception:
+                    # The row is stored. A fault in what follows it must not stop the batch.
+                    logger.exception("observer failed for %s", target.url)
+            with timed(self._slot, "flush"):
                 await self.flush()
 
+        started = time.monotonic()
         await asyncio.gather(*(one(target) for target in targets))
+        # Slot time the round paid for but did not use: the cost of waiting for its slowest pages.
+        with contextlib.suppress(Exception):
+            idle = (time.monotonic() - started) * self._concurrency - used.get("slots", 0.0)
+            self._slot["idle"] = self._slot.get("idle", 0.0) + max(0.0, idle)
 
     async def _fetch_row(self, target: Target) -> Dict[str, Any]:
         row: Dict[str, Any] = {
@@ -268,6 +335,11 @@ class Engine:
             if tier == "DOM_TRAFILATURA" and scraped.word_count < THIN_HTML_WORDS:
                 self.stats["thin_html"] += 1
             row["text"] = text or None
+            with contextlib.suppress(Exception):
+                sizes = self.stats["bytes_by_tier"].setdefault(tier, {"n": 0, "body": 0, "text": 0})
+                sizes["n"] += 1
+                sizes["body"] += len(body)
+                sizes["text"] += len(text.encode("utf-8"))
         return row
 
     # ------------------------------------------------------------ judging
@@ -285,8 +357,10 @@ class Engine:
             "relevance_version": judging.relevance_version(),
         }
         calls = self._writer("judgement_calls", day)
+        self._jev_spent["calls"] += 1
         try:
-            result = await self._jev.ask(excerpt, self._questions)
+            with timed(self._jev_spent, "seconds"):
+                result = await self._jev.ask(excerpt, self._questions)
         except (JevUnavailable, JevRejected) as exc:
             refused = isinstance(exc, JevRejected)
             calls.add({**call, "status": "rejected" if refused else "unavailable", "error": str(exc)})
