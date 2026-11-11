@@ -246,7 +246,7 @@ class Engine:
                 "flush": {"uploads": self._uploads, "seconds_total": round(self._upload_seconds, 1)},
                 "fetch_seconds_by_tier": {tier: _spread(times) for tier, times in sorted(self._fetch_seconds.items())},
                 "timeouts": {"connect": counts.get("connect_timeouts", 0), "read": counts.get("read_timeouts", 0), "browser": counts.get("browser_timeouts", 0)},
-                **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches")},
+                **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8")},
                 "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                         "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
                 # shortcut: ru_maxrss is KB on Linux only; macOS reports bytes
