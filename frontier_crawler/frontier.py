@@ -128,6 +128,8 @@ _FRONTIER_SCHEMA = pa.schema(
         ("status", pa.string()),
         ("discovered_at", _TS),
         ("fetched_at", _TS),
+        # its last fetch served its content: stored, unchanged or a duplicate, with no block. Null until fetched.
+        ("stored", pa.bool_()),
     ]
 )
 _HOST_COUNTS = ("fetches", "content", "heavy", "refused", "errors", "error_pages")
@@ -328,6 +330,7 @@ class Frontier:
         # What the queue declined to take in this run, by reason. Reported in the run summary.
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
+        self.seed_urls_requeued = 0
         self.lifts = 0
         self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
         self.lines_lifted: set = set()
@@ -489,16 +492,17 @@ class Frontier:
     def add_seeds(self, seeds: Sequence[Seed], now: dt.datetime) -> int:
         added = 0
         for seed in seeds:
-            line = self._lines.get(seed.id)
             for url in seed.urls:
                 known = self._entries.get(url)
                 if known is not None:
-                    # A seed that has never stored anything gets its starting URLs tried again each run:
-                    # the failure may have been temporary, and the run summary then shows the reason.
-                    if line and line["content"] == 0 and known["status"] in ("fetched", "failed"):
+                    # A starting URL whose own fetch served nothing is tried again each run, whatever the rest of
+                    # its seed found: the failure may have been temporary, and the run summary then shows the reason.
+                    # One fetched before the record existed (null) is tried once more, to find out.
+                    if not known.get("stored") and known["status"] in ("fetched", "failed"):
                         self._set_status(known, "queued")
                         self._enqueue(known)
                         self._queued_per_host[known["host"]] = self._queued_per_host.get(known["host"], 0) + 1
+                        self.seed_urls_requeued += 1
                     continue
                 if seed.id not in self._lines:
                     self._new_line(seed.id, seed.id, None, url, now)
@@ -576,6 +580,7 @@ class Frontier:
         else:
             self._set_status(entry, "failed")
         entry["fetched_at"] = now
+        entry["stored"] = outcome in ("stored", "unchanged", "duplicate") and not row.get("block_marker")
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
         marker = row.get("block_marker") or ""
@@ -1164,6 +1169,7 @@ async def crawl(
             "queued": frontier.count("queued"), "known_urls": len(frontier),
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
+            "seed_urls_requeued": frontier.seed_urls_requeued,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,

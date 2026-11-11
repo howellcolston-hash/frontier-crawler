@@ -257,6 +257,37 @@ def test_lines_and_their_state_survive_a_save_and_load(tmp_path: Path) -> None:
     assert again._host_line == {"a.test": "s", "b.test": "s:b.test"}
 
 
+def test_a_starting_url_is_retried_on_its_own_record_not_its_seeds(tmp_path: Path) -> None:
+    seed = Seed(id="s", entity="s", urls=("https://a.test/", "https://a.test/main"))
+    frontier = Frontier()
+    frontier.add_seeds([seed], NOW)
+    first = frontier.entry("https://a.test/")
+    row = _page_row("https://a.test/", '<a href="https://b.test/">b</a>')
+    frontier.mark(first, row, None, NOW)
+    frontier.add_links(first, row, None, NOW)
+    frontier.mark(frontier.entry("https://b.test/"), _content(), None, NOW)          # another site's first page: content
+    frontier.mark(frontier.entry("https://a.test/main"), DEAD, None, NOW)
+    assert frontier.line("s")["content"] == 2                       # the seed line has content; its main URL does not
+    store = LocalStore(tmp_path / "store")
+    store.put_many(frontier.save(tmp_path / "w"), "state")
+    again = Frontier.load(store, tmp_path / "w2")
+    again.add_seeds([seed], NOW)
+    assert again.entry("https://a.test/main")["status"] == "queued" and again.entry("https://a.test/")["status"] == "fetched"
+    assert again.seed_urls_requeued == 1
+    # A URL fetched before the record existed is tried once; served again unchanged, it is left alone after that.
+    again.entry("https://a.test/")["stored"] = None
+    again.add_seeds([seed], NOW)
+    assert again.entry("https://a.test/")["status"] == "queued" and again.seed_urls_requeued == 2
+    again.mark(again.entry("https://a.test/"), {**_content(), "outcome": "unchanged"}, None, NOW)
+    again.mark(again.entry("https://a.test/main"), {"outcome": "error"}, None, NOW)
+    again.add_seeds([seed], NOW)
+    assert again.entry("https://a.test/")["status"] == "fetched" and again.entry("https://a.test/main")["status"] == "queued"
+    # A blocked page is not served content.
+    again.mark(again.entry("https://a.test/main"), {**_content(), "block_marker": "captcha"}, None, NOW)
+    again.add_seeds([seed], NOW)
+    assert again.entry("https://a.test/main")["status"] == "queued" and again.seed_urls_requeued == 4
+
+
 class FakeSite:
     def __init__(self, pages: Dict[str, str]) -> None:
         self.pages = pages
@@ -290,6 +321,7 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert sorted(site.fetched) == ["https://a.test/", "https://dead.test/"]
     assert first["stored_by_seed"] == {"a": 1, "dead": 0} and first["seeds_with_nothing"] == ["dead"]
     assert first["seed_url_problems"] == {"https://dead.test/": "error_page, status 404: http 404"}
+    assert first["seed_urls_requeued"] == 0
 
     second = go("r2", 10)
     assert second["seeds_added"] == 0 and second["stored"] == 3 and second["error_pages"] == 2   # /deep, and the dead seed again
@@ -298,6 +330,7 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert second["lines_spawned"] == 1 and second["lines_active"] == 3   # b.test became a line
     assert second["seeds_with_nothing"] == ["dead"]            # still reported in a later run
     assert site.fetched.count("https://dead.test/") == 2 and "https://dead.test/" in second["seed_url_problems"]   # and tried again
+    assert second["seed_urls_requeued"] == 1
 
     frontier = Frontier.load(store, tmp_path / "w3")
     assert frontier.entry("https://a.test/deep")["hops"] == 2 and frontier.count("fetched") == 6
