@@ -33,7 +33,7 @@ needed the PDF or browser tier, refusals, failures and dead links.
 
 Input contract:
     frontier = Frontier.load(store, workdir); frontier.add_seeds(seeds, now)
-    picks = frontier.select(n, seeds, today)
+    picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
     files = frontier.save(workdir)          # upload with store.put_many
     stats = await crawl(store, engine, seeds, workdir=..., max_fetches=..., batch=...)
@@ -42,11 +42,13 @@ Every constant below is PROVISIONAL.
 
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 import heapq
 import json
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -76,6 +78,7 @@ NEW_HOST_SHARE = 0.2            # part of each round kept for hosts never fetche
 HOST_ROUND_SHARE = 0.1          # most of one round that one host may take (at least 2)
 MAX_LINKS_PER_PAGE = 300
 MAX_QUEUED_PER_HOST = 2000
+MAX_IN_FLIGHT_PER_HOST = 2      # entries handed out by take() and not yet marked, per host
 PORTAL_THRESHOLD = 0.7          # Jev's data_portal answer at which a page is listed as a candidate for a derived client
 
 FRONTIER_PATH = "state/frontier.parquet"
@@ -250,6 +253,27 @@ def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[f
     return 1.0
 
 
+def _static(entry: Dict[str, Any], weight: float) -> float:
+    """The part of priority() fixed for a queued entry, in priority()'s own order of operations: priority() is
+    monotone in it, bit for bit, for one group's shared line and host factors."""
+    return weight * entry["base"] * HOP_DECAY ** entry["hops"]
+
+
+class _Group:
+    """The queued entries that share a line, a host and a seed, and so every factor of priority() but the static one.
+    members are kept best first: static score down, then url."""
+
+    __slots__ = ("line", "host", "seed", "weight", "members", "version")
+
+    def __init__(self, line: str, host: str, seed: str, weight: float) -> None:
+        self.line, self.host, self.seed, self.weight = line, host, seed, weight
+        self.members: List[Dict[str, Any]] = []
+        self.version = 0
+
+    def key(self, entry: Dict[str, Any]) -> Tuple[float, str]:
+        return -_static(entry, self.weight), entry["url"]
+
+
 class Frontier:
     def __init__(
         self,
@@ -270,11 +294,35 @@ class Frontier:
                 line["yield"] = parent["yield"] * HOP_DECAY
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
-        for entry in self._entries.values():
+        # The queue, ranked by group: see select(). The heaps are built by the first select() or take(), which bring the seed weights.
+        self._groups: Dict[Tuple[str, str, str], _Group] = {}
+        self._groups_by_line: Dict[str, List[_Group]] = {}
+        self._groups_by_host: Dict[str, List[_Group]] = {}
+        self._weights: Optional[Dict[str, float]] = None      # the active seeds' weights the heaps were built with
+        self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
+        self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on hosts never fetched
+        self._version = 0
+        self._crossing: Dict[str, List[Dict[str, Any]]] = {}  # host -> its entries still marked crossing, any status
+        self._statuses = Counter(entry["status"] for entry in self._entries.values())
+        self._line_statuses = Counter(line["status"] for line in self._lines.values())
+        self._in_flight: Dict[str, Tuple[str, str]] = {}     # url -> (host, line) of each entry out with take()
+        self._flight_host: Dict[str, int] = {}
+        self._flight_line: Dict[str, int] = {}
+        self._takes = 0
+        # seq is the order entries were queued in: select() has always broken ties within a never-fetched host by it.
+        for seq, entry in enumerate(self._entries.values()):
+            entry["seq"] = seq
             if entry["status"] == "queued":
                 self._queued_per_host[entry["host"]] = self._queued_per_host.get(entry["host"], 0) + 1
-            if not entry.get("crossing") and entry["host"]:
+                (self._groups.get((entry["line_id"], entry["host"], entry["seed_id"])) or self._group(entry)).members.append(entry)
+            if entry.get("crossing"):
+                self._crossing.setdefault(entry["host"], []).append(entry)
+            elif entry["host"]:
                 self._host_line.setdefault(entry["host"], entry["line_id"])
+        self._seq = len(self._entries)
+        for group in self._groups.values():
+            if len(group.members) > 1:
+                group.members.sort(key=group.key)
         # What the queue declined to take in this run, by reason. Reported in the run summary.
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
@@ -319,10 +367,10 @@ class Frontier:
         return self._lines.get(line_id)
 
     def count(self, status: str) -> int:
-        return sum(1 for entry in self._entries.values() if entry["status"] == status)
+        return self._statuses[status]
 
     def count_lines(self, status: str) -> int:
-        return sum(1 for line in self._lines.values() if line["status"] == status)
+        return self._line_statuses[status]
 
     def priority(self, entry: Dict[str, Any], weight: float, extra_host: int = 0, extra_line: int = 0) -> float:
         line = self._lines[entry["line_id"]]
@@ -343,6 +391,7 @@ class Frontier:
             "fetches": 0, "content": 0, "since_thaw": 0, "yield": start_yield, "status": "active", "frozen_at": None, "inbound": 0,
         }
         self._lines[line_id] = line
+        self._line_statuses["active"] += 1
         return line
 
     def _record_yield(self, line: Dict[str, Any], value: Optional[float], now: dt.datetime) -> None:
@@ -351,9 +400,13 @@ class Frontier:
         line["content"] += value is None or value > 0
         line["since_thaw"] += 1
         if value is not None:
+            before = line["yield"]
             line["yield"] = (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value
+            if line["yield"] > before:
+                self._push_all(self._groups_by_line.get(line["line_id"], ()))
         if line["status"] == "active" and line["since_thaw"] >= MIN_FETCHES_TO_FREEZE and line["yield"] < FREEZE_YIELD:
             line["status"] = "frozen"
+            self._line_statuses.update({"active": -1, "frozen": 1})
             line["frozen_at"] = now
             line["inbound"] = 0
             self.frozen += 1
@@ -366,7 +419,9 @@ class Frontier:
         line["inbound"] += 1
         if line["inbound"] >= THAW_INBOUND:
             line.update({"status": "active", "frozen_at": None, "inbound": 0, "since_thaw": 0, "yield": THAW_YIELD})
+            self._line_statuses.update({"active": 1, "frozen": -1})
             self.thawed += 1
+            self._push_all(self._groups_by_line.get(line["line_id"], ()))
 
     def _spawn(self, entry: Dict[str, Any], now: dt.datetime) -> None:
         """A crossing link yielded content: its site becomes a line, and the queued links to that site move into it."""
@@ -378,10 +433,18 @@ class Frontier:
             self._new_line(line_id, entry["seed_id"], parent, entry["url"], now, self._lines[parent]["yield"] * HOP_DECAY)
             self._host_line[host] = line_id
             self.spawned += 1
-        entry.update({"line_id": line_id, "crossing": False, "hops": 0})
-        for other in self._entries.values():
-            if other["host"] == host and other.get("crossing"):
-                other.update({"line_id": line_id, "crossing": False, "hops": 1})
+        self._move(entry, line_id, 0)
+        for other in self._crossing.pop(host, ()):
+            if other is not entry:
+                self._move(other, line_id, 1)
+
+    def _move(self, entry: Dict[str, Any], line_id: str, hops: int) -> None:
+        waiting = entry["status"] == "queued" and entry["url"] not in self._in_flight
+        if waiting:
+            self._dequeue(entry)
+        entry.update({"line_id": line_id, "crossing": False, "hops": hops})
+        if waiting:
+            self._enqueue(entry)
 
     # ------------------------------------------------------------ adding
 
@@ -395,13 +458,27 @@ class Frontier:
         if self._queued_per_host.get(host, 0) >= MAX_QUEUED_PER_HOST:
             self.skipped["host_queue_full"] += 1
             return False
-        self._entries[url] = {
+        self._insert({
             "url": url, "host": host, "seed_id": seed_id, "line_id": line_id, "crossing": crossing, "hops": hops,
             "parent_fetch_id": parent, "anchor": anchor or None, "base": base, "status": "queued",
             "discovered_at": now, "fetched_at": None,
-        }
+        })
         self._queued_per_host[host] = self._queued_per_host.get(host, 0) + 1
         return True
+
+    def _insert(self, entry: Dict[str, Any]) -> None:
+        entry["seq"] = self._seq
+        self._seq += 1
+        self._entries[entry["url"]] = entry
+        self._statuses[entry["status"]] += 1
+        if entry.get("crossing"):
+            self._crossing.setdefault(entry["host"], []).append(entry)
+        if entry["status"] == "queued":
+            self._enqueue(entry)
+
+    def _set_status(self, entry: Dict[str, Any], status: str) -> None:
+        self._statuses.update({entry["status"]: -1, status: 1})
+        entry["status"] = status
 
     def add_seeds(self, seeds: Sequence[Seed], now: dt.datetime) -> int:
         added = 0
@@ -413,7 +490,8 @@ class Frontier:
                     # A seed that has never stored anything gets its starting URLs tried again each run:
                     # the failure may have been temporary, and the run summary then shows the reason.
                     if line and line["content"] == 0 and known["status"] in ("fetched", "failed"):
-                        known["status"] = "queued"
+                        self._set_status(known, "queued")
+                        self._enqueue(known)
                         self._queued_per_host[known["host"]] = self._queued_per_host.get(known["host"], 0) + 1
                     continue
                 if seed.id not in self._lines:
@@ -434,10 +512,10 @@ class Frontier:
         for href in unparseable:
             # Kept as written, with the page it came from, so it can be looked at and repaired later.
             if href not in self._entries:
-                self._entries[href] = {
+                self._insert({
                     **entry, "url": href, "host": "", "crossing": False, "parent_fetch_id": row["fetch_id"],
                     "anchor": None, "status": "unparseable", "discovered_at": now, "fetched_at": None,
-                }
+                })
                 self.skipped["unparseable_link"] += 1
         for url, anchor in links:
             known = self._entries.get(url)
@@ -467,10 +545,16 @@ class Frontier:
     # ------------------------------------------------------------ after a fetch
 
     def mark(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> None:
+        flight = self._in_flight.pop(entry["url"], None)
+        if flight is not None:
+            self._flight_host[flight[0]] -= 1
+            self._flight_line[flight[1]] -= 1
+        elif entry["status"] == "queued":
+            self._dequeue(entry)
         if entry["status"] == "queued":
             self._queued_per_host[entry["host"]] = max(0, self._queued_per_host.get(entry["host"], 0) - 1)
         outcome = row.get("outcome")
-        entry["status"] = "failed" if outcome == "error" else "fetched"
+        self._set_status(entry, "failed" if outcome == "error" else "fetched")
         entry["fetched_at"] = now
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
@@ -489,66 +573,281 @@ class Frontier:
         # The fetch counts toward the line that found it, so a line is credited for reaching new ground.
         value = fetch_yield(row, answers)
         self._record_yield(self._lines[entry["line_id"]], value, now)
+        if flight is not None and flight[1] != entry["line_id"]:
+            self._push_all(self._groups_by_line.get(flight[1], ()))   # the line it was taken from has one fewer in flight
         if entry.get("crossing") and (value is None or value > 0):
             self._spawn(entry, now)
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")
         if final and final not in self._entries:
-            self._entries[final] = {**entry, "url": final, "host": urlsplit(final).netloc, "anchor": None, "status": "alias"}
+            self._insert({**entry, "url": final, "host": urlsplit(final).netloc, "anchor": None, "status": "alias"})
+
+    # ------------------------------------------------------------ the ranked queue
+    #
+    # Every factor of priority() but the static one is shared by a group (line, host, seed), so a group ranks by its best
+    # entry, and the heaps hold one item per group. An item's score may be stale only by being too high: whatever lowers a
+    # group (a fetch, an entry leaving, an entry in flight) is left for _top() to re-score, and whatever raises one (a
+    # line's yield rising, a thaw, an entry put back, a better entry joining) pushes a new item. Older items are skipped by
+    # their version.
+
+    def _group(self, entry: Dict[str, Any]) -> _Group:
+        key = (entry["line_id"], entry["host"], entry["seed_id"])
+        group = self._groups.get(key)
+        if group is None:
+            group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0))
+            self._groups_by_line.setdefault(key[0], []).append(group)
+            self._groups_by_host.setdefault(key[1], []).append(group)
+        return group
+
+    def _enqueue(self, entry: Dict[str, Any]) -> None:
+        group = self._group(entry)
+        members = group.members
+        i = bisect.bisect_left(members, group.key(entry), key=group.key)
+        members.insert(i, entry)
+        if self._weights is not None and self._eligible(group):
+            extras = self._extras(group)
+            # A later entry can still lead: two static scores may round to one score, and then the url decides.
+            if i == 0 or self.priority(entry, group.weight, *extras) == self.priority(members[0], group.weight, *extras):
+                self._push(group)
+
+    def _dequeue(self, entry: Dict[str, Any]) -> None:
+        group = self._groups[(entry["line_id"], entry["host"], entry["seed_id"])]
+        i = bisect.bisect_left(group.members, group.key(entry), key=group.key)
+        assert group.members[i] is entry
+        del group.members[i]
+
+    def _eligible(self, group: _Group) -> bool:
+        line = self._lines.get(group.line)
+        return bool(group.members) and group.seed in (self._weights or {}) and line is not None and line["status"] == "active"
+
+    def _never_fetched(self, host: str) -> bool:
+        return self._hosts.get(host, {}).get("fetches", 0) == 0
+
+    def _extras(self, group: _Group) -> Tuple[int, int]:
+        return self._flight_host.get(group.host, 0), self._flight_line.get(group.line, 0)
+
+    @staticmethod
+    def _runs(group: _Group, start: int):
+        """(start, end) of each run of members with the same static score, best first."""
+        members, weight = group.members, group.weight
+        key = lambda e: -_static(e, weight)
+        while start < len(members):
+            end = start + 1
+            if end < len(members) and key(members[end]) == key(members[start]):
+                end = bisect.bisect_right(members, key(members[start]), end, key=key)
+            yield start, end
+            start = end
+
+    def _best(self, group: _Group, extra_host: int, extra_line: int, out: Any = (), start: int = 0) -> Optional[Tuple[float, Dict[str, Any]]]:
+        """(score, entry) of the group's best member not in out: highest score, then lowest url. The score never rises
+        along the members, but neighbouring static scores can round to one score, so runs are read until it falls."""
+        members = group.members
+        best = None
+        for i, j in self._runs(group, start):
+            entry = next((members[k] for k in range(i, j) if members[k]["url"] not in out), None)
+            if entry is None:
+                continue
+            score = self.priority(entry, group.weight, extra_host, extra_line)
+            if best is not None and score < best[0]:
+                break
+            if best is None or entry["url"] < best[1]["url"]:
+                best = (score, entry)
+        return best
+
+    def _push(self, group: _Group) -> None:
+        if self._weights is None or not self._eligible(group):
+            return
+        score, entry = self._best(group, *self._extras(group))  # type: ignore[misc]
+        self._version += 1
+        group.version = self._version
+        item = (-score, entry["url"], self._version, group)
+        heapq.heappush(self._heap, item)
+        if self._never_fetched(group.host):
+            heapq.heappush(self._new_heap, item)
+
+    def _push_all(self, groups: Any) -> None:
+        for group in groups:
+            self._push(group)
+
+    def _ready(self, seeds: Sequence[Seed], today: dt.date) -> None:
+        """Build the heaps for these seed weights, or rebuild them when the weights change or stale items pile up."""
+        weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
+        if weights == self._weights and len(self._heap) <= 2 * len(self._groups) + 1000:
+            return
+        self._weights = weights
+        self._heap, self._new_heap = [], []
+        for group in self._groups.values():
+            if group.seed in weights and group.weight != weights[group.seed]:
+                group.weight = weights[group.seed]
+                group.members.sort(key=group.key)
+            self._push(group)
+
+    def _top(self, heap: List[Tuple[float, str, int, _Group]], new_hosts: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
+        """The heap's first item, once it is current and exact; stale items are dropped and high ones re-scored."""
+        while heap:
+            negative, url, version, group = heap[0]
+            if version != group.version or not self._eligible(group) or (new_hosts and not self._never_fetched(group.host)):
+                heapq.heappop(heap)
+                continue
+            score, entry = self._best(group, *self._extras(group))  # type: ignore[misc]
+            if -score == negative and entry["url"] == url:
+                return heap[0]
+            heapq.heappop(heap)
+            self._push(group)
+        return None
 
     # ------------------------------------------------------------ choosing
 
     def select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> List[Dict[str, Any]]:
-        """Up to n queued entries for the next round, from active lines, spread across hosts and lines."""
-        weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
-        queued = [
-            entry for entry in self._entries.values()
-            if entry["status"] == "queued" and entry["seed_id"] in weights and self._lines[entry["line_id"]]["status"] == "active"
-        ]
-        if n <= 0 or not queued:
+        """Up to n queued entries for the next round, from active lines, spread across hosts and lines.
+
+        The result is exactly that of scoring every queued entry and taking them through a lazily re-scored heap
+        (tests/test_frontier.py keeps that version and checks this against it). Here a group stands in the heap for its
+        entries, and an entry is scored on its own only when it reaches the top. Entries out with take() count as held.
+        """
+        self._ready(seeds, today)
+        if n <= 0:
             return []
         host_cap = max(2, math.ceil(n * HOST_ROUND_SHARE))
         picked: List[Dict[str, Any]] = []
-        taken: set = set()
         in_host: Dict[str, int] = {}
         in_line: Dict[str, int] = {}
 
         def take(entry: Dict[str, Any]) -> None:
             picked.append(entry)
-            taken.add(entry["url"])
             in_host[entry["host"]] = in_host.get(entry["host"], 0) + 1
             in_line[entry["line_id"]] = in_line.get(entry["line_id"], 0) + 1
 
         # First, the share kept for hosts never fetched: the best entry of each, best hosts first.
-        best_new: Dict[str, Dict[str, Any]] = {}
-        for entry in queued:
-            if self._hosts.get(entry["host"], {}).get("fetches", 0) == 0:
-                current = best_new.get(entry["host"])
-                if current is None or self.priority(entry, weights[entry["seed_id"]]) > self.priority(current, weights[current["seed_id"]]):
-                    best_new[entry["host"]] = entry
-        reserve = math.ceil(n * NEW_HOST_SHARE)
-        ranked = sorted(best_new.values(), key=lambda e: (-self.priority(e, weights[e["seed_id"]]), e["url"]))
-        for entry in ranked[:reserve]:
+        for entry in self._new_host_picks(math.ceil(n * NEW_HOST_SHARE)):
             take(entry)
 
-        # Then the rest by priority. Each pick lowers the priority of what shares its host or line,
-        # so the heap is re-scored lazily: an entry is taken only if its fresh score still leads.
-        def score(entry: Dict[str, Any]) -> float:
-            return self.priority(entry, weights[entry["seed_id"]], in_host.get(entry["host"], 0), in_line.get(entry["line_id"], 0))
+        # Then the rest by priority. Each pick lowers the priority of what shares its host or line, so an entry is
+        # taken only if its fresh score still leads every score in the heap, which may be stale.
+        def extras(host: str, line: str, host_counts: Dict[str, int], line_counts: Dict[str, int]) -> Tuple[int, int]:
+            return self._flight_host.get(host, 0) + host_counts.get(host, 0), self._flight_line.get(line, 0) + line_counts.get(line, 0)
 
-        heap = [(-score(entry), entry["url"]) for entry in queued if entry["url"] not in taken]
-        heapq.heapify(heap)
-        while heap and len(picked) < n:
-            stale, url = heapq.heappop(heap)
-            entry = self._entries[url]
+        start_host, start_line = dict(in_host), dict(in_line)   # every entry's first score in this round counts the reserve
+        out = {entry["url"] for entry in picked}               # entries no longer waiting in their group this round
+        cursor: Dict[_Group, int] = {}
+        followed: set = set()   # groups whose entries now come through `local`, not the persistent heap
+        local: List[Tuple[float, str, Dict[str, Any], Optional[_Group]]] = []   # a followed group's next entry, or an entry put back
+        popped: List[Tuple[float, str, int, _Group]] = []   # persistent items taken off here, put back at the end
+
+        def follow(group: _Group) -> None:
+            followed.add(group)
+            i = cursor.get(group, 0)
+            while i < len(group.members) and group.members[i]["url"] in out:
+                i += 1
+            cursor[group] = i
+            best = self._best(group, *extras(group.host, group.line, start_host, start_line), out, i)
+            if best is not None:
+                heapq.heappush(local, (-best[0], best[1]["url"], best[1], group))
+
+        def top() -> Optional[tuple]:
+            while True:
+                item = self._top(self._heap)
+                if item is None or (item[3] not in followed and not start_host.get(item[3].host) and not start_line.get(item[3].line)):
+                    break
+                popped.append(heapq.heappop(self._heap))
+                if item[3] not in followed:
+                    follow(item[3])
+            if local and (item is None or local[0][:2] < item[:2]):
+                return local[0]
+            return item
+
+        while len(picked) < n:
+            item = top()
+            if item is None:
+                break
+            if local and item is local[0]:
+                _, url, entry, group = heapq.heappop(local)
+            else:
+                popped.append(heapq.heappop(self._heap))
+                url, group = item[1], item[3]
+                entry = self._entries[url]
+            if group is not None:
+                out.add(url)
+                follow(group)
             if in_host.get(entry["host"], 0) >= host_cap:
                 continue
-            fresh = -score(entry)
-            if heap and fresh > heap[0][0]:
-                heapq.heappush(heap, (fresh, url))
+            fresh = -self.priority(entry, self._weights[entry["seed_id"]], *extras(entry["host"], entry["line_id"], in_host, in_line))  # type: ignore[index]
+            following = top()
+            if following is not None and fresh > following[0]:
+                heapq.heappush(local, (fresh, url, entry, None))
                 continue
             take(entry)
+        for item in popped:
+            heapq.heappush(self._heap, item)
         return picked
+
+    def _new_host_picks(self, k: int) -> List[Dict[str, Any]]:
+        """The best entry of each of the k best hosts never fetched, best first. Ties within a host go to the entry
+        queued first, ties between hosts to the url, as select() has always done."""
+        scores: Dict[str, float] = {}
+        order: List[str] = []
+        popped = []
+        while k > 0:
+            item = self._top(self._new_heap, new_hosts=True)
+            if item is None or (len(order) >= k and -item[0] < scores[order[k - 1]]):
+                break
+            popped.append(heapq.heappop(self._new_heap))
+            if item[3].host not in scores:
+                scores[item[3].host] = -item[0]
+                order.append(item[3].host)
+        for item in popped:
+            heapq.heappush(self._new_heap, item)
+        picks = []
+        for host in order:
+            first = None
+            for group in self._groups_by_host[host]:
+                if not self._eligible(group):
+                    continue
+                extras = self._extras(group)
+                for i, j in self._runs(group, 0):
+                    if self.priority(group.members[i], group.weight, *extras) != scores[host]:
+                        break
+                    for entry in group.members[i:j]:
+                        if first is None or entry["seq"] < first["seq"]:
+                            first = entry
+            picks.append(first)
+        picks.sort(key=lambda e: (-scores[e["host"]], e["url"]))  # type: ignore[index]
+        return picks[:k]  # type: ignore[return-value]
+
+    def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
+        """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
+        and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
+        Every 1/NEW_HOST_SHARE-th call takes from hosts never fetched while there are any. Nothing calls this yet."""
+        self._ready(seeds, today)
+        self._takes += 1
+        heaps = [(self._heap, False)]
+        if self._takes % round(1 / NEW_HOST_SHARE) == 0:
+            heaps.insert(0, (self._new_heap, True))
+        for heap, new_hosts in heaps:
+            full = []
+            while True:
+                item = self._top(heap, new_hosts)
+                if item is None or self._flight_host.get(item[3].host, 0) < MAX_IN_FLIGHT_PER_HOST:
+                    break
+                full.append(heapq.heappop(heap))
+            for kept in full:
+                heapq.heappush(heap, kept)
+            if item is not None:
+                entry = self._entries[item[1]]
+                self._dequeue(entry)
+                self._in_flight[entry["url"]] = (entry["host"], entry["line_id"])
+                self._flight_host[entry["host"]] = self._flight_host.get(entry["host"], 0) + 1
+                self._flight_line[entry["line_id"]] = self._flight_line.get(entry["line_id"], 0) + 1
+                return entry
+        return None
+
+    def release(self, entry: Dict[str, Any]) -> None:
+        """Return an entry from take() that was not fetched to the queue."""
+        host, line = self._in_flight.pop(entry["url"])
+        self._flight_host[host] -= 1
+        self._flight_line[line] -= 1
+        self._enqueue(entry)
+        self._push_all(self._groups_by_host.get(host, []) + self._groups_by_line.get(line, []))
 
 
 async def crawl(
