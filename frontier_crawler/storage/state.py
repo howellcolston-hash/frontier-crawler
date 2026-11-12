@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import bisect
 import datetime as dt
+import hashlib
 import json
 from array import array
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -21,51 +22,102 @@ import pyarrow.parquet as pq
 
 from frontier_crawler.storage.store import Store
 
-URL_STATE_PATH = "state/url_state.parquet"
+URL_STATE_PATH = "state/url_state.parquet"     # before 2026-11-12: url, sha256, last_fetched, http_status; read once, left in place
+URL_HASHES_PATH = "state/url_hashes.parquet"
 JEV_SPEND_PATH = "state/jev_spend.json"
 BODY_HASHES_PATH = "state/body_hashes.parquet"
 WATCH_PATH = "state/watch.json"
 
-_URL_SCHEMA = pa.schema(
-    [
-        ("url", pa.string()),
-        ("sha256", pa.string()),
-        ("last_fetched", pa.timestamp("us", tz="UTC")),
-        ("http_status", pa.int32()),
-    ]
-)
+
+def url_key(text: str) -> int:
+    """A URL's 64-bit key: the first 8 bytes of its BLAKE2b hash. Two of n URLs share one with probability about n^2 / 2^65."""
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=8).digest(), "little")
+
+
+def u64(values: array) -> pa.Array:
+    """An array("Q") as an Arrow uint64 array, without copying."""
+    return pa.Array.from_buffers(pa.uint64(), len(values), [None, pa.py_buffer(values)])
+
+
+def to_array(values: pa.Array) -> array:
+    """An Arrow uint64 array as an array("Q").
+    shortcut: read and written in this machine's byte order, little-endian on every runner used."""
+    values, out = values.combine_chunks() if isinstance(values, pa.ChunkedArray) else values, array("Q")
+    if len(values):
+        out.frombytes(values.buffers()[1].slice(values.offset * 8, len(values) * 8))
+    return out
+
+
+def unique_sorted(values: pa.Array) -> pa.Array:
+    values = values.take(pc.sort_indices(values))
+    return values.filter(last_of_runs(values))
+
+
+def read_u64(local: Path, names: Sequence[str]) -> List[array]:
+    """uint64 columns of a Parquet file as array("Q")s."""
+    table = pq.read_table(local, columns=list(names))
+    return [to_array(table.column(name)) for name in names]
+
+
+def write_u64(local: Path, columns: Dict[str, pa.Array], sorted_name: str) -> None:
+    """Write uint64 columns, the sorted one delta-encoded (about 5 bytes a value at a few million random keys)."""
+    local.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(columns), local, compression="zstd", use_dictionary=False,
+                   column_encoding={name: "DELTA_BINARY_PACKED" if name == sorted_name else "PLAIN" for name in columns})
+
+
+def last_of_runs(keys: pa.Array) -> pa.Array:
+    """True at the last of each run of equal values in a sorted array."""
+    if not len(keys):
+        return pa.array([], pa.bool_())
+    return pa.concat_arrays([pc.not_equal(keys.slice(0, len(keys) - 1), keys.slice(1)), pa.array([True])])
 
 
 class UrlState:
-    """url -> the hash of what it last served."""
+    """url -> what it last served, to tell an unchanged page: the URL's 64-bit key -> the first 8 bytes of its content's SHA-256,
+    16 bytes a URL in memory (two sorted arrays, searched by bisection) instead of a row of Python objects. A page is
+    wrongly called unchanged only if two URLs share a key and their contents those 8 bytes: never, in practice. A store
+    with only the older url_state.parquet is read from that once; the older file is left in place."""
 
-    def __init__(self, rows: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
-        self._rows: Dict[str, Dict[str, Any]] = rows or {}
+    def __init__(self, keys: Optional[array] = None, values: Optional[array] = None) -> None:
+        self._keys = keys if keys is not None else array("Q")
+        self._values = values if values is not None else array("Q")
+        self._new: Dict[int, int] = {}
 
     @classmethod
     def load(cls, store: Store, workdir: Path) -> "UrlState":
-        local = Path(workdir) / "state-in" / "url_state.parquet"
-        if not store.get(URL_STATE_PATH, local):
-            return cls()
-        return cls({row["url"]: row for row in pq.read_table(local).to_pylist()})
+        local = Path(workdir) / "state-in" / "url_hashes.parquet"
+        if store.get(URL_HASHES_PATH, local):
+            return cls(*read_u64(local, ("k", "h")))
+        state, old = cls(), Path(workdir) / "state-in" / "url_state.parquet"
+        if store.get(URL_STATE_PATH, old):
+            for batch in pq.ParquetFile(old).iter_batches(columns=["url", "sha256"]):
+                for url, sha256 in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist()):
+                    if url and sha256:
+                        state.record(url, sha256)
+        return state
 
-    def last_hash(self, url: str) -> Optional[str]:
-        row = self._rows.get(url)
-        return row["sha256"] if row else None
+    def same(self, url: str, sha256: str) -> bool:
+        """Whether url last served content with this hash."""
+        key = url_key(url)
+        value = self._new.get(key)
+        if value is None:
+            at = bisect.bisect_left(self._keys, key)
+            value = self._values[at] if at < len(self._keys) and self._keys[at] == key else None
+        return value == int(sha256[:16], 16)
 
-    def record(self, url: str, sha256: str, when: dt.datetime, status: int) -> None:
-        self._rows[url] = {"url": url, "sha256": sha256, "last_fetched": when, "http_status": status}
-
-    def __len__(self) -> int:
-        return len(self._rows)
+    def record(self, url: str, sha256: str) -> None:
+        self._new[url_key(url)] = int(sha256[:16], 16)
 
     def save(self, workdir: Path) -> Tuple[Path, str]:
-        local = Path(workdir) / "state-out" / "url_state.parquet"
-        local.parent.mkdir(parents=True, exist_ok=True)
-        rows = [self._rows[url] for url in sorted(self._rows)]
-        columns = {name: [row.get(name) for row in rows] for name in _URL_SCHEMA.names}
-        pq.write_table(pa.Table.from_pydict(columns, schema=_URL_SCHEMA), local, compression="zstd")
-        return local, URL_STATE_PATH
+        local = Path(workdir) / "state-out" / "url_hashes.parquet"
+        keys = pa.concat_arrays([u64(self._keys), pa.array(list(self._new), pa.uint64())])
+        values = pa.concat_arrays([u64(self._values), pa.array(list(self._new.values()), pa.uint64())])
+        order = pc.sort_indices(keys)   # stable: for a key in both, the old value comes first and this run's last
+        keys, values = keys.take(order), values.take(order)
+        last = last_of_runs(keys)
+        write_u64(local, {"k": keys.filter(last), "h": values.filter(last)}, "k")
+        return local, URL_HASHES_PATH
 
 
 class BodyHashes:
@@ -90,12 +142,7 @@ class BodyHashes:
     @classmethod
     def load(cls, store: Store, workdir: Path) -> "BodyHashes":
         local = Path(workdir) / "state-in" / "body_hashes.parquet"
-        known = array("Q")
-        if store.get(BODY_HASHES_PATH, local):
-            column = pq.read_table(local).column("h").combine_chunks()
-            if len(column):
-                known.frombytes(column.buffers()[1].slice(column.offset * 8, len(column) * 8))
-        return cls(known)
+        return cls(read_u64(local, ("h",))[0] if store.get(BODY_HASHES_PATH, local) else array("Q"))
 
     def __contains__(self, sha256: str) -> bool:
         key = self._key(sha256)
@@ -110,12 +157,9 @@ class BodyHashes:
         new = self._new | set(map(self._key, pending))
         if not new:
             return []
-        known = pa.Array.from_buffers(pa.uint64(), len(self._known), [None, pa.py_buffer(self._known)])
-        keys = pa.concat_arrays([known, pa.array(sorted(new), pa.uint64())])
+        keys = pa.concat_arrays([u64(self._known), pa.array(sorted(new), pa.uint64())])
         local = Path(workdir) / "state-out" / "body_hashes.parquet"
-        local.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.table({"h": keys.take(pc.sort_indices(keys))}), local, compression="zstd",
-                       use_dictionary=False, column_encoding={"h": "DELTA_BINARY_PACKED"})
+        write_u64(local, {"h": keys.take(pc.sort_indices(keys))}, "h")
         return [(local, BODY_HASHES_PATH)]
 
 

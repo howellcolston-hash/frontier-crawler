@@ -448,7 +448,8 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert second["seed_urls_requeued"] == 1
 
     frontier = Frontier.load(store, tmp_path / "w3")
-    assert frontier.entry("https://a.test/deep")["hops"] == 2 and frontier.count("fetched") == 6
+    # A fetched URL is kept as its key in the seen set (its hops are in its fetch row, below); a starting URL whole.
+    assert frontier.entry("https://a.test/deep") is None and frontier._known("https://a.test/deep") and frontier.count("fetched") == 6
     broken = frontier.entry("http://[bad")
     assert broken["status"] == "unparseable" and broken["parent_fetch_id"] and broken["seed_id"] == "a"   # kept with the page it came from
 
@@ -556,7 +557,7 @@ def test_watched_pages_are_read_when_due_and_a_changed_one_queues_its_new_links(
     rows = [row for path in (tmp_path / "store" / "fetches").rglob("*.parquet") for row in pq.read_table(path).to_pylist()]
     assert {row["url_requested"]: row["line_id"] for row in rows if row["line_id"].startswith("watch:")} == {
         "https://a.test/notices": "watch:notices", "https://a.test/gone": "watch:gone"}
-    assert Frontier.load(store, tmp_path / "w1").entry("https://a.test/n/1")["line_id"] == "a"
+    assert {row["url_requested"]: row["line_id"] for row in rows}["https://a.test/n/1"] == "a"   # fetched as the site's line
     assert counts(go("r2", 6)) == (2, 1, 1, 0, 0, 1, 0)             # read 6 hours ago: not due; the dead one is due hourly
     assert counts(go("r3", 12)) == (2, 2, 2, 0, 1, 1, 0)            # due, and served the same bytes
     site.pages["https://a.test/notices"] = '<a href="/n/1">1</a> <a href="/n/2">2</a>'
@@ -626,7 +627,7 @@ def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
         queue_uploads = 0
 
         def put_many(self, files: Any, message: str = "") -> None:
-            self.queue_uploads += any(remote == "state/frontier.parquet" for _, remote in files)
+            self.queue_uploads += any(remote == "state/queue/manifest.json" for _, remote in files)
             super().put_many(files, message)
 
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
@@ -646,7 +647,7 @@ def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
     assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
     assert stats["slot_seconds"]["waiting"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
     assert stats["workers"] == 4 and 1 <= stats["peak_in_flight"] <= 2   # one host: at most MAX_IN_FLIGHT_PER_HOST at once
-    assert set(stats["state_bytes"]) >= {"frontier", "hosts", "lines", "url_state"} and all(stats["state_bytes"].values())
+    assert set(stats["state_bytes"]) >= {"queue", "hosts", "lines", "url_hashes"} and all(stats["state_bytes"].values())
 
 
 def test_crawl_stops_taking_urls_after_max_minutes(tmp_path: Path) -> None:

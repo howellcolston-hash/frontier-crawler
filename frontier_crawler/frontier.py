@@ -77,6 +77,25 @@ mode (state/lines.parquet), so switching modes loses nothing.
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links; and when its sitemaps were last read.
 
+The queue on disk (storage/queue.py: state/queue/). Queued entries live in bucket files sorted by group; every other URL
+the queue has known is a 64-bit key in a seen set (a never-seen URL is wrongly taken as seen with probability n / 2^64 for
+n known: 5e-13 a URL at 10 million, so about 3e-6 URLs ever lost to it over the first 10 million). What a fetched URL last
+served, for telling an unchanged page, is the engine's state/url_hashes.parquet; when a watched page was last read, its
+state/watch.json. A run holds in memory only its hot set. At its first take, a pass over the buckets scores each group by
+its best entry as the ranking rule would (fixed: its priority; bandit: one Thompson draw from its arm, staleness widening
+included; shadow: both) and loads the best HOT_PER_GROUP entries of the top groups until HOT_ENTRIES are loaded, plus the
+best entry of COLD_SAMPLE groups drawn uniformly from the rest. Those are a group's turn at a re-test: a fixed re-test
+draws from them in proportion to the groups left on disk, as it drew from every group before; a bandit arm left out is
+reachable through its draw, which staleness widens, and through the sample. When a loaded group's entries fall below the
+best still on disk, its next ones are loaded; when the hot set runs dry (fixed: its best falls below the best group left
+out), the next groups are. A seed's starting group is always loaded. Groups held by a site factor of 0 or an inactive
+seed are not scored or loaded, and are back in the ranking once raised or active. A link into a group left on disk is
+appended to it unloaded; it joins the ranking when its group next does. A crossing left on disk when its site became a
+line (spawned after it was queued) moves to that line when it is loaded, as _spawn would have moved it. At save, a group
+keeps its best MAX_QUEUED_PER_GROUP entries, and past MAX_QUEUED the lowest-ranked groups at the run's first take (fixed
+priority, a held site or seed ranked as if not held) are cut whole, so the cap acts a run late. What is cut stays in the
+seen set and in the links table, which holds every link of every stored page.
+
 Sitemaps. At the start of a run, a seed's starting sites and the sites with a line on a domain steered above 1 have
 their robots.txt and the sitemaps it names (else /sitemap.xml) read, at most once per SITEMAP_EVERY, and up to
 SITEMAP_MAX_URLS new URLs each, newest first, are queued as ordinary links (add_sitemap). Discovery only: robots.txt
@@ -108,11 +127,15 @@ import contextlib
 import datetime as dt
 import functools
 import heapq
+import itertools
 import json
 import logging
 import math
 import random
+import resource
+import sys
 import time
+from array import array
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,7 +150,8 @@ from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import newest_first, normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
-from frontier_crawler.storage.state import load_watch_times, save_watch_times
+from frontier_crawler.storage.queue import QueueFiles, group_key, kept as kept_whole
+from frontier_crawler.storage.state import load_watch_times, save_watch_times, url_key
 from frontier_crawler.storage.store import Store
 
 MAX_HOPS = 5                    # links this many steps from the start of a line are the last ones queued
@@ -166,34 +190,19 @@ ARM_WINDOW = 6.0                # PROVISIONAL: fetches an arm's estimate remembe
 ARM_PRIOR = 2.0                 # PROVISIONAL: pseudo-fetches behind a new arm's prior, so it starts wide
 ARM_STALE_DAYS = 14.0           # PROVISIONAL: days without a fetch over which an arm's evidence halves, down to ARM_PRIOR
 ARM_REFRESH = 8                 # PROVISIONAL: arms drawn at random whose sample is drawn again at each take
+# The queue on disk; see the module docstring.
+HOT_ENTRIES = 100_000           # PROVISIONAL: entries a run loads at its first take, best groups first: about a dozen runs' takes
+HOT_PER_GROUP = 64              # PROVISIONAL: entries of one group loaded at a time; its next ones load when these run out
+COLD_SAMPLE = 2_000             # PROVISIONAL: groups outside the hot set drawn uniformly each run, their best entry loaded
+MAX_QUEUED_PER_GROUP = 1_000    # PROVISIONAL: a group's lowest-ranked entries past this are cut at save
+MAX_QUEUED = 5_000_000          # PROVISIONAL: queued entries in all; past it the lowest-ranked groups are cut at save
 
 logger = logging.getLogger("frontier_crawler.frontier")
 
-FRONTIER_PATH = "state/frontier.parquet"
 HOSTS_PATH = "state/hosts.parquet"
 LINES_PATH = "state/lines.parquet"
 
 _TS = pa.timestamp("us", tz="UTC")
-_FRONTIER_SCHEMA = pa.schema(
-    [
-        ("url", pa.string()),
-        ("host", pa.string()),
-        ("seed_id", pa.string()),   # the seed this descends from, however many lines later
-        ("line_id", pa.string()),
-        ("crossing", pa.bool_()),   # a link to a site no line covered when it was found
-        ("hops", pa.int32()),
-        ("parent_fetch_id", pa.string()),
-        ("anchor", pa.string()),
-        ("base", pa.float64()),
-        # queued | fetched | failed | retry (timed out once; fetched again later) | alias (a redirect target of a fetched URL) |
-        # unparseable (a link as written on its page that could not be read as a URL; never fetched)
-        ("status", pa.string()),
-        ("discovered_at", _TS),
-        ("fetched_at", _TS),
-        # its last fetch served its content: stored, unchanged or a duplicate, with no block. Null until fetched.
-        ("stored", pa.bool_()),
-    ]
-)
 _HOST_COUNTS = ("fetches", "content", "heavy", "refused", "errors", "error_pages")
 # sitemap_read_at: when its robots.txt and sitemaps were last read (null: never; absent from files saved before sitemaps were read).
 _HOSTS_SCHEMA = pa.schema([("host", pa.string())] + [(name, pa.int64()) for name in _HOST_COUNTS] + [("sitemap_read_at", _TS)])
@@ -310,11 +319,22 @@ def _static(entry: Dict[str, Any], weight: float) -> float:
     return weight * entry["base"] * HOP_DECAY ** entry["hops"] * (GENERATION_DECAY if entry.get("crossing") else 1.0)
 
 
+class _UrlDown(str):
+    """A url that sorts in reverse, so a min-heap of (score, url) drops the largest url first among equal scores."""
+
+    __slots__ = ()
+
+    def __lt__(self, other: str) -> bool:
+        return str.__gt__(self, other)
+
+
 class _Group:
     """The queued entries that share a line, a host and a seed, and so every factor of priority() but the static one.
-    members are kept best first: static score down, then url."""
+    members are kept best first: static score down, then url. A group with rows on disk is cold until loaded: its new
+    entries wait in pending and it is not ranked. Once hot, its members hold its loaded rows and the rest stay on disk."""
 
-    __slots__ = ("line", "host", "seed", "weight", "members", "version", "slot", "drawn")
+    __slots__ = ("line", "host", "seed", "weight", "members", "version", "slot", "drawn",
+                 "hot", "bucket", "start", "disk", "taken", "floor", "pending")
 
     def __init__(self, line: str, host: str, seed: str, weight: float) -> None:
         self.line, self.host, self.seed, self.weight = line, host, seed, weight
@@ -322,6 +342,12 @@ class _Group:
         self.version = 0
         self.slot = -1   # its place in Frontier._filled while it has members
         self.drawn = 0   # the version of its current items in the arm heaps
+        self.hot = True
+        self.bucket = -1                 # its bucket file, once known
+        self.start = self.disk = 0       # its rows on disk: where they start in the bucket, and how many are not loaded
+        self.taken = 0                   # rows loaded so far, the first of its rows on disk
+        self.floor = 0.0                 # static score at weight 1 of the last row loaded: none on disk is higher
+        self.pending: Optional[List[Dict[str, Any]]] = None   # entries queued while cold
 
     def key(self, entry: Dict[str, Any]) -> Tuple[float, str]:
         return -_static(entry, self.weight), entry["url"]
@@ -335,6 +361,9 @@ class Frontier:
         lines: Optional[List[Dict[str, Any]]] = None,
         rng_seed: Any = 0,
     ) -> None:
+        # The queue on disk (see the module docstring); empty for a queue built in memory.
+        self._files = QueueFiles(decay=(HOP_DECAY, GENERATION_DECAY))
+        self._loc: List[Tuple[Any, Any, Any]] = []   # per bucket: its groups' keys, sorted, and their first rows and row counts
         self._entries: Dict[str, Dict[str, Any]] = {entry["url"]: entry for entry in (entries or [])}
         self._hosts: Dict[str, Dict[str, int]] = {
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
@@ -446,18 +475,82 @@ class Frontier:
         self.takes_by_kind: Counter = Counter()    # greedy, explore (bandit); agreed, differed (shadow)
         self.tried: set = set()                    # groups taken from in this run
         self.shadow = dict.fromkeys(("takes", "agreed", "estimate_fixed", "estimate_bandit"), 0.0)
+        self._disk_left = 0                  # queued rows on disk not loaded
+        self._disk_by_seed: Counter = Counter()
+        self._cold_groups = 0                # groups with rows on disk, not loaded
+        self._inserted = 0                   # URLs first known in this run
+        self._reserve: List[Tuple[float, tuple]] = []   # groups left out of the hot set, worst first
+        self._beyond = -math.inf             # the best score at the first take of a group left out of the reserve too
+        self._spent = False                  # a pass over the disk found nothing more to load
+        self._sample: List[_Group] = []      # the groups drawn uniformly from those left out
+        self._cut: Dict[Tuple[str, str, str], int] = {}   # groups to cut at save for MAX_QUEUED: rows on disk
+        self._cold_top: Dict[str, float] = {}    # per seed, the best priority of its groups left on disk
+        self._cold_held = 0                  # rows on disk of sites steered to 0
+        self._hot_rng = random.Random(f"{rng_seed}:hot")
+        self.queue: Dict[str, Any] = {       # the run record's queue figures: see queue_record()
+            "migrated": False, "load_seconds": 0.0, "select_seconds": 0.0, "save_seconds": 0.0, "bytes_in": 0, "bytes_out": 0,
+            "scans": 0, "groups_promoted": 0, "entries_appended_cold": 0, "cut_group_cap": 0, "cut_total_cap": 0, "seen": 0,
+            "peak_rss_mb_after_select": None,
+        }
 
     # ------------------------------------------------------------ persistence
 
     @classmethod
     def load(cls, store: Store, workdir: Path, rng_seed: Any = 0) -> "Frontier":
+        """The hosts and lines tables whole; the queue's files (state/queue/, or the older state/frontier.parquet), of
+        which only the entries kept whole are read into memory here."""
+        began = time.monotonic()
         tables: List[List[Dict[str, Any]]] = []
-        for remote in (FRONTIER_PATH, HOSTS_PATH, LINES_PATH):
+        size = 0
+        for remote in (HOSTS_PATH, LINES_PATH):
             local = Path(workdir) / "state-in" / remote.rsplit("/", 1)[1]
-            tables.append(pq.read_table(local).to_pylist() if store.get(remote, local) else [])
-        return cls(*tables, rng_seed=rng_seed)
+            got = store.get(remote, local)
+            tables.append(pq.read_table(local).to_pylist() if got else [])
+            size += local.stat().st_size if got else 0
+        files = QueueFiles.load(store, workdir, (HOP_DECAY, GENERATION_DECAY))
+        frontier = cls(files.kept, *tables, rng_seed=rng_seed)
+        frontier._attach(files)
+        frontier.queue.update(migrated=files.migrated, bytes_in=size + files.bytes_in, load_seconds=time.monotonic() - began)
+        return frontier
+
+    def _attach(self, files: QueueFiles) -> None:
+        """Take the queue's files: where each group's rows are, and the queued counts per host and seed. Nothing is loaded."""
+        self._files = files
+        self._host_line.update(files.host_line)
+        self._statuses.update(files.dropped)
+        for bucket, rows in enumerate(files.rows):
+            keys, starts, counts = array("Q"), array("q"), array("q")
+            if rows:
+                first, first_rows, sizes = files.runs(bucket, ("line_id", "host", "seed_id"))
+                hashed = [group_key(*key) for key in zip(first["line_id"], first["host"], first["seed_id"])]
+                order = sorted(range(len(hashed)), key=hashed.__getitem__)
+                keys, starts, counts = array("Q", (hashed[i] for i in order)), array("q", (first_rows[i] for i in order)), array("q", (sizes[i] for i in order))
+                for host, seed, n in zip(first["host"], first["seed_id"], sizes):
+                    self._queued_per_host[host] = self._queued_per_host.get(host, 0) + n
+                    self._disk_by_seed[seed] += n
+                self._disk_left += sum(sizes)
+                self._cold_groups += len(sizes)
+            self._loc.append((keys, starts, counts))
+
+    def _locate(self, key: Tuple[str, str, str]) -> Optional[Tuple[int, int, int]]:
+        """(bucket, first row, rows) of a group's rows on disk, or None. shortcut: two groups sharing a 64-bit key (about
+        n^2 / 2^65 for n groups) would be taken for one."""
+        if not self._loc:
+            return None
+        hashed = group_key(*key)
+        bucket = hashed % self._files.buckets
+        keys, starts, counts = self._loc[bucket]
+        i = bisect.bisect_left(keys, hashed)
+        return (bucket, starts[i], counts[i]) if i < len(keys) and keys[i] == hashed else None
+
+    def _known(self, url: str) -> bool:
+        """Whether the queue has known url: in memory, or in the seen set."""
+        return url in self._entries or (bool(self._files.seen) and self._files.has(url_key(url)))
 
     def save(self, workdir: Path) -> List[Tuple[Path, str]]:
+        """The files of the next state, to upload in one commit: hosts, lines and the queue's (only its changed buckets).
+        Applies the caps: MAX_QUEUED_PER_GROUP to every bucket written, MAX_QUEUED to the groups chosen at the first take."""
+        began = time.monotonic()
         out = Path(workdir) / "state-out"
         out.mkdir(parents=True, exist_ok=True)
         zero = dict.fromkeys(_HOST_COUNTS, 0)
@@ -465,7 +558,6 @@ class Frontier:
                      for host in sorted(set(self._hosts) | set(self.sitemap_read))]
         files: List[Tuple[Path, str]] = []
         for remote, schema, rows in (
-            (FRONTIER_PATH, _FRONTIER_SCHEMA, [self._entries[url] for url in sorted(self._entries)]),
             (HOSTS_PATH, _HOSTS_SCHEMA, host_rows),
             (LINES_PATH, _LINES_SCHEMA, [self._lines[line_id] for line_id in sorted(self._lines)]),
         ):
@@ -473,12 +565,63 @@ class Frontier:
             columns = {name: [row.get(name) for row in rows] for name in schema.names}
             pq.write_table(pa.Table.from_pydict(columns, schema=schema), local, compression="zstd")
             files.append((local, remote))
+        adds: Dict[int, List[Dict[str, Any]]] = {}
+        drops: Dict[int, List[Tuple[int, int]]] = {}
+        cut = {key: n for key, n in self._cut.items() if key not in self._groups or not self._groups[key].hot}
+        cut_total = sum(cut.values())
+        for key in cut:
+            bucket, start, rows = self._locate(key)  # type: ignore[misc]
+            drops.setdefault(bucket, []).append((start, start + rows))
+        for group in self._groups.values():   # rows loaded are written from memory, if still queued
+            if group.taken:
+                drops.setdefault(group.bucket, []).append((group.start, group.start + group.taken))
+        kept_rows: List[Dict[str, Any]] = []
+        kept_counts: Counter = Counter()
+        for entry in self._entries.values():
+            if entry["status"] == "queued":
+                key = (entry["line_id"], entry["host"], entry["seed_id"])
+                if key in cut:
+                    cut_total += 1
+                else:
+                    adds.setdefault(self._bucket(key), []).append(entry)
+            elif kept_whole(entry):
+                kept_rows.append(entry)
+                kept_counts[entry["status"]] += 1
+        dropped = {status: n - kept_counts[status] for status, n in sorted(self._statuses.items()) if status != "queued" and n > kept_counts[status]}
+        host_line = dict(self._host_line)
+        for url in sorted(self._entries):   # as a load from one file of every entry mapped them: a host to its first entry's line
+            entry = self._entries[url]
+            if entry["host"] and not entry.get("crossing"):
+                host_line.setdefault(entry["host"], entry["line_id"])
+        queue_files, figures = self._files.save(out, adds, drops, self._entries, kept_rows, host_line, dropped, MAX_QUEUED_PER_GROUP)
+        files += queue_files
+        self.queue.update(cut_group_cap=figures["cut"], cut_total_cap=cut_total, seen=figures["seen"],
+                          bytes_out=sum(local.stat().st_size for local, _ in files), save_seconds=time.monotonic() - began)
         return files
+
+    def _bucket(self, key: Tuple[str, str, str]) -> int:
+        group = self._groups.get(key)   # none for an entry out with take() when _spawn moved it
+        if group is None:
+            return group_key(*key) % self._files.buckets
+        if group.bucket < 0:
+            group.bucket = group_key(*key) % self._files.buckets
+        return group.bucket
+
+    def queue_record(self) -> Dict[str, Any]:
+        """The run record's queue figures: counts, seconds and bytes only."""
+        hot = [group for group in self._groups.values() if group.hot and group.members]
+        pending = sum(len(group.pending) for group in self._groups.values() if group.pending)
+        return {
+            **{key: round(value, 2) if isinstance(value, float) else value for key, value in self.queue.items()},
+            "groups_hot": len(hot), "groups_cold": self._cold_groups,
+            "entries_hot": sum(len(group.members) for group in hot), "entries_cold": self._disk_left + pending,
+        }
 
     # ------------------------------------------------------------ reading
 
     def __len__(self) -> int:
-        return len(self._entries)
+        """URLs the queue has known."""
+        return len(self._files.seen) + self._inserted if self._files.seen else len(self._entries)
 
     def entry(self, url: str) -> Optional[Dict[str, Any]]:
         return self._entries.get(url)
@@ -487,7 +630,7 @@ class Frontier:
         return self._lines.get(line_id)
 
     def count(self, status: str) -> int:
-        return self._statuses[status]
+        return self._statuses[status] + (self._disk_left if status == "queued" else 0)
 
     def steer(self, sites: Dict[str, float]) -> None:
         """Set the site factors, per registered domain. The heaps are rebuilt for them by the next select() or take()."""
@@ -602,7 +745,7 @@ class Frontier:
         self, url: str, seed_id: str, line_id: str, hops: int, base: float, now: dt.datetime,
         parent: Optional[str] = None, anchor: str = "", crossing: bool = False,
     ) -> bool:
-        if not url or url in self._entries:
+        if not url or self._known(url):
             return False
         host = urlsplit(url).netloc
         if self._queued_per_host.get(host, 0) >= MAX_QUEUED_PER_HOST:
@@ -614,11 +757,13 @@ class Frontier:
             "discovered_at": now, "fetched_at": None,
         })
         self._queued_per_host[host] = self._queued_per_host.get(host, 0) + 1
+        self.queue["entries_appended_cold"] += not self._groups[(line_id, host, seed_id)].hot
         return True
 
     def _insert(self, entry: Dict[str, Any]) -> None:
         entry["seq"] = self._seq
         self._seq += 1
+        self._inserted += 1
         self._entries[entry["url"]] = entry
         self._statuses[entry["status"]] += 1
         if entry.get("crossing"):
@@ -631,10 +776,14 @@ class Frontier:
         entry["status"] = status
 
     def add_seeds(self, seeds: Sequence[Seed], now: dt.datetime) -> int:
+        """Queue the seeds' starting URLs not yet known, and again those whose own fetch served nothing. An active seed's
+        starting group is loaded from disk, so its starting URLs are ranked in this run."""
         added = 0
         for seed in seeds:
             for url in seed.urls:
                 known = self._entries.get(url)
+                if known is None and self._known(url):   # queued on disk, or fetched by another route
+                    continue
                 if known is not None:
                     # A starting URL whose own fetch served nothing (or a thin page) is tried again each run, whatever the rest of
                     # its seed found: the failure may have been temporary, and the run summary then shows the reason.
@@ -650,6 +799,12 @@ class Frontier:
                 if self._add(url, seed.id, seed.id, 0, 1.0, now):
                     self._host_line.setdefault(urlsplit(url).netloc, seed.id)
                     added += 1
+        if self._loc:
+            starting = {(seed.id, urlsplit(url).netloc, seed.id) for seed in seeds if seed.active(now.date()) for url in seed.urls}
+            cold = [self._group(dict(zip(("line_id", "host", "seed_id"), key))) for key in sorted(starting) if self.factor(key[1]) > 0]
+            cold = [group for group in cold if not group.hot]
+            self._heat([(group, HOT_PER_GROUP) for group in cold])
+            self.queue["groups_promoted"] += len(cold)
         return added
 
     def sitemap_sites(self, seeds: Sequence[Seed], today: dt.date, now: dt.datetime) -> Dict[str, str]:
@@ -691,7 +846,7 @@ class Frontier:
         links, unparseable = row["links"]
         for href in unparseable:
             # Kept as written, with the page it came from, so it can be looked at and repaired later.
-            if href not in self._entries:
+            if not self._known(href):
                 self._insert({
                     **entry, "url": href, "host": "", "crossing": False, "parent_fetch_id": row["fetch_id"],
                     "anchor": None, "status": "unparseable", "discovered_at": now, "fetched_at": None,
@@ -703,7 +858,7 @@ class Frontier:
             # A link into another line's site, queued, fetched or new: the host map knows its line either way.
             if covering is not None and covering != own_line:
                 self._note_inbound(covering, own_line)
-            if url in self._entries:
+            if self._known(url):
                 continue
             if covering == own_line:
                 hops, line_id, crossing = entry["hops"] + 1, own_line, False
@@ -792,7 +947,7 @@ class Frontier:
             self._reward(tag, value)
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")
-        if final and final not in self._entries:
+        if final and not self._known(final):
             self._insert({**entry, "url": final, "host": urlsplit(final).netloc, "anchor": None, "status": "alias"})
 
     # ------------------------------------------------------------ when a judgement arrives
@@ -855,10 +1010,17 @@ class Frontier:
             self._groups_by_domain.setdefault(registered_domain(key[1]), []).append(group)
             if not entry.get("crossing"):
                 self._own_by_line.setdefault(key[0], []).append(group)
+            on_disk = self._locate(key)
+            if on_disk is not None:
+                group.hot, group.pending = False, []
+                group.bucket, group.start, group.disk = on_disk
         return group
 
     def _enqueue(self, entry: Dict[str, Any]) -> None:
         group = self._group(entry)
+        if not group.hot:
+            group.pending.append(entry)  # type: ignore[union-attr]
+            return
         members = group.members
         i = bisect.bisect_left(members, group.key(entry), key=group.key)
         members.insert(i, entry)
@@ -875,6 +1037,9 @@ class Frontier:
 
     def _dequeue(self, entry: Dict[str, Any]) -> None:
         group = self._groups[(entry["line_id"], entry["host"], entry["seed_id"])]
+        if not group.hot:
+            group.pending.remove(entry)  # type: ignore[union-attr]
+            return
         i = bisect.bisect_left(group.members, group.key(entry), key=group.key)
         assert group.members[i] is entry
         del group.members[i]
@@ -883,6 +1048,173 @@ class Frontier:
             if last is not group:
                 self._filled[group.slot], last.slot = last, group.slot
             group.slot = -1
+        if group.disk:
+            self._top_up(group)
+
+    # ------------------------------------------------------------ the queue on disk
+
+    def _top_up(self, group: _Group) -> None:
+        """Load a hot group's next rows while its best entry in memory is below the best left on disk (or it has none)."""
+        while group.disk and (not group.members or _static(group.members[0], 1.0) < group.floor):
+            rows = self._files.read(group.bucket, [(group.start + group.taken, min(HOT_PER_GROUP, group.disk))])[0]
+            self._take_rows(group, rows)
+
+    def _take_rows(self, group: _Group, rows: List[Dict[str, Any]]) -> None:
+        group.taken += len(rows)
+        group.disk -= len(rows)
+        self._disk_left -= len(rows)
+        if rows:
+            group.floor = _static(rows[-1], 1.0)
+        for row in sorted(rows, key=lambda row: row["url"]):   # numbered in url order, as entries read from one file were
+            self._disk_by_seed[row["seed_id"]] -= 1
+            if row["url"] in self._entries:   # never twice
+                continue
+            for name in ("host", "line_id", "seed_id"):   # shared by a group's rows
+                row[name] = sys.intern(row[name])
+            row["seq"] = self._seq
+            self._seq += 1
+            line = self._lines.get(self._host_line.get(row["host"], ""))
+            if row.get("crossing") and line and line.get("parent_line") and line["created_at"] >= (row["discovered_at"] or line["created_at"]):
+                row.update(line_id=line["line_id"], crossing=False, hops=1)   # its site became a line since: moved as _spawn moves
+            self._entries[row["url"]] = row
+            self._statuses["queued"] += 1
+            if row.get("crossing"):
+                self._crossing.setdefault(row["host"], []).append(row)
+            self._enqueue(row)
+
+    def _heat(self, wanted: Sequence[Tuple[_Group, int]]) -> None:
+        """Load cold groups: the best n rows of each, one read per bucket, with what was queued for it while cold."""
+        reads: Dict[int, List[Tuple[_Group, int]]] = {}
+        for group, n in wanted:
+            if group.hot:
+                continue
+            group.hot, pending, group.pending = True, group.pending, None
+            self._cold_groups -= 1
+            for entry in pending:  # type: ignore[union-attr]
+                self._enqueue(entry)
+            reads.setdefault(group.bucket, []).append((group, min(n, group.disk)))
+        for bucket, groups in reads.items():
+            for (group, _), rows in zip(groups, self._files.read(bucket, [(g.start + g.taken, n) for g, n in groups])):
+                self._take_rows(group, rows)
+        for group, _ in wanted:   # rows moved to their site's line can leave a group with none
+            self._top_up(group)
+
+    def _cold(self, item: tuple) -> _Group:
+        (line, host, seed), crossing = item[:2]
+        return self._group({"line_id": line, "host": host, "seed_id": seed, "crossing": crossing})
+
+    def _sample_arm(self, line: str, best: Dict[str, Any], host: str) -> float:
+        """One Thompson draw from a group's arm, as _draw makes, from the hot set's own generator."""
+        mean, n = self._arm(line, best, host)
+        if self._temperature <= 0:
+            return mean
+        x = self._hot_rng.betavariate(max(mean * n, 1e-3), max((1.0 - mean) * n, 1e-3))
+        return mean + self._temperature * (x - mean)
+
+    def _select(self, weights: Dict[str, float], today: dt.date, again: bool = False) -> int:
+        """Score every group on disk by its best entry and load the hot set and the uniform sample (see the module
+        docstring); keep the next best as the reserve, and choose the groups MAX_QUEUED cuts at save. Returns the groups
+        loaded. again: a later pass, for the groups still on disk, whose hot set counts as promoted."""
+        if not self._disk_left:
+            return 0
+        began = time.monotonic()
+        self._today = today
+        rules = {"fixed": ("fixed",), "bandit": ("draw",), "shadow": ("fixed", "draw")}[self._mode]
+        heaps: Dict[str, list] = {rule: [] for rule in rules}
+        totals = dict.fromkeys(rules, 0)
+        beyond = -math.inf   # the best score of a group neither loaded nor kept in reserve
+        order = itertools.count()
+        excess = sum(self._files.rows) - MAX_QUEUED
+        cuts: list = []
+        cut_rows, eligible = 0, 0
+        sample: List[tuple] = []
+        self._cold_top, self._cold_held = {}, 0
+        for bucket, rows in enumerate(self._files.rows):
+            if not rows:
+                continue
+            first, _, counts = self._files.runs(bucket, ("line_id", "host", "seed_id", "base", "hops", "crossing", "url"))
+            for i, count in enumerate(counts):
+                line, host, seed = key = (first["line_id"][i], first["host"][i], first["seed_id"][i])
+                group = self._groups.get(key)
+                if (group is not None and group.hot) or line not in self._lines:
+                    continue
+                best = {"line_id": line, "host": host, "base": first["base"][i], "hops": first["hops"][i], "crossing": first["crossing"][i]}
+                factor = self.factor(host)
+                weight = weights.get(seed, 0.0) * factor
+                self._cold_held += count if factor == 0 else 0
+                if seed in weights:
+                    self._cold_top[seed] = max(self._cold_top.get(seed, 0.0), round(self.priority(best, weight), 4))
+                if excess > 0:   # keep the lowest-ranked groups that hold the excess, a held site or seed ranked as if not held
+                    heapq.heappush(cuts, (-self.priority(best, (weights.get(seed) or 1.0) * (factor or 1.0)), next(order), key, count))
+                    cut_rows += count
+                    while cut_rows - cuts[0][3] >= excess:
+                        cut_rows -= heapq.heappop(cuts)[3]
+                if weight <= 0 or host in self.cooled:
+                    continue
+                item = (key, bool(best["crossing"]), count, first["url"][i])
+                for rule in rules:   # the best groups holding the hot set and a reserve as large
+                    score = self.priority(best, weight) if rule == "fixed" else weight * self._sample_arm(line, best, host)
+                    heapq.heappush(heaps[rule], (score, _UrlDown(item[3]), item))
+                    totals[rule] += min(count, HOT_PER_GROUP)
+                    while totals[rule] - min(heaps[rule][0][2][2], HOT_PER_GROUP) >= 2 * HOT_ENTRIES:
+                        dropped = heapq.heappop(heaps[rule])
+                        totals[rule] -= min(dropped[2][2], HOT_PER_GROUP)
+                        beyond = max(beyond, dropped[0]) if rule == rules[0] else beyond
+                eligible += 1
+                if len(sample) < COLD_SAMPLE:   # reservoir sampling
+                    sample.append(item)
+                elif (j := self._hot_rng.randrange(eligible)) < COLD_SAMPLE:
+                    sample[j] = item
+        hot: Dict[Tuple[str, str, str], tuple] = {}
+        self._reserve = []
+        for rule in rules:
+            loaded = 0
+            for score, _, item in sorted(heaps[rule], key=lambda t: (-t[0], t[2][3])):   # best first, ties by url as take() breaks them
+                if loaded < HOT_ENTRIES:
+                    hot[item[0]] = item
+                    loaded += min(item[2], HOT_PER_GROUP)
+                elif rule == rules[0]:
+                    self._reserve.append((score, item))
+        self._reserve.reverse()
+        self._beyond = beyond
+        self._heat([(self._cold(item), HOT_PER_GROUP) for item in hot.values()])
+        self._sample = [self._cold(item) for item in sample if item[0] not in hot]
+        self._heat([(group, 1) for group in self._sample])
+        self._cut = {key: count for _, _, key, count in cuts}
+        self.queue["groups_promoted"] += len(self._sample) + (len(hot) if again else 0)
+        self.queue["scans"] += 1
+        self.queue["select_seconds"] += time.monotonic() - began
+        self.queue["peak_rss_mb_after_select"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)   # Linux: KB
+        return len(hot) + len(self._sample)
+
+    def _refill(self) -> None:
+        """Load the next groups left out of the hot set while it has run dry: no group left to take from, or (fixed, shadow)
+        its best at or below the best group left out. With the reserve used up, the groups still on disk are scored again."""
+        while self._disk_left:
+            if self._mode == "bandit":
+                heap = self._arm_heap or []
+                while heap and (heap[0][1] != heap[0][2].drawn or not self._eligible(heap[0][2])):
+                    heapq.heappop(heap)
+                if heap:
+                    return
+            else:
+                top = self._top(self._heap)
+                if top is not None and -top[0] > (self._reserve[-1][0] if self._reserve else self._beyond):
+                    return
+            if not self._reserve:
+                if self._spent or not self._select(self._weights or {}, self._today or dt.date.today(), again=True):
+                    self._spent = True   # none left on disk that may be taken: not scored again in this run
+                    return
+                continue
+            batch: List[Tuple[_Group, int]] = []
+            loaded = 0
+            while self._reserve and (not batch or loaded < HOT_ENTRIES // 10):
+                group = self._cold(self._reserve.pop()[1])
+                if not group.hot and group.host not in self.cooled:
+                    batch.append((group, HOT_PER_GROUP))
+                    loaded += min(group.disk, HOT_PER_GROUP)
+            self._heat(batch)
+            self.queue["groups_promoted"] += len(batch)
 
     def _eligible(self, group: _Group) -> bool:
         return (bool(group.members) and group.seed in (self._weights or {}) and group.line in self._lines
@@ -944,6 +1276,7 @@ class Frontier:
         if weights != self._weights or len(self._heap) > 2 * len(self._groups) + 1000:
             if weights != self._weights:
                 self._arm_heap = None
+                self._select(weights, today)
             self._weights = weights
             self._heap, self._new_heap = [], []
             for group in self._groups.values():
@@ -1028,7 +1361,7 @@ class Frontier:
 
         takes = int(self.shadow["takes"])
         return {
-            "mode": self._mode, "temperature": self._temperature, "arms": len(self._filled), "arms_tried": len(self.tried),
+            "mode": self._mode, "temperature": self._temperature, "arms": len(self._filled) + self._cold_groups, "arms_tried": len(self.tried),
             "greedy_takes": self.takes_by_kind["greedy"], "exploration_takes": self.takes_by_kind["explore"],
             "mean_reward_greedy": mean("greedy"), "mean_reward_exploration": mean("explore"),
             "shadow_takes": takes, "shadow_agreed": int(self.shadow["agreed"]),
@@ -1187,6 +1520,7 @@ class Frontier:
         entry = self.take_retry(seeds, today, MAX_RETRY_IN_FLIGHT)
         if entry is not None:
             return entry
+        self._refill()
         if self._mode == "bandit":
             entry = self._take_bandit()
         else:
@@ -1213,7 +1547,10 @@ class Frontier:
         self._takes += 1
         if self._takes % round(1 / RETEST_SHARE) == 0:
             for _ in range(RETEST_DRAWS if self._filled else 0):
-                group = self._rng.choice(self._filled)
+                pool = self._filled   # the sample stands for the groups left on disk, in proportion to them
+                if self._sample and self._rng.random() * (self._cold_groups + len(self._filled)) < self._cold_groups:
+                    pool = self._sample
+                group = self._rng.choice(pool)
                 if self._eligible(group) and self._flight_host.get(group.host, 0) < MAX_IN_FLIGHT_PER_HOST:
                     entry = self._best(group, *self._extras(group))[1]  # type: ignore[index]
                     self.retests.add(entry["url"])
@@ -1289,6 +1626,10 @@ class Frontier:
             queued[seed] += 1
             if entry["host"] not in self.cooled:
                 top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed] * self.factor(entry["host"])), 4))
+        for seed in weights:   # rows on disk, at their best's priority when the hot set was chosen
+            queued[seed] += self._disk_by_seed.get(seed, 0)
+            if seed in self._cold_top:
+                top[seed] = max(top.get(seed, 0.0), self._cold_top[seed])
         return queued, top
 
     def expire_retries(self, now: dt.datetime) -> int:
@@ -1631,7 +1972,10 @@ async def crawl(
             # Site factors: sites with one other than 1, fetches from sites below and above 1, entries held by a factor of 0.
             "sites_steered": sum(f != 1 for f in frontier._steer.values()),
             "fetches_steered_down": counts["steered_down"], "fetches_steered_up": counts["steered_up"],
-            "queued_held_by_steer": sum(len(g.members) for g in frontier._groups.values() if frontier.factor(g.host) == 0),
+            "queued_held_by_steer": frontier._cold_held + sum(len(g.members) + len(g.pending or ()) for g in frontier._groups.values() if frontier.factor(g.host) == 0),
+            # The queue on disk: groups and entries in memory (hot) or not, what was loaded beyond the hot set, appended
+            # unloaded, cut by the caps, URLs known, seconds and bytes for its state, and the peak memory once loaded.
+            "queue": frontier.queue_record(),
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "ranking": frontier.ranking_record(),
             "seed_url_problems": seed_url_problems, "seed_url_redirects": seed_url_redirects,

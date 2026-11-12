@@ -46,7 +46,9 @@ Parquet shards in the store, in folders by the UTC day the fetching run started 
 | `ocr_text` | scanned PDF read with Tesseract |
 | `judgement_calls`, `judgements` | Jev call about a document, and each answer in it |
 
-Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served, when each watched page was last read, the set of stored body hashes and Jev spend.
+Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served (`url_hashes.parquet`: 64-bit keys), when each watched page was last read, the set of stored body hashes and Jev spend.
+
+The queue (`state/queue/`) is kept on disk so a run's memory does not grow with it: queued entries in bucket files sorted by group (a line, a host and a seed), every other URL it has known as a 64-bit key in `seen.parquet`, the few entries kept whole (retries, unparseable links, fetched starting URLs) in `kept.parquet`, and `manifest.json`, written last. A run loads only the best-ranked groups and a random sample of the rest, more as it needs them; a link into a group left on disk is appended to it unread. A group keeps at most 1,000 entries and the queue 5 million; what is cut is counted in the run record and can be recovered from the `links` table. A store with only the older `frontier.parquet` and `url_state.parquet` is read from those once; they are left in place.
 
 ## Logs
 
@@ -56,6 +58,7 @@ A run prints counts only. What it fetched, and anything that went wrong, is writ
 - `seed_url_redirects`: starting URLs that were sent to another site, with the site they ended on.
 - `sitemap_sites_read`, `sitemaps_read`, `sitemap_failures`, `sitemap_urls_queued`: a seed's starting sites, and sites on a domain steered above 1, have their `robots.txt` and the sitemaps it names (else `/sitemap.xml`) read at most once a week; up to 500 new URLs a site, newest first, join the queue as ordinary links. This only finds pages: `robots.txt` rules are not applied.
 - `ranking`: `mode`, `temperature`, `arms` (groups with queued URLs), `arms_tried` (taken from in this run); in `bandit` mode `greedy_takes` and `exploration_takes` (picks that were not the best estimate) with `mean_reward_greedy` and `mean_reward_exploration`; in `shadow` mode `shadow_takes`, `shadow_agreed` (takes where `bandit` would have taken the same URL), `shadow_mean_reward_agreed` and `shadow_mean_reward_differed` (what `fixed`'s picks were worth, split by that), and `shadow_mean_estimate_fixed` and `shadow_mean_estimate_bandit` (the bandit's estimate of each rule's picks). `ranking_file_ignored` counts a malformed `ranking.json`.
+- `queue`: `groups_hot` and `groups_cold`, `entries_hot` and `entries_cold` (in memory, or left on disk), `groups_promoted` (loaded beyond the first ranked choice), `entries_appended_cold`, `cut_group_cap` and `cut_total_cap`, `seen` (URLs known), `scans` (passes over the queue on disk), `load_seconds`, `select_seconds`, `save_seconds`, `bytes_in` and `bytes_out` for the queue's state, `peak_rss_mb_after_select`, and `migrated` for the run that read the older file. `peak_rss_mb` is the whole run's.
 - `watch_entries`, `watch_due`, `watch_fetched`, `watch_changed`, `watch_unchanged`, `watch_failed`, `watch_links_queued`, `watch_file_ignored`, `watch_entries_ignored`: the watched pages of `config/watch.json`. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
 
 ## Tests

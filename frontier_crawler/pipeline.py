@@ -257,7 +257,11 @@ class Engine:
             await self._cut(force=True)
         state_files = [self._state.save(self._workdir), save_spend(self._spend, self._workdir),
                        *self._hashes.save(self._workdir, self._unsent_bodies)]
-        self.stats["state_bytes"] = {Path(remote).stem: _size(local) for local, remote in state_files + list(extra)}
+        # By file, or by folder for the queue's files (state/queue/...): state/hosts.parquet -> hosts.
+        self.stats["state_bytes"] = {}
+        for local, remote in state_files + list(extra):
+            name = remote.split("/")[1].split(".")[0]
+            self.stats["state_bytes"][name] = self.stats["state_bytes"].get(name, 0) + _size(local)
         await self.flush(force=True, extra=state_files + list(extra))
         self._measure()
         logger.info("engine %s", {key: value for key, value in self.stats.items() if key != "shards"})
@@ -388,14 +392,14 @@ class Engine:
         key = row["url_final"]
         if scraped.http_status != 200 and scraped.word_count < _ERROR_PAGE_MAX_WORDS:
             outcome = "error_page"
-        elif self._state.last_hash(key) == digest:
+        elif self._state.same(key, digest):
             outcome = "unchanged"
         elif digest in self._seen and self._seen[digest] != key:
             outcome = "duplicate"
         else:
             outcome = "stored"
         self._seen.setdefault(digest, key)
-        self._state.record(key, digest, when, scraped.http_status)
+        self._state.record(key, digest)
         row.update(
             {
                 "outcome": outcome,
