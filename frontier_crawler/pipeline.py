@@ -392,7 +392,7 @@ class Engine:
         key = row["url_final"]
         if scraped.http_status != 200 and scraped.word_count < _ERROR_PAGE_MAX_WORDS:
             outcome = "error_page"
-        elif self._state.same(key, digest):
+        elif not target.fresh and self._state.same(key, digest):
             outcome = "unchanged"
         elif digest in self._seen and self._seen[digest] != key:
             outcome = "duplicate"

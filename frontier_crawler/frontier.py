@@ -3,7 +3,9 @@
 Seeds (config/seeds.jsonl in the store) are starting points, not permanent tracks. The crawl is
 organised into lines. A line is one direction of research: it starts at a seed, or at a
 site that another line reached and found content on. Lines multiply as the crawl finds
-new sites, each with its own counters, and each one ends when it stops paying.
+new sites, each with its own counters, and each one ends when it stops paying. A seed's starting
+URL is fetched as its start even if another line queued or fetched it before: once, read as new
+(not unchanged) so its links start the seed's line; then as any starting URL (seed_urls_reread).
 
 Branching. A link to a site that no line covers (a crossing) is queued under the line that found
 it. If fetching it yields content, that site becomes a new line and the parent line carries on.
@@ -150,7 +152,7 @@ from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import newest_first, normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
-from frontier_crawler.storage.queue import QueueFiles, group_key, kept as kept_whole
+from frontier_crawler.storage.queue import QueueFiles, group_key, kept as kept_whole, starting as is_start
 from frontier_crawler.storage.state import load_watch_times, save_watch_times, url_key
 from frontier_crawler.storage.store import Store
 
@@ -459,6 +461,7 @@ class Frontier:
         self.skipped = {"unparseable_link": 0, "hop_limit": 0, "host_queue_full": 0}
         self.spawned = 0
         self.seed_urls_requeued = 0
+        self.seed_urls_reread = 0   # starting URLs known from another line, taken over as their seed's start
         self.lifts = 0
         self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
         self.lines_lifted: set = set()
@@ -776,15 +779,28 @@ class Frontier:
         entry["status"] = status
 
     def add_seeds(self, seeds: Sequence[Seed], now: dt.datetime) -> int:
-        """Queue the seeds' starting URLs not yet known, and again those whose own fetch served nothing. An active seed's
-        starting group is loaded from disk, so its starting URLs are ranked in this run."""
+        """Queue the seeds' starting URLs not yet fetched as theirs, and again those whose own fetch served nothing. One the
+        queue knows from another line (queued there, or fetched however long ago) becomes the seed's start all the same and
+        is fetched once for it, read as new (Target.fresh) so its links start the seed's line. An active seed's starting
+        group is loaded from disk first, so its starting URLs are ranked in this run and found there."""
+        heated: set = set()
+        if self._loc:
+            starts = {(seed.id, urlsplit(url).netloc, seed.id) for seed in seeds if seed.active(now.date()) for url in seed.urls}
+            heated = {key for key in starts if self.factor(key[1]) > 0}
+            cold = [self._group(dict(zip(("line_id", "host", "seed_id"), key))) for key in sorted(heated)]
+            cold = [group for group in cold if not group.hot]
+            self._heat([(group, HOT_PER_GROUP) for group in cold])
+            self.queue["groups_promoted"] += len(cold)
+        owners: Dict[str, set] = {}
+        for seed in seeds:
+            for url in seed.urls:
+                owners.setdefault(url, set()).add(seed.id)
         added = 0
         for seed in seeds:
             for url in seed.urls:
                 known = self._entries.get(url)
-                if known is None and self._known(url):   # queued on disk, or fetched by another route
-                    continue
-                if known is not None:
+                # A seed's own start, or one of another seed that still lists the URL (so two seeds never take it in turns).
+                if known is not None and is_start(known) and known["seed_id"] in owners[url]:
                     # A starting URL whose own fetch served nothing (or a thin page) is tried again each run, whatever the rest of
                     # its seed found: the failure may have been temporary, and the run summary then shows the reason.
                     # One fetched before the record existed (null) is tried once more, to find out.
@@ -796,15 +812,32 @@ class Frontier:
                     continue
                 if seed.id not in self._lines:
                     self._new_line(seed.id, seed.id, None, url, now)
-                if self._add(url, seed.id, seed.id, 0, 1.0, now):
-                    self._host_line.setdefault(urlsplit(url).netloc, seed.id)
-                    added += 1
-        if self._loc:
-            starting = {(seed.id, urlsplit(url).netloc, seed.id) for seed in seeds if seed.active(now.date()) for url in seed.urls}
-            cold = [self._group(dict(zip(("line_id", "host", "seed_id"), key))) for key in sorted(starting) if self.factor(key[1]) > 0]
-            cold = [group for group in cold if not group.hot]
-            self._heat([(group, HOT_PER_GROUP) for group in cold])
-            self.queue["groups_promoted"] += len(cold)
+                host = urlsplit(url).netloc
+                if known is None and not self._known(url):
+                    if self._add(url, seed.id, seed.id, 0, 1.0, now):
+                        self._host_line.setdefault(host, seed.id)
+                        added += 1
+                    continue
+                # Known from another line, or only as a key in the seen set. An inactive or held seed's group is not loaded,
+                # so its own start may be on disk: left until the group is. shortcut: a seed with more than HOT_PER_GROUP
+                # starting URLs on one host may have the rest re-read once, as a second row of its own group.
+                if (known is None and (seed.id, host, seed.id) not in heated) or (known is not None and known["status"] == "retry"):
+                    continue   # a retry is due anyway; if it stays another line's, it is taken over at the next run
+                if known is not None:   # retired: its row on disk, if any, is skipped when loaded (never twice)
+                    if known["status"] == "queued":
+                        self._dequeue(known)
+                        self._queued_per_host[host] -= 1
+                        if known.get("crossing"):
+                            self._crossing[host] = [other for other in self._crossing.get(host, ()) if other is not known]
+                    self._statuses[known["status"]] -= 1
+                self._insert({
+                    "url": url, "host": host, "seed_id": seed.id, "line_id": seed.id, "crossing": False, "hops": 0,
+                    "parent_fetch_id": None, "anchor": None, "base": 1.0, "status": "queued", "discovered_at": now, "fetched_at": None,
+                })
+                self._inserted -= 1   # known already
+                self._queued_per_host[host] = self._queued_per_host.get(host, 0) + 1
+                self._host_line.setdefault(host, seed.id)
+                self.seed_urls_reread += 1
         return added
 
     def sitemap_sites(self, seeds: Sequence[Seed], today: dt.date, now: dt.datetime) -> Dict[str, str]:
@@ -1797,7 +1830,8 @@ async def crawl(
         retry = entry["status"] == "retry"
         fetch_id = None
         try:
-            target = Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"])
+            target = Target(entry["url"], by_id[entry["seed_id"]].entity, entry["seed_id"], entry["line_id"], entry["hops"], entry["parent_fetch_id"],
+                            is_start(entry) and entry["fetched_at"] is None)
             limits = {"timeout": RETRY_TIMEOUT_SECONDS, "connect": RETRY_CONNECT_SECONDS} if retry else {}
             row = await engine.fetch(target, **limits)
             if engine.sampled(row):
@@ -1960,7 +1994,7 @@ async def crawl(
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
             "fetches_by_host_page": by_host_page, "fetches_new_domain_share": frontier.new_domain_takes,
-            "seed_urls_requeued": frontier.seed_urls_requeued, **read,
+            "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread, **read,
             "watch_entries": len(watch), "watch_due": len(due), **watched,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},

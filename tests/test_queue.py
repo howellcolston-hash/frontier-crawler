@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from frontier_crawler import frontier as frontier_module
-from frontier_crawler.frontier import MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, crawl
+from frontier_crawler.frontier import MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage import queue as queue_module
 from frontier_crawler.storage.state import UrlState
@@ -369,3 +369,48 @@ def test_the_url_state_is_read_once_from_the_older_file_and_kept_as_keys(tmp_pat
     store.put_many([state.save(tmp_path / "w1")], "state")
     again = UrlState.load(store, tmp_path / "w2")
     assert again.same("https://a.test/", digest) and (tmp_path / "store" / "state" / "url_state.parquet").exists()
+
+
+@pytest.mark.parametrize("older_file", [False, True])
+def test_a_starting_url_known_from_another_line_is_fetched_once_as_its_seeds(tmp_path: Path, older_file: bool) -> None:
+    a = _seed("a", "https://a.test/")
+    frontier = Frontier()
+    frontier.add_seeds([a], NOW)
+    root = frontier.entry("https://a.test/")
+    row = _page_row("https://a.test/", '<a href="/old">o</a> <a href="/q">q</a> <a href="/x">x</a> <a href="https://b.test/">b</a>')
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    for url in ("https://a.test/old", "https://a.test/x"):   # fetched under a's line, storing nothing (thin)
+        frontier.mark(frontier.entry(url), {**_content(url), "word_count": 3}, None, NOW)
+    store = LocalStore(tmp_path / "store")
+    out = frontier.save(tmp_path / "w0")
+    if older_file:   # the queue as the older code saved it: every entry, one file
+        store.put_many([f for f in out if f[1] in ("state/hosts.parquet", "state/lines.parquet")], "state")
+        old = tmp_path / "old.parquet"
+        pq.write_table(queue_module._table([frontier._entries[url] for url in sorted(frontier._entries)]), old)
+        store.put_many([(old, "state/frontier.parquet")], "state")
+    else:
+        store.put_many(out, "state")
+    again = Frontier.load(store, tmp_path / "w1")
+    assert again.queue["migrated"] == older_file and again.entry("https://a.test/old") is None
+    # New seeds on a URL fetched under a's line, one queued in a's group, and a crossing queued in a group left on disk.
+    seeds = [a, _seed("n1", "https://a.test/old"), _seed("n2", "https://a.test/q"), _seed("n3", "https://b.test/")]
+    assert again.add_seeds(seeds, NOW) == 0 and again.seed_urls_reread == 3 and again.seed_urls_requeued == 0
+    for url, sid in (("https://a.test/old", "n1"), ("https://a.test/q", "n2"), ("https://b.test/", "n3")):
+        entry = again.entry(url)
+        assert (entry["seed_id"], entry["line_id"], entry["hops"], entry["crossing"], entry["status"]) == (sid, sid, 0, False, "queued")
+    taken = []
+    while (entry := again.take(seeds, NOW.date())) is not None:
+        taken.append((entry["url"], entry["line_id"]))
+        again.mark(entry, _content(entry["url"]), None, NOW)
+    assert len(taken) == len({url for url, _ in taken})   # nothing fetched twice
+    assert {("https://a.test/old", "n1"), ("https://a.test/q", "n2"), ("https://b.test/", "n3")} <= set(taken)
+    assert all(again.line(sid)["fetches"] == 1 for sid in ("n1", "n2", "n3"))
+    # The next run leaves them alone; a seed whose URL is replaced by one fetched under its line before is fetched for it.
+    third = _reload(again, tmp_path, "w2")
+    third.add_seeds(seeds, NOW)
+    assert third.seed_urls_reread == third.seed_urls_requeued == 0 and third.count("queued") == 0
+    replaced = [Seed(id="a", entity="a", urls=("https://a.test/x",))] + seeds[1:]
+    fourth = _reload(third, tmp_path, "w3")
+    fourth.add_seeds(replaced, NOW)
+    assert fourth.seed_urls_reread == 1 and fourth.entry("https://a.test/x")["hops"] == 0 and fourth.entry("https://a.test/x")["status"] == "queued"
