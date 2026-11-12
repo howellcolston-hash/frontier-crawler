@@ -602,6 +602,7 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
     (row,) = _rows(tmp_path / "store", "ocr_text")
     assert read == [b"%PDF scan"] and first["scans_read"] == 1 and first["judged"] == 1    # the PDF that had text is left alone
     assert (row["langs"], row["pages_read"], row["pages_total"], row["text"]) == ("ara+eng", 4, 9, DOC)
+    assert json.loads(row["join_keys"])["names"] == 0 and json.loads(row["join_keys"])["per_100_words"] == 0.0
     assert later("o2", "ocr_days")["scans_read"] == 0                                      # not read twice
     assert later("j1", "judge_days")["judged"] == 1                                        # only the text PDF was still unjudged
     assert later("j2", "judge_days")["judged"] == 0
