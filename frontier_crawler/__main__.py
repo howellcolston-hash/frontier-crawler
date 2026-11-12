@@ -14,8 +14,8 @@ Environment:
     CRAWLER_JEV_MONTHLY_USD      safety ceiling on Jev spend per month in USD (default 10).
     CRAWLER_VERBOSE              set to log fetch failures and other detail. Off by default: see below.
 
-Configuration is read from the store: config/seeds.jsonl, config/questions.json (optional) and
-config/clients/*.json. What a run did is written to the store as runs/<run id>.json. Only counts
+Configuration is read from the store: config/seeds.jsonl, config/questions.json (optional),
+config/steer.json (optional) and config/clients/*.json. What a run did is written to the store as runs/<run id>.json. Only counts
 are printed, so a run's log says how much was done and not where.
 """
 
@@ -27,12 +27,13 @@ import datetime as dt
 import faulthandler
 import json
 import logging
+import math
 import os
 import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -78,6 +79,24 @@ def _configure_questions(store: Store, workdir: Path) -> None:
         judging.configure(json.loads(path.read_text(encoding="utf-8")))
 
 
+def _steer(store: Store, workdir: Path) -> Tuple[Dict[str, float], int]:
+    """config/steer.json: {"version": 1, "sites": {registered domain: factor >= 0}}. (factors, 1) for a file that is
+    not that, which is ignored: a broken steering file must not stop a crawl."""
+    path = _config(store, workdir, "config/steer.json")
+    if path is None:
+        return {}, 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data["version"] != 1:
+            raise ValueError("unknown version")
+        sites = {str(site): float(factor) for site, factor in data["sites"].items()}
+        if not all(math.isfinite(factor) and factor >= 0 for factor in sites.values()):
+            raise ValueError("a factor is not a number >= 0")
+        return sites, 0
+    except Exception:
+        return {}, 1
+
+
 def _specs(store: Store, workdir: Path) -> List[derived_module.Spec]:
     for remote in store.list("config/clients"):
         if remote.endswith(".json"):
@@ -98,9 +117,11 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             raise SystemExit("no config/seeds.jsonl in the store")
         seeds = load_seeds(seeds_path)
         _configure_questions(store, Path(workdir))
+        steer, steer_ignored = _steer(store, Path(workdir))
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=HostThrottle(args.min_interval)) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
-            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes)
+            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer)
+    stats["steer_file_ignored"] = steer_ignored
     _report(ctx, stats)
     if stats["errors"] or stats["seeds_with_nothing"]:
         ctx["status"] = "partial"
