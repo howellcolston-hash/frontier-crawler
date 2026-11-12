@@ -134,7 +134,8 @@ def test_the_deadline_stops_new_takes_and_pages_in_flight_finish(tmp_path: Path)
     stats = _crawl(tmp_path, site, concurrency=3, max_minutes=1, clock=lambda: clock[0])
     assert stats["stopped_by"] == "max_minutes" and stats["total"] == len(site.started) == len(site.finished) <= 4
     frontier = _frontier(tmp_path)
-    assert all(frontier.entry(url)["status"] == "fetched" for url in site.started)   # recorded, not lost
+    # Recorded, not lost. A fetched URL is kept as its key in the seen set, a starting URL whole.
+    assert frontier.count("fetched") == len(site.started) and all(frontier._known(url) for url in site.started)
     assert frontier.count("queued") == 11 - len(site.started)
 
 
@@ -168,8 +169,8 @@ def test_a_worker_survives_a_fault_in_fetching_in_recording_and_in_judging(tmp_p
     stats = asyncio.run(crawl(store, engine, SEEDS, workdir=tmp_path / "r1", max_fetches=100, now=lambda: NOW))
     assert stats["total"] == 6 and stats["judged"] == 4 and stats["queued"] == 0   # every page but the broken fetch, once
     frontier = _frontier(tmp_path)
-    assert frontier.entry(broken_fetch)["status"] == "failed"
-    assert frontier.entry(broken_links)["status"] == "fetched" and frontier.entry(broken_judge)["status"] == "fetched"
+    # The broken fetch failed; the root and the other five, their bookkeeping or judging broken or not, were fetched.
+    assert (frontier.count("failed"), frontier.count("fetched")) == (1, 6) and frontier._known(broken_fetch)
     judged = {call["fetch_id"] for call in _rows(tmp_path, "judgement_calls")}
     # Stored, and left for the backlog: the page Jev failed on, and the one whose bookkeeping failed before it was handed on.
     assert {row["url_requested"] for row in _rows(tmp_path, "fetches") if row["fetch_id"] not in judged} == {broken_judge, broken_links}
@@ -204,7 +205,9 @@ def test_judging_does_not_hold_a_fetch_slot(tmp_path: Path) -> None:
 
 def test_links_are_queued_at_once_and_re_scored_when_the_judgement_arrives(tmp_path: Path) -> None:
     stats = _crawl(tmp_path, Site(3), jev=_jev(lambda request: httpx.Response(200, json=_jev_body())), monthly_usd=8, max_fetches=1)
-    bases = {e["base"] for e in _frontier(tmp_path)._entries.values() if e["parent_fetch_id"]}
+    frontier = _frontier(tmp_path)
+    frontier._ready(SEEDS, NOW.date())   # queued entries stay on disk until the first take loads them
+    bases = {e["base"] for e in frontier._entries.values() if e["parent_fetch_id"]}
     assert stats["judged"] == 1 and stats["links_added"] == 3 and bases == {frontier_module.link_base(_answers())}
 
 
@@ -253,7 +256,7 @@ def test_a_timed_out_page_is_retried_once_with_the_long_limit(tmp_path: Path) ->
     assert [limit for url, limit in site.limits if url == recovers] == [None, frontier_module.RETRY_TIMEOUT_SECONDS]
     assert sorted(c for c in site.connects if c) == [frontier_module.RETRY_CONNECT_SECONDS] * 2
     frontier = _frontier(tmp_path)
-    assert frontier.entry(recovers)["status"] == "fetched" and frontier.entry(fails)["status"] == "failed"
+    assert (frontier.count("fetched"), frontier.count("failed")) == (3, 1)   # the root, the recovered page and h2; the one that failed twice
 
 
 def test_a_retry_left_at_the_end_of_a_run_is_taken_by_the_next(tmp_path: Path) -> None:
@@ -300,7 +303,7 @@ def test_a_crawl_fails_retries_that_waited_too_long(tmp_path: Path) -> None:
     frontier.mark(frontier.entry("https://h0.test/"), {"outcome": "error", "timed_out": True}, None, NOW - dt.timedelta(days=3))
     store.put_many(frontier.save(tmp_path / "w0"), "state")
     stats = _crawl(tmp_path, Site(0), store=store)
-    assert stats["retries_expired"] == 1 and stats["retries"] == 0 and _frontier(tmp_path).entry("https://h0.test/")["status"] == "failed"
+    assert stats["retries_expired"] == 1 and stats["retries"] == 0 and _frontier(tmp_path).count("failed") == 1
 
 
 def test_with_no_jev_good_pages_keep_their_lines_high_and_dead_crossings_count_toward_none(tmp_path: Path) -> None:

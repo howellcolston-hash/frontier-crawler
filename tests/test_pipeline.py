@@ -644,7 +644,7 @@ def test_a_run_records_where_its_time_and_bytes_went(tmp_path: Path) -> None:
     assert set(tiers) == {"DOM_TRAFILATURA", "API", "error"} and tiers["error"]["n"] == 1
     assert stats["bytes_by_tier"]["DOM_TRAFILATURA"] == {"body": len(f"<html>{DOC}</html>"), "text": len(DOC.encode())}
     assert stats["shard_bytes"]["fetches"] > 0 and stats["shard_bytes"]["judgements"] > 0
-    assert stats["state_bytes"]["url_state"] > 0 and stats["state_bytes"]["jev_spend"] > 0
+    assert stats["state_bytes"]["url_hashes"] > 0 and stats["state_bytes"]["jev_spend"] > 0
     assert stats["jev"]["calls"] == 1 and stats["jev"]["ceiling_usd_today"] > 0 and stats["jev"]["seconds_mean"] >= 0
     assert stats["timeouts"] == {"connect": 0, "read": 0, "browser": 0} and stats["browser_launches"] == 0
     assert stats["peak_rss_mb"] > 0
