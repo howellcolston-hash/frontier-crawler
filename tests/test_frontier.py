@@ -248,8 +248,12 @@ def test_lines_saved_frozen_load_active_and_save_without_the_old_columns(tmp_pat
     import pyarrow.parquet as pq
     (local, _), = [f for f in frontier.save(tmp_path) if f[1] == "state/lines.parquet"]
     (row,) = pq.read_table(local).to_pylist()
-    assert set(row) == {"line_id", "seed_id", "parent_line", "root_url", "created_at", "fetches", "content", "yield", "relevance", "inbound", "generation"}
+    assert set(row) == {"line_id", "seed_id", "parent_line", "root_url", "created_at", "fetches", "content", "yield", "relevance", "inbound", "generation",
+                        "arm_alpha", "arm_beta", "arm_at"}
     assert row["inbound"] == 2 and row["generation"] == 0
+    # Saved before arms: its yield as the mean, its 12 fetches (at most ARM_WINDOW) as the evidence, last fetched when it was created.
+    n = min(12.0, frontier_module.ARM_WINDOW)
+    assert abs(row["arm_alpha"] - 0.05 * n) < 1e-12 and abs(row["arm_beta"] - 0.95 * n) < 1e-12 and row["arm_at"] == NOW
 
 
 def _two_lines(yields: Dict[str, float]) -> Frontier:

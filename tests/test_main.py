@@ -21,6 +21,21 @@ def test_a_steering_file_is_optional_and_a_broken_one_is_ignored_and_counted(tmp
         assert cli._steer(store, tmp_path / f"w{n + 1}") == expected, text
 
 
+def test_a_ranking_file_is_optional_and_a_broken_one_runs_the_fixed_rule_and_is_counted(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path / "store")
+    assert cli._ranking(store, tmp_path / "w0") == (("fixed", 1.0), 0)
+    (tmp_path / "store" / "config").mkdir(parents=True)
+    for n, (text, expected) in enumerate([
+        ('{"version": 1, "mode": "bandit", "temperature": 0.5}', (("bandit", 0.5), 0)), ('{"version": 1, "mode": "shadow"}', (("shadow", 1.0), 0)),
+        ('{"version": 1, "mode": "fixed", "temperature": 0}', (("fixed", 0.0), 0)),
+        ('{"version": 1, "mode": "greedy"}', (("fixed", 1.0), 1)), ('{"version": 2, "mode": "bandit"}', (("fixed", 1.0), 1)),
+        ('{"version": 1, "mode": "bandit", "temperature": -1}', (("fixed", 1.0), 1)), ('{"version": 1, "mode": "bandit", "temperature": "NaN"}', (("fixed", 1.0), 1)),
+        ('{"version": 1}', (("fixed", 1.0), 1)), ("[1]", (("fixed", 1.0), 1)), ("not json", (("fixed", 1.0), 1)),
+    ]):
+        (tmp_path / "store" / "config" / "ranking.json").write_text(text)
+        assert cli._ranking(store, tmp_path / f"w{n + 1}") == expected, text
+
+
 def test_a_watch_file_is_optional_and_a_broken_one_or_bad_entries_are_ignored_and_counted(tmp_path: Path) -> None:
     store = LocalStore(tmp_path / "store")
     assert cli._watch(store, tmp_path / "w0") == ([], 0, 0)
