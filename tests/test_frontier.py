@@ -115,6 +115,46 @@ def test_registered_domains_damp_together_and_a_new_subdomain_is_not_new_ground(
     assert frontier.take(seeds, NOW.date()) is expected
 
 
+def test_a_site_factor_sinks_or_lifts_a_registered_domain_and_its_subdomains() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://www.example.com/"), _seed("t", "https://example.org/")]
+    frontier.add_seeds(seeds, NOW)
+    frontier._add("https://docs.example.com/", "s", "s", 0, 1.0, NOW)
+    today = NOW.date()
+    frontier.steer({"example.com": 0.5})
+    assert frontier.by_seed(seeds, today)[1] == {"s": 0.5, "t": 1.0}
+    assert frontier.select(3, seeds, today)[0]["url"] == "https://example.org/"
+    assert frontier.take(seeds, today)["url"] == "https://example.org/"
+    frontier.steer({"example.com": 3.0})
+    assert frontier.by_seed(seeds, today)[1] == {"s": 3.0, "t": 1.0}
+    assert frontier.take(seeds, today)["host"].endswith("example.com")
+
+
+def test_a_site_factor_of_zero_is_never_taken_and_comes_back_when_raised() -> None:
+    frontier = Frontier()
+    seeds = [_seed("s", "https://www.example.com/"), _seed("t", "https://example.org/")]
+    frontier.add_seeds(seeds, NOW)
+    frontier._add("https://docs.example.com/a", "s", "s", 1, 1.0, NOW)
+    frontier._add("https://docs.example.com/b", "s", "s", 1, 1.0, NOW)
+    frontier._add("https://new.example.com/", "t", "t", 1, 1.0, NOW, crossing=True)   # would spawn a line on example.com
+    today = NOW.date()
+    frontier.mark(frontier.entry("https://www.example.com/"), {"outcome": "error", "timed_out": True}, None, NOW)   # waits for its retry
+    assert frontier.count("retry") == 1
+    queued = frontier.count("queued")
+    frontier.steer({"example.com": 0.0})
+    assert [e["url"] for e in frontier.select(10, seeds, today)] == ["https://example.org/"]
+    for turn in (0, round(1 / NEW_DOMAIN_SHARE) - 1, round(1 / RETEST_SHARE) - 1) * 20:   # ranked, new-domain and re-test turns
+        frontier._takes = turn
+        taken = frontier.take(seeds, today)
+        assert taken is not None and taken["url"] == "https://example.org/"
+        frontier.release(taken)
+    assert frontier.take_retry(seeds, today) is None and frontier.spawned == 0
+    assert frontier.count("queued") == queued   # nothing left the queue
+    frontier.steer({"example.com": 2.0})
+    assert {e["host"] for e in frontier.select(10, seeds, today)} >= {"docs.example.com", "new.example.com"}
+    assert frontier.take_retry(seeds, today) is not None
+
+
 def test_expired_or_removed_seeds_are_not_followed() -> None:
     frontier = Frontier()
     old = _seed("old", "https://old.test/", until=dt.date(2026, 11, 1))
@@ -420,6 +460,20 @@ def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path
     assert stats["fetches_by_generation"] == {"0": 1, "1": 2, "2": 1, "3": 0, "4-7": 0, "8+": 0}
     assert stats["fetches_by_host_page"] == {"1": 3, "2-5": 1, "6-20": 0, "21+": 0}   # b.test/x is its host's second page
     assert stats["fetches_new_domain_share"] == 0                                      # four takes: no new-domain turn yet
+    assert (stats["sites_steered"], stats["fetches_steered_down"], stats["fetches_steered_up"], stats["queued_held_by_steer"]) == (0, 0, 0, 0)
+
+
+def test_a_crawl_honours_site_factors_and_counts_them(tmp_path: Path) -> None:
+    site = FakeSite({
+        "https://a.test/": '<a href="https://b.test/">b</a> <a href="https://c.test/">c</a> <a href="/x">x</a>',
+        "https://a.test/x": "", "https://b.test/": "", "https://c.test/": "",
+    })
+    store = LocalStore(tmp_path / "store")
+    engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW,
+                              steer={"a.test": 0.5, "b.test": 2.0, "c.test": 0.0, "d.test": 1.0}))
+    assert "https://c.test/" not in site.fetched and stats["lines_spawned"] == 1   # b.test only
+    assert (stats["sites_steered"], stats["fetches_steered_down"], stats["fetches_steered_up"], stats["queued_held_by_steer"]) == (3, 2, 1, 1)
 
 
 def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
@@ -667,7 +721,9 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
         entry for entry in self._entries.values()
         if entry["status"] == "queued" and entry["seed_id"] in weights
         and entry["host"] not in self.cooled   # hosts that served nothing COOL_AFTER times in a row in this run
+        and self.factor(entry["host"]) > 0
     ]
+    weight = lambda e: weights[e["seed_id"]] * self.factor(e["host"])   # the seed weight x the site factor
     if n <= 0 or not queued:
         return []
     host_cap = max(2, math.ceil(n * HOST_ROUND_SHARE))
@@ -688,17 +744,17 @@ def reference_select(self, n: int, seeds: Sequence[Seed], today: dt.date) -> Lis
     for entry in queued:
         if _domain_fetches(self, entry["host"]) == 0:
             current = best_new.get(registered_domain(entry["host"]))
-            if current is None or self.priority(entry, weights[entry["seed_id"]]) > self.priority(current, weights[current["seed_id"]]):
+            if current is None or self.priority(entry, weight(entry)) > self.priority(current, weight(current)):
                 best_new[registered_domain(entry["host"])] = entry
     reserve = math.ceil(n * NEW_DOMAIN_SHARE)
-    ranked = sorted(best_new.values(), key=lambda e: (-self.priority(e, weights[e["seed_id"]]), e["url"]))
+    ranked = sorted(best_new.values(), key=lambda e: (-self.priority(e, weight(e)), e["url"]))
     for entry in ranked[:reserve]:
         take(entry)
 
     # Then the rest by priority. Each pick lowers the priority of what shares its host or line,
     # so the heap is re-scored lazily: an entry is taken only if its fresh score still leads.
     def score(entry: Dict[str, Any]) -> float:
-        return self.priority(entry, weights[entry["seed_id"]], in_host.get(entry["host"], 0), in_line.get(entry["line_id"], 0))
+        return self.priority(entry, weight(entry), in_host.get(entry["host"], 0), in_line.get(entry["line_id"], 0))
 
     heap = [(-score(entry), entry["url"]) for entry in queued if entry["url"] not in taken]
     heapq.heapify(heap)
@@ -728,8 +784,8 @@ def reference_bests(frontier: Frontier, seeds: Sequence[Seed], today: dt.date) -
     best: Dict[tuple, tuple] = {}
     for e in frontier._entries.values():
         if (e["status"] == "queued" and e["url"] not in frontier._in_flight and e["seed_id"] in weights
-                and out_host[e["host"]] < MAX_IN_FLIGHT_PER_HOST and e["host"] not in frontier.cooled):
-            rank = (-frontier.priority(e, weights[e["seed_id"]], out_host[e["host"]], out_line[e["line_id"]]), e["url"])
+                and out_host[e["host"]] < MAX_IN_FLIGHT_PER_HOST and e["host"] not in frontier.cooled and frontier.factor(e["host"]) > 0):
+            rank = (-frontier.priority(e, weights[e["seed_id"]] * frontier.factor(e["host"]), out_host[e["host"]], out_line[e["line_id"]]), e["url"])
             group = (e["line_id"], e["host"], e["seed_id"])
             if group not in best or rank < best[group][0]:
                 best[group] = (rank, e)
@@ -789,7 +845,11 @@ def _random_frontier(rng: random.Random) -> tuple:
             "status": rng.choices(["queued", "fetched", "failed", "alias"], [85, 8, 4, 3])[0], "discovered_at": NOW, "fetched_at": None,
         })
     rng.shuffle(entries)   # queued order differs from url order
-    return Frontier(entries, host_rows, lines, rng_seed=rng.random()), seeds
+    frontier = Frontier(entries, host_rows, lines, rng_seed=rng.random())
+    if rng.random() < 0.5:   # site factors on some domains, 0 included; the other half runs without, as before they existed
+        domains = sorted({registered_domain(host) for host in hosts})
+        frontier.steer({d: rng.choice([0.0, 0.5, 1.0, 2.0, rng.random()]) for d in rng.sample(domains, rng.randint(1, len(domains)))})
+    return frontier, seeds
 
 
 def _churn(frontier: Frontier, seeds: List[Seed], rng: random.Random, later: Optional[list] = None) -> None:

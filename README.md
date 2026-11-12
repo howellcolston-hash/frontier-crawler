@@ -27,6 +27,7 @@ Read from the store's `config/` folder at the start of a run:
 |---|---|
 | `seeds.jsonl` | starting pages, one JSON object per line |
 | `questions.json` | optional: the questions asked about each document and how the answers combine into relevance. The format and the built-in default are `EXAMPLE` in `frontier_crawler/judge/questions.py` |
+| `steer.json` | optional: a weight per site, `{"version": 1, "sites": {"example.com": 0.5}}`, keyed by registered domain (subdomains included). It multiplies priority: 1 is neutral, below 1 sinks a site, above 1 lifts it, 0 stops fetching from it while keeping its queue. A malformed file is ignored and counted in the run record |
 | `clients/*.json` | optional: derived client specs |
 
 Judging uses [Jev](https://docs.typesafe.ai) and needs `JEV_API_KEY`. Without it pages are stored and left pending.

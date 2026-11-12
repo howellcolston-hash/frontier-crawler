@@ -30,11 +30,14 @@ first link from that line into it in a run), and every 1/RETEST_SHARE-th take() 
 entry of a group drawn at random, so cold groups are tried again (the draw ignores priority,
 generation included). Growth is bounded by the fetches per run, so lines compete for a fixed capacity.
 
-    priority = seed weight x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
+    priority = seed weight x site factor x base x HOP_DECAY^hops x line yield x GENERATION_DECAY^generation
                / (1 + fetched from this host / HOST_HALF)
                / (1 + fetched from this registered domain, all its hosts / DOMAIN_HALF)
                / (1 + fetched in this line / LINE_HALF)
 
+The site factor comes from the optional config/steer.json, per registered domain (1 where absent). Like the seed weight
+it is part of a group's weight, so every ranked path uses it; a re-test draw ignores it but for 0, which, like an
+inactive seed, leaves the site's entries queued and never taken, crossings into it and its retries included.
 base is 1 for a seed. For a link it comes from Jev's answers about the page it was found on
 (half "leads to further records", half relevance), or DEFAULT_LINK_BASE when that page has
 not been judged. hops count from the start of the line, generation from the seed. A crossing
@@ -317,6 +320,7 @@ class Frontier:
         for host, host_counts in self._hosts.items():
             self._domain_fetches[registered_domain(host)] += host_counts["fetches"]
         self._weights: Optional[Dict[str, float]] = None      # the active seeds' weights the heaps were built with
+        self._steer: Dict[str, float] = {}                     # registered domain -> site factor; see steer()
         self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
         self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on registered domains never fetched
         self._version = 0
@@ -402,6 +406,14 @@ class Frontier:
 
     def count(self, status: str) -> int:
         return self._statuses[status]
+
+    def steer(self, sites: Dict[str, float]) -> None:
+        """Set the site factors, per registered domain. The heaps are rebuilt for them by the next select() or take()."""
+        self._steer = dict(sites)
+        self._weights = None
+
+    def factor(self, host: str) -> float:
+        return self._steer.get(registered_domain(host), 1.0)
 
     def priority(self, entry: Dict[str, Any], weight: float, extra_host: int = 0, extra_line: int = 0) -> float:
         line = self._lines[entry["line_id"]]
@@ -698,7 +710,7 @@ class Frontier:
         key = (entry["line_id"], entry["host"], entry["seed_id"])
         group = self._groups.get(key)
         if group is None:
-            group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0))
+            group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0) * self.factor(key[1]))
             self._groups_by_line.setdefault(key[0], []).append(group)
             self._groups_by_host.setdefault(key[1], []).append(group)
             self._groups_by_domain.setdefault(registered_domain(key[1]), []).append(group)
@@ -731,7 +743,7 @@ class Frontier:
 
     def _eligible(self, group: _Group) -> bool:
         return (bool(group.members) and group.seed in (self._weights or {}) and group.line in self._lines
-                and group.host not in self.cooled)
+                and group.host not in self.cooled and group.weight > 0)
 
     def _new_domain(self, host: str) -> bool:
         return self._domain_fetches[registered_domain(host)] == 0
@@ -790,8 +802,8 @@ class Frontier:
         self._weights = weights
         self._heap, self._new_heap = [], []
         for group in self._groups.values():
-            if group.seed in weights and group.weight != weights[group.seed]:
-                group.weight = weights[group.seed]
+            if group.seed in weights and group.weight != weights[group.seed] * self.factor(group.host):
+                group.weight = weights[group.seed] * self.factor(group.host)
                 group.members.sort(key=group.key)
             self._push(group)
 
@@ -885,7 +897,7 @@ class Frontier:
                 follow(group)
             if in_host.get(entry["host"], 0) >= host_cap:
                 continue
-            fresh = -self.priority(entry, self._weights[entry["seed_id"]], *extras(entry["host"], entry["line_id"], in_host, in_line))  # type: ignore[index]
+            fresh = -self.priority(entry, self._groups[(entry["line_id"], entry["host"], entry["seed_id"])].weight, *extras(entry["host"], entry["line_id"], in_host, in_line))  # type: ignore[index]
             following = top()
             if following is not None and fresh > following[0]:
                 heapq.heappush(local, (fresh, url, entry, None))
@@ -976,7 +988,7 @@ class Frontier:
         if limit is not None and self._retry_flight >= limit:
             return None
         entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
-                      and e["host"] not in self.cooled and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
+                      and e["host"] not in self.cooled and self.factor(e["host"]) > 0 and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
         if entry is not None:
             del self._retry[entry["url"]]
             self._retry_flight += 1
@@ -994,7 +1006,7 @@ class Frontier:
                 continue
             queued[seed] += 1
             if entry["host"] not in self.cooled:
-                top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed]), 4))
+                top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed] * self.factor(entry["host"])), 4))
         return queued, top
 
     def expire_retries(self, now: dt.datetime) -> int:
@@ -1040,9 +1052,10 @@ async def crawl(
     max_minutes: Optional[float] = None,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     clock: Callable[[], float] = time.monotonic,
+    steer: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
-    or nothing is left to take.
+    or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -1060,6 +1073,7 @@ async def crawl(
     seconds: Dict[str, float] = dict.fromkeys(("load_state", "take", "fetching", "judge_wait", "final_save"), 0.0)
     with timed(seconds, "load_state"):
         frontier = Frontier.load(store, workdir, rng_seed=now().strftime("%Y-%m-%dT%H"))   # the run's start hour: re-tests reproducible
+    frontier.steer(steer or {})
     by_id = {seed.id: seed for seed in seeds}
     retries_expired = frontier.expire_retries(now())
     seeds_added = frontier.add_seeds(seeds, now())
@@ -1067,7 +1081,7 @@ async def crawl(
     stored_by_seed = {seed.id: 0 for seed in seeds}
     seed_url_problems: Dict[str, str] = {}
     data_portals: Dict[str, float] = {}
-    counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered"), 0)
+    counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered", "steered_down", "steered_up"), 0)
     by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
     by_host_page = dict.fromkeys(("1", "2-5", "6-20", "21+"), 0)   # fetches by their page number on their host
     # Re-test takes against ordinary ones, so the re-test share can be judged: pages taken, stored and judged, and relevance.
@@ -1086,6 +1100,8 @@ async def crawl(
         by_generation[str(generation) if generation < 4 else "4-7" if generation < 8 else "8+"] += 1
         page = frontier._hosts.get(entry["host"], {}).get("fetches", 0) + 1
         by_host_page["1" if page == 1 else "2-5" if page <= 5 else "6-20" if page <= 20 else "21+"] += 1
+        counts["steered_down"] += frontier.factor(entry["host"]) < 1
+        counts["steered_up"] += frontier.factor(entry["host"]) > 1
         if awaited:
             frontier.expect_judgement(row["fetch_id"], entry["line_id"])
         frontier.mark(entry, row, None, now())
@@ -1230,6 +1246,10 @@ async def crawl(
             # Seed ids: these go to the private run record only. __main__ prints top-level numbers alone.
             "stored_by_seed": stored_by_seed, "queued_by_seed": queued_by_seed, "top_priority_by_seed": top_priority_by_seed,
             "hosts_cooled": len(frontier.cooled),
+            # Site factors: sites with one other than 1, fetches from sites below and above 1, entries held by a factor of 0.
+            "sites_steered": sum(f != 1 for f in frontier._steer.values()),
+            "fetches_steered_down": counts["steered_down"], "fetches_steered_up": counts["steered_up"],
+            "queued_held_by_steer": sum(len(g.members) for g in frontier._groups.values() if frontier.factor(g.host) == 0),
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
             "seed_url_problems": seed_url_problems,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
