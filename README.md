@@ -40,10 +40,10 @@ Parquet shards in the store, in folders by the UTC day the fetching run started 
 
 | table | one row per |
 |---|---|
-| `fetches` | fetch attempt: where the URL came from, status, outcome, content hash, size, text and `title` (an HTML page's `<title>` or a PDF's metadata title, at most 300 characters; absent from shards before engine 0.4.0, so read it as nullable). Rows from engine 0.2.0 and earlier also carry the bytes in `body` |
+| `fetches` | fetch attempt: where the URL came from, status, outcome, content hash, size, text and `title` (an HTML page's `<title>` or a PDF's metadata title, at most 300 characters; absent from shards before engine 0.4.0, so read it as nullable) and, for a stored page, `join_keys`: JSON counts of the distinct dates, amounts, ids, names and contacts in its text, and their total per 100 words (regular expressions, `frontier_crawler/joinkeys.py`; absent before engine 0.5.0). Rows from engine 0.2.0 and earlier also carry the bytes in `body` |
 | `bodies` | content hash stored: the bytes as served (rendered HTML for the browser tier). Identical bytes are stored once, across runs; `python -m frontier_crawler body SHA256` writes one out |
 | `links` | distinct link on a stored HTML page, in page order, whether or not the queue took it |
-| `ocr_text` | scanned PDF read with Tesseract |
+| `ocr_text` | scanned PDF read with Tesseract, with `join_keys` for the text read (from engine 0.5.0) |
 | `judgement_calls`, `judgements` | Jev call about a document, and each answer in it |
 
 Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served (`url_hashes.parquet`: 64-bit keys), when each watched page was last read, the set of stored body hashes and Jev spend.

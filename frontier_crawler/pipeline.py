@@ -46,6 +46,7 @@ from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejecte
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.questions import Question, relevance
 from frontier_crawler import ocr
+from frontier_crawler.joinkeys import join_keys
 from frontier_crawler.storage.shards import (
     ANSWER_SCHEMA, BODY_SCHEMA, CALL_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, HEAVY_LEVEL, LINK_SCHEMA, OCR_SCHEMA, ShardWriter, bodies_of, day_folder,
 )
@@ -422,6 +423,7 @@ class Engine:
             if tier == "DOM_TRAFILATURA" and scraped.word_count < THIN_HTML_WORDS:
                 self.stats["thin_html"] += 1
             row["text"] = text or None
+            row["join_keys"] = json.dumps(join_keys(text)) if text else None
             sizes = self.stats["bytes_by_tier"].setdefault(tier, {"body": 0, "text": 0})
             sizes["body"] += len(body)
             sizes["text"] += len(text.encode("utf-8"))
@@ -579,7 +581,8 @@ class Engine:
                 words = len(text.split())
                 self._writer("ocr_text", day).add(
                     {"fetch_id": row["fetch_id"], "sha256": row["sha256"], "run_id": self.run_id, "read_at": self._now(),
-                     "langs": langs, "pages_read": pages_read, "pages_total": pages_total, "text": text, "word_count": words}
+                     "langs": langs, "pages_read": pages_read, "pages_total": pages_total, "text": text, "word_count": words,
+                     "join_keys": json.dumps(join_keys(text)) if text else None}
                 )
                 self.stats["scans_read"] += 1
                 if words >= _MIN_JUDGE_WORDS:

@@ -1,8 +1,8 @@
 """Parquet shards: the engine's tables. One file holds many rows, so file counts stay low.
 
 Six tables, each partitioned by the UTC day on which the fetching run started:
-    fetches/           one row per fetch attempt, with where it came from, the content hash, the text and the title
-                       (no title column before engine 0.4.0: read columns by name)
+    fetches/           one row per fetch attempt, with where it came from, the content hash, the text, the title and join keys
+                       (no title column before engine 0.4.0, no join_keys before 0.5.0: read columns by name)
     bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of)
     links/             one row per distinct link on a stored HTML page, in page order
     ocr_text/          one row per scanned PDF read with Tesseract
@@ -26,7 +26,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.4.0"  # 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.5.0"  # 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -60,6 +60,9 @@ FETCH_SCHEMA = pa.schema(
         ("text", pa.string()),
         # An HTML page's <title> or a PDF's metadata title, trimmed, at most 300 characters. Absent from shards before engine 0.4.0.
         ("title", pa.string()),
+        # A stored page's join keys (joinkeys.join_keys) as JSON: distinct dates, amounts, ids, names and contacts in its
+        # text, and their total per 100 words. Absent from shards before engine 0.5.0.
+        ("join_keys", pa.string()),
         ("word_count", pa.int32()),
         # Why the page is not content (a non-200 status or a block-page phrase), else null.
         ("block_marker", pa.string()),
@@ -129,6 +132,8 @@ OCR_SCHEMA = pa.schema(
         ("pages_total", pa.int32()),
         ("text", pa.string()),
         ("word_count", pa.int32()),
+        # As in fetches, from the text read here. Absent from shards before engine 0.5.0.
+        ("join_keys", pa.string()),
     ]
 )
 
