@@ -72,12 +72,16 @@ def group_key(line_id: str, host: str, seed_id: str) -> int:
     return url_key(f"{line_id}\x1f{host}\x1f{seed_id}")
 
 
+def starting(entry: Dict[str, Any]) -> bool:
+    """Whether an entry is its seed's starting URL: the first page of the seed's own line."""
+    return entry["hops"] == 0 and entry["line_id"] == entry["seed_id"] and not entry.get("crossing")
+
+
 def kept(entry: Dict[str, Any]) -> bool:
     """Whether an entry that is not queued is kept whole: a retry, an unparseable link (kept to be repaired), or a seed's
     starting URL once fetched (whether its own fetch stored anything decides if it is queued again)."""
     status = entry["status"]
-    return status in ("retry", "unparseable") or (
-        status in ("fetched", "failed") and entry["hops"] == 0 and entry["line_id"] == entry["seed_id"] and not entry.get("crossing"))
+    return status in ("retry", "unparseable") or (status in ("fetched", "failed") and starting(entry))
 
 
 def _table(rows: Sequence[Dict[str, Any]]) -> pa.Table:

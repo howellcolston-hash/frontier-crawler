@@ -488,6 +488,24 @@ def test_a_thin_starting_page_is_reported_and_tried_again_and_a_redirect_to_anot
     assert second["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"}
 
 
+def test_a_new_seed_on_a_page_fetched_under_another_line_reads_it_as_new_once(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": '<a href="/p">p</a>', "https://a.test/p": '<a href="/deep">deep</a>', "https://a.test/deep": ""})
+    store = LocalStore(tmp_path / "store")
+
+    def go(run: str, seeds: List[Seed]) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW))
+
+    seeds = [_seed("a", "https://a.test/")]
+    assert go("r1", seeds)["seed_urls_reread"] == 0 and sorted(site.fetched) == ["https://a.test/", "https://a.test/deep", "https://a.test/p"]
+    seeds.append(_seed("n", "https://a.test/p"))   # the page is unchanged since r1: read as new all the same, for its links
+    second = go("r2", seeds)
+    assert site.fetched[3:] == ["https://a.test/p"] and second["seed_urls_reread"] == 1
+    assert second["unchanged"] == 0 and second["stored_by_seed"] == {"a": 0, "n": 1} and second["links_written"] == 1
+    third = go("r3", seeds)
+    assert len(site.fetched) == 4 and third["seed_urls_reread"] == third["seed_urls_requeued"] == 0
+
+
 def test_a_sitemap_queues_the_newest_urls_the_queue_has_not_seen_as_ordinary_links(monkeypatch: Any) -> None:
     monkeypatch.setattr(frontier_module, "SITEMAP_MAX_URLS", 3)
     frontier = Frontier()

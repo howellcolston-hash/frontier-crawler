@@ -59,6 +59,7 @@ class Target:
     line_id: str = ""
     hops: int = 0
     parent_fetch_id: Optional[str] = None
+    fresh: bool = False   # read as new even if unchanged since an earlier fetch: a seed's starting URL fetched as one the first time
 
 
 @dataclass
