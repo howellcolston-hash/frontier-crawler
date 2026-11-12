@@ -75,6 +75,7 @@ class ScrapeResult:
     timed_out: bool = False  # nothing was served because the request or the page load timed out
     throttle_wait: float = 0.0  # seconds this fetch waited for its host's turn
     links: Optional[Links] = None  # (links, unparseable hrefs) of an HTML page, as its reader found them
+    title: Optional[str] = None  # an HTML page's <title>, a PDF's metadata title
 
 
 @contextlib.contextmanager
@@ -296,9 +297,9 @@ class HarvesterCascade:
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
             rendered = await self._browser(url, result.error_message, result.http_status, timeout, waited)
         if rendered.raw_payload:
-            # Links only: the browser gave the text. Without them the page is still stored.
+            # Links and title only: the browser gave the text. Without them the page is still stored.
             with contextlib.suppress(Exception), timed(self.timings, "extract_html"):
-                rendered.links = (await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url))[2]
+                _, _, rendered.links, rendered.title = await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url)
             return rendered
         # The browser got nothing. Keep what the plain request was served.
         result.error_message = rendered.error_message
@@ -323,8 +324,8 @@ class HarvesterCascade:
             result.too_large_bytes = size
             return result, False
 
-        def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None) -> ScrapeResult:
-            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links)
+        def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None, title: Optional[str] = None) -> ScrapeResult:
+            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links, title=title)
 
         def undecoded(encoding: Optional[str]) -> Optional[str]:
             """Count a page read in a legacy encoding; the note when no encoding fit."""
@@ -341,21 +342,21 @@ class HarvesterCascade:
         if "application/pdf" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".pdf"):
             try:
                 with timed(self.timings, "pdf_text"):  # the round trip to a reader process
-                    text, note = await self._readers.run(PDF_SECONDS + readers.MARGIN_SECONDS, self.read_pdf, body, PDF_SECONDS)
+                    text, note, title = await self._readers.run(PDF_SECONDS + readers.MARGIN_SECONDS, self.read_pdf, body, PDF_SECONDS)
             except Exception as exc:  # encrypted, damaged, not a PDF at all, or the reader crashed or hung
                 return served(None, "PDF", f"pdf not read: {exc}"), False
-            return served(text, "PDF", note), False
+            return served(text, "PDF", note, title=title), False
         try:
             with timed(self.timings, "extract_html"):  # the round trip to a reader process: decoding, text and links
-                text, encoding, links = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
+                text, encoding, links, title = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
             note = undecoded(encoding)
         except Exception as exc:  # the reader crashed or hung: the page is kept, without text or links, and not rendered
             return served(None, "DOM_TRAFILATURA", f"html not read: {exc}"), False
         words = word_count(text or "")
         shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
         if (status == 200 and shell) or status in _BROWSER_RETRY_STATUS:
-            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links), True
-        return served(text, "DOM_TRAFILATURA", note, links), False
+            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links, title), True
+        return served(text, "DOM_TRAFILATURA", note, links, title), False
 
     async def _browser(
         self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None, waited: Optional[Dict[str, float]] = None,

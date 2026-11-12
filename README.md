@@ -38,7 +38,7 @@ Parquet shards in the store, in folders by the UTC day the fetching run started 
 
 | table | one row per |
 |---|---|
-| `fetches` | fetch attempt: where the URL came from, status, outcome, content hash, size and text. Rows from engine 0.2.0 and earlier also carry the bytes in `body` |
+| `fetches` | fetch attempt: where the URL came from, status, outcome, content hash, size, text and `title` (an HTML page's `<title>` or a PDF's metadata title, at most 300 characters; absent from shards before engine 0.4.0, so read it as nullable). Rows from engine 0.2.0 and earlier also carry the bytes in `body` |
 | `bodies` | content hash stored: the bytes as served (rendered HTML for the browser tier). Identical bytes are stored once, across runs; `python -m frontier_crawler body SHA256` writes one out |
 | `links` | distinct link on a stored HTML page, in page order, whether or not the queue took it |
 | `ocr_text` | scanned PDF read with Tesseract |

@@ -49,8 +49,9 @@ def test_json_is_the_api_tier() -> None:
 
 def test_a_page_of_text_needs_no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     browser: List[str] = []
-    result = _fetch(_html(f"<p>{WORDS}</p>"), browser=browser, monkeypatch=monkeypatch)
-    assert result.tier_used == "DOM_TRAFILATURA" and result.word_count >= 150 and not browser
+    result = _fetch(lambda request: httpx.Response(200, text=f"<html><head><title>Berths</title></head><body><p>{WORDS}</p></body></html>",
+                                                   headers={"content-type": "text/html"}), browser=browser, monkeypatch=monkeypatch)
+    assert result.tier_used == "DOM_TRAFILATURA" and result.word_count >= 150 and not browser and result.title == "Berths"
 
 
 def test_an_index_page_of_links_needs_no_browser(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,8 +111,8 @@ def test_a_bogus_or_wrong_declared_charset_falls_back_to_detection() -> None:
 
 def _no_encoding_fits(body: bytes, content_type: str, url: str) -> Any:
     """read_html as it answers when no encoding fits. Module level, so a worker process can import it."""
-    text, _, links = readers.read_html(body, content_type, url)
-    return text, None, links
+    text, _, links, title = readers.read_html(body, content_type, url)
+    return text, None, links, title
 
 
 def test_bytes_no_encoding_fits_are_read_as_utf8_with_a_note(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -171,6 +172,7 @@ def test_pdf_text_is_read_from_every_page() -> None:
     result = _fetch(lambda request: httpx.Response(200, content=PDF, headers={"content-type": "application/pdf"}), url="https://a.test/gazette.pdf")
     assert result.tier_used == "PDF" and result.raw_payload == PDF and result.error_message is None
     assert "Gazette notice 0" in result.markdown_content and "Company 2" in result.markdown_content
+    assert result.title == "untitled"   # the metadata title reportlab wrote
 
 
 def test_pdf_reading_stops_at_the_time_limit_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:

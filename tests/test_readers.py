@@ -70,9 +70,20 @@ def test_a_worker_reads_exactly_what_this_process_would() -> None:
         finally:
             pool.close()
 
-    for (url, body), (text, encoding, links) in zip(PAGES.items(), asyncio.run(run())):
+    for (url, body), (text, encoding, links, _) in zip(PAGES.items(), asyncio.run(run())):
         assert (text, links) == _read_here(url, body) and encoding == decode(body, "text/html")[1]
     assert asyncio.run(run())[0][2] == ([("https://a.test/one", "One"), ("https://b.test/x", "B")], ["http://[bad"])
+
+
+def test_a_page_title_is_read_trimmed_and_cut_and_text_without_html_has_none() -> None:
+    long = "Notices " * 60
+    body = f"<html><head><title>\n  Tenders &amp; notices \n</title></head><body><p>{TEXT}</p></body></html>".encode()
+    assert read_html(body, "text/html", "https://a.test/")[3] == "Tenders & notices"
+    assert len(read_html(f"<html><head><title>{long}</title></head></html>".encode(), "text/html", "https://a.test/")[3]) == 300
+    legacy = f"<html><head><title>港口管理局</title></head><body><p>{'港口管理局公布了泊位时间表。' * 40}</p></body></html>".encode("gb18030")
+    assert read_html(legacy, "text/html; charset=gb18030", "https://a.test/")[3] == "港口管理局"
+    assert read_html(b"<html><head><title> </title></head></html>", "text/html", "https://a.test/")[3] is None
+    assert read_html(b"a plain <title>x</title> file", "text/plain", "https://a.test/")[2:] == (None, None)
 
 
 def test_a_reader_that_crashes_costs_its_page_its_text_and_nothing_else() -> None:

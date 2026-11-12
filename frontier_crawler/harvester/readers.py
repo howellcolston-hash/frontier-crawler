@@ -3,7 +3,7 @@ that crashes or hangs on hostile input costs one page, not the run.
 
 Input contract:
     pool = ReaderPool(counts)       # counts["reader_crashes"], counts["reader_timeouts"] are kept up to date
-    text, encoding, links = await pool.run(HTML_SECONDS, read_html, body, content_type, url)
+    text, encoding, links, title = await pool.run(HTML_SECONDS, read_html, body, content_type, url)
     pool.close()                    # kills the workers: at the end of a run, and on error
 pool.run raises ReaderFailed when the call's worker died twice or ran past the limit; other exceptions from the
 reader come back as they were raised. The functions sent must be importable at module level.
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import faulthandler
+import html as html_module
 import multiprocessing
 import re
 import time
@@ -30,6 +31,7 @@ READER_WORKERS = 3              # PROVISIONAL: worker processes reading pages at
 HTML_SECONDS = 60.0             # PROVISIONAL: a worker reading one HTML or JSON body for longer is killed
 MARGIN_SECONDS = 30.0           # PROVISIONAL: past a reader's own time limit (PDF text) before its worker is killed
 MAX_LINKS_PER_PAGE = 300        # PROVISIONAL: links kept from one page, in page order
+MAX_TITLE_CHARS = 300           # PROVISIONAL: a page title is cut to this many characters
 
 Links = Tuple[List[Tuple[str, str]], List[str]]
 
@@ -124,33 +126,43 @@ def looks_like_html(content_type: Optional[str], body: bytes) -> bool:
     return not content_type and body.lstrip()[:1] == b"<"
 
 
-def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], Optional[str], Optional[Links]]:
-    """(markdown text, encoding read in, the page's links or None when the bytes do not look like HTML)."""
+def title_of(raw: Any) -> Optional[str]:
+    """A title with its whitespace collapsed, cut to MAX_TITLE_CHARS; None when empty."""
+    return " ".join(str(raw or "").split())[:MAX_TITLE_CHARS] or None
+
+
+def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], Optional[str], Optional[Links], Optional[str]]:
+    """(markdown text, encoding read in, the page's links, its <title>); links and title are None when the bytes do not look like HTML."""
     html, encoding = decode(body, content_type)
     try:
         text = trafilatura.extract(html, output_format="markdown", include_comments=False, include_tables=True)
     except Exception:  # a page trafilatura cannot read is stored without text
         text = None
-    return text, encoding, extract_links(body, url) if looks_like_html(content_type, body) else None
+    if not looks_like_html(content_type, body):
+        return text, encoding, None, None
+    # From the decoded text, so a page in a legacy encoding gets its title in it.
+    found = re.search(r"<title(?:\s[^>]*)?>(.*?)</title\s*>", html, re.I | re.S)
+    return text, encoding, extract_links(body, url), title_of(html_module.unescape(found.group(1))) if found else None
 
 
-def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str]]:
-    """(text of every page, a note when `seconds` ran out first). Scanned pages have no text."""
+def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str], Optional[str]]:
+    """(text of every page, a note when `seconds` ran out first, the title in its metadata). Scanned pages have no text."""
     import pypdfium2
 
     pdf = pypdfium2.PdfDocument(body)
     try:
+        title = title_of(pdf.get_metadata_dict().get("Title"))
         parts = []
         deadline = time.monotonic() + seconds
         for index in range(len(pdf)):
             if time.monotonic() > deadline:
-                return "\n".join(parts), f"text read for the first {index} of {len(pdf)} pages"
+                return "\n".join(parts), f"text read for the first {index} of {len(pdf)} pages", title
             page = pdf[index]
             textpage = page.get_textpage()
             parts.append(textpage.get_text_bounded())
             textpage.close()
             page.close()
-        return "\n".join(parts), None
+        return "\n".join(parts), None, title
     finally:
         pdf.close()
 

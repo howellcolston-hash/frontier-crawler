@@ -1,7 +1,8 @@
 """Parquet shards: the engine's tables. One file holds many rows, so file counts stay low.
 
 Six tables, each partitioned by the UTC day on which the fetching run started:
-    fetches/           one row per fetch attempt, with where it came from, the content hash and the text
+    fetches/           one row per fetch attempt, with where it came from, the content hash, the text and the title
+                       (no title column before engine 0.4.0: read columns by name)
     bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of)
     links/             one row per distinct link on a stored HTML page, in page order
     ocr_text/          one row per scanned PDF read with Tesseract
@@ -25,7 +26,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.3.0"  # 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.4.0"  # 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -57,6 +58,8 @@ FETCH_SCHEMA = pa.schema(
         # in bodies, by sha256. Kept so old and new shards read alike.
         ("body", pa.binary()),
         ("text", pa.string()),
+        # An HTML page's <title> or a PDF's metadata title, trimmed, at most 300 characters. Absent from shards before engine 0.4.0.
+        ("title", pa.string()),
         ("word_count", pa.int32()),
         # Why the page is not content (a non-200 status or a block-page phrase), else null.
         ("block_marker", pa.string()),

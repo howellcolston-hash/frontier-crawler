@@ -402,6 +402,7 @@ class Engine:
                 "sha256": digest,
                 "size_bytes": len(body),
                 "word_count": scraped.word_count,
+                "title": scraped.title,
                 "block_marker": block_marker(scraped.http_status, text),
                 "tier_note": scraped.error_message,
             }

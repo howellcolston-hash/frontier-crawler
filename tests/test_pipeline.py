@@ -115,6 +115,13 @@ def test_fetch_row_carries_provenance_and_its_bytes_go_to_bodies(tmp_path: Path)
     assert (row["seed_id"], row["line_id"], row["hops"], row["parent_fetch_id"]) == ("example-port", "example-port:a.test", 2, "parent-fetch")
 
 
+def test_a_fetch_row_carries_the_pages_title(tmp_path: Path) -> None:
+    page = dataclasses.replace(_page("https://a.test/x"), title="Berth schedule")
+    asyncio.run(_engine(tmp_path, FakeCascade({"https://a.test/x": page, "https://a.test/y": _page("https://a.test/y")}), "r1").run(
+        [_job("https://a.test/x"), _job("https://a.test/y")]))
+    assert {row["url_final"]: row["title"] for row in _rows(tmp_path / "store", "fetches")} == {"https://a.test/x": "Berth schedule", "https://a.test/y": None}
+
+
 def test_second_run_marks_unchanged_and_keeps_no_second_copy(tmp_path: Path) -> None:
     cascade = FakeCascade({"https://a.test/x": _page("https://a.test/x")})
     asyncio.run(_engine(tmp_path, cascade, "r1").run([_job("https://a.test/x")]))
@@ -199,8 +206,8 @@ def test_fetch_rows_never_go_up_without_their_bodies(tmp_path: Path) -> None:
 
 
 def _old_format_shard(tmp_path: Path, rows: List[Dict[str, Any]], day: dt.date) -> None:
-    """Fetch rows as engine 0.2.0 wrote them, with the bytes inline."""
-    writer = ShardWriter("fetches", FETCH_SCHEMA, "old", day, tmp_path / "work-old")
+    """Fetch rows as engine 0.2.0 wrote them, with the bytes inline and no title column."""
+    writer = ShardWriter("fetches", FETCH_SCHEMA.remove(FETCH_SCHEMA.get_field_index("title")), "old", day, tmp_path / "work-old")
     for row in rows:
         writer.add(row)
     LocalStore(tmp_path / "store").put_many([writer.write(writer.take(force=True))])
@@ -469,6 +476,10 @@ def test_ceiling_leaves_documents_pending_and_the_backlog_picks_them_up(tmp_path
 
     assert backlog("j1")["judged"] == 3 and len(_rows(tmp_path / "store", "judgement_calls")) == 3
     assert backlog("j2")["judged"] == 0          # nothing is asked twice
+    # A shard written before the title column is read alongside the new ones.
+    _old_format_shard(tmp_path, [{"fetch_id": "old-1", "outcome": "stored", "tier_used": "DOM_TRAFILATURA", "sha256": "ab" * 32,
+                                  "text": DOC, "word_count": len(DOC.split())}], DAY)
+    assert backlog("j3")["judged"] == 1
 
 
 def test_the_ceiling_stops_calls_once_the_month_has_spent_it(tmp_path: Path) -> None:
