@@ -58,6 +58,9 @@ their robots.txt and the sitemaps it names (else /sitemap.xml) read, at most onc
 SITEMAP_MAX_URLS new URLs each, newest first, are queued as ordinary links (add_sitemap). Discovery only: robots.txt
 rules are not applied.
 
+Watched pages (crawl's watch, from config/watch.json) are fetched before any ranked take when due, outside the queue,
+up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as links of its site's line.
+
 A page that timed out is retried once, with a longer limit, through take()'s retry lane; a second timeout fails it,
 and so does waiting longer than RETRY_MAX_AGE for the retry.
 
@@ -76,6 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import collections
 import contextlib
 import datetime as dt
 import functools
@@ -99,6 +103,7 @@ from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import newest_first, normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
+from frontier_crawler.storage.state import load_watch_times, save_watch_times
 from frontier_crawler.storage.store import Store
 
 MAX_HOPS = 5                    # links this many steps from the start of a line are the last ones queued
@@ -130,6 +135,7 @@ TAKE_WAIT_SECONDS = 0.05        # how long a crawl worker with nothing to take w
 THIN_WORDS = 20                 # PROVISIONAL: an HTML page served with fewer words is not content: an outage notice, an empty shell
 SITEMAP_EVERY = dt.timedelta(days=7)   # PROVISIONAL: how often one site's robots.txt and sitemaps are read
 SITEMAP_MAX_URLS = 500          # PROVISIONAL: new URLs queued from one site's sitemaps per read
+WATCH_SHARE = 0.2               # PROVISIONAL: most of a run's max_fetches that watched pages may take
 
 logger = logging.getLogger("frontier_crawler.frontier")
 
@@ -1102,11 +1108,16 @@ async def crawl(
     clock: Callable[[], float] = time.monotonic,
     steer: Optional[Dict[str, float]] = None,
     sitemaps: Optional[Callable[[str], Awaitable[Tuple[List[Tuple[str, str]], int, int]]]] = None,
+    watch: Sequence[Dict[str, Any]] = (),
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
     sitemaps: HarvesterCascade.sitemap_entries, or None to read none. Before the first take, each site sitemap_sites()
     finds due has its sitemaps read and add_sitemap() queues what they list; a failure is counted and the crawl goes on.
+    watch: watched pages, {"id", "url", "every_hours"} each. Those never served or last served every_hours ago or more
+    are fetched before any ranked take, oldest due first, up to WATCH_SHARE of max_fetches. Each is a fetch row with
+    line_id "watch:<id>"; the links of a changed one are queued as links of the line covering its host. When each was
+    last served is kept in state/watch.json.
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -1133,6 +1144,21 @@ async def crawl(
     seed_url_problems: Dict[str, str] = {}
     seed_url_redirects: Dict[str, str] = {}   # a starting URL -> the other site it was sent to
     starting = {url for seed in seeds for url in seed.urls}
+    # Watched pages due now, oldest due first. With none configured, no watch state is read or written.
+    watch_times = load_watch_times(store, workdir) if watch else {}
+    never = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    def due_at(w: Dict[str, Any]) -> dt.datetime:
+        last = watch_times.get(w["url"])
+        try:
+            return never if last is None else last + dt.timedelta(hours=w["every_hours"])
+        except OverflowError:   # an interval past the calendar: never due again
+            return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+
+    due = sorted((w for w in watch if due_at(w) <= now()), key=due_at)
+    watch_queue = collections.deque(due[:math.floor(max_fetches * WATCH_SHARE)])
+    watched = dict.fromkeys(("watch_fetched", "watch_changed", "watch_unchanged", "watch_failed", "watch_links_queued"), 0)
+    watch_tally = dict.fromkeys(("taken", "stored", "judged", "relevance"), 0)   # judge() wants one; not reported
     read = dict.fromkeys(("sitemap_sites_read", "sitemaps_read", "sitemap_failures", "sitemap_urls_queued"), 0)
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered", "steered_down", "steered_up"), 0)
@@ -1220,6 +1246,36 @@ async def crawl(
                 if entry["url"] in frontier._in_flight:
                     frontier.mark(entry, {"outcome": "error"}, None, now())
 
+    async def fetch_watched(w: Dict[str, Any]) -> None:
+        """A watched page: a fetch row of its own line_id, outside the queue; a changed one's links join the queue."""
+        nonlocal links_added
+        try:
+            host = urlsplit(w["url"]).netloc
+            line = frontier.line(frontier._host_line.get(host) or "")
+            seed_id = line["seed_id"] if line else ""
+            entity = by_id[seed_id].entity if seed_id in by_id else ""
+            row = await engine.fetch(Target(w["url"], entity, seed_id, f"watch:{w['id']}"))
+            watched["watch_fetched"] += 1
+            content = row["outcome"] in ("stored", "duplicate") and not row["block_marker"]
+            watched["watch_changed" if content else "watch_unchanged" if row["outcome"] == "unchanged" else "watch_failed"] += 1
+            if row["outcome"] != "error":
+                watch_times[w["url"]] = now()
+            if line is not None:
+                # As if it were a page of its site's line, at its start: new links on it are queued, known ones are not.
+                as_entry = {"url": w["url"], "host": host, "seed_id": seed_id, "line_id": line["line_id"], "crossing": False, "hops": 0,
+                            "parent_fetch_id": None, "anchor": None, "base": DEFAULT_LINK_BASE, "status": "fetched",
+                            "discovered_at": now(), "fetched_at": now()}
+                queued = frontier.add_links(as_entry, row, None, now())
+                watched["watch_links_queued"] += queued
+                links_added += queued
+            if engine.sampled(row):
+                task = asyncio.create_task(judge({**row, "links": None}, watch_tally))
+                judging.add(task)
+                task.add_done_callback(judging.discard)
+        except Exception:
+            logger.exception("a watched page failed")
+            watched["watch_failed"] += 1
+
     async def worker() -> None:
         nonlocal stopped_by
         while True:
@@ -1228,6 +1284,14 @@ async def crawl(
                 return
             # max_fetches counts new pages only. Past it, workers still work off the retries, until the deadline.
             new_pages = counts["taken"] < max_fetches
+            if watch_queue and new_pages:   # watched pages go ahead of every ranked take, and count toward max_fetches
+                counts["taken"] += 1
+                counts["in_flight"] += 1
+                try:
+                    await fetch_watched(watch_queue.popleft())
+                finally:
+                    counts["in_flight"] -= 1
+                continue
             with timed(seconds, "take"):
                 entry = frontier.take(seeds, now().date()) if new_pages else frontier.take_retry(seeds, now().date())
             if entry is None:
@@ -1313,7 +1377,8 @@ async def crawl(
     done.set()
     await uploader
     with timed(seconds, "final_save"):
-        stats = dict(await engine.finish(frontier.save(workdir)))
+        stats = dict(await engine.finish(frontier.save(workdir) + ([save_watch_times(
+            {w["url"]: watch_times[w["url"]] for w in watch if w["url"] in watch_times}, workdir)] if watch else [])))
     queued_by_seed, top_priority_by_seed = frontier.by_seed(seeds, now().date())
     seconds["total"] = time.monotonic() - began
     stats.update(
@@ -1324,6 +1389,7 @@ async def crawl(
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
             "fetches_by_host_page": by_host_page, "fetches_new_domain_share": frontier.new_domain_takes,
             "seed_urls_requeued": frontier.seed_urls_requeued, **read,
+            "watch_entries": len(watch), "watch_due": len(due), **watched,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,

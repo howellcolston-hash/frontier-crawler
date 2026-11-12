@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 import heapq
+import json
 import math
 import random
 from collections import Counter
@@ -22,6 +23,7 @@ from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 from frontier_crawler.harvester.cascade import ScrapeResult
+import pyarrow.parquet as pq
 
 NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
 TEXT = "The port authority published the berth schedule and the tariff for bulk cargo. " * 12
@@ -528,6 +530,61 @@ def test_a_crawl_reads_due_sitemaps_once_a_week_and_a_failure_does_not_stop_it(t
     third = go("r3", NOW + dt.timedelta(days=7))
     assert sorted(read) == ["https://a.test", "https://down.test"] and third["sitemap_urls_queued"] == 0   # nothing new to queue
     assert Frontier.load(store, tmp_path / "w").sitemap_read["a.test"] == NOW + dt.timedelta(days=7)
+
+
+def test_watched_pages_are_read_when_due_and_a_changed_one_queues_its_new_links(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", "https://a.test/notices": '<a href="/n/1">1</a>', "https://a.test/n/1": "", "https://a.test/n/2": ""})
+    store = LocalStore(tmp_path / "store")
+    watch = [{"id": "notices", "url": "https://a.test/notices", "every_hours": 12.0}, {"id": "gone", "url": "https://a.test/gone", "every_hours": 1.0}]
+
+    def go(run: str, hours: float) -> Dict[str, Any]:
+        when = NOW + dt.timedelta(hours=hours)
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
+        site.fetched.clear()
+        return asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / run, max_fetches=10, now=lambda: when, watch=watch))
+
+    def counts(stats: Dict[str, Any]) -> tuple:
+        return tuple(stats[f"watch_{key}"] for key in ("entries", "due", "fetched", "changed", "unchanged", "failed", "links_queued"))
+
+    first = go("r1", 0)
+    assert counts(first) == (2, 2, 2, 1, 0, 1, 1) and site.fetched[:2] == ["https://a.test/notices", "https://a.test/gone"]
+    assert "https://a.test/n/1" in site.fetched                     # its link joined the queue of the site's line
+    rows = [row for path in (tmp_path / "store" / "fetches").rglob("*.parquet") for row in pq.read_table(path).to_pylist()]
+    assert {row["url_requested"]: row["line_id"] for row in rows if row["line_id"].startswith("watch:")} == {
+        "https://a.test/notices": "watch:notices", "https://a.test/gone": "watch:gone"}
+    assert Frontier.load(store, tmp_path / "w1").entry("https://a.test/n/1")["line_id"] == "a"
+    assert counts(go("r2", 6)) == (2, 1, 1, 0, 0, 1, 0)             # read 6 hours ago: not due; the dead one is due hourly
+    assert counts(go("r3", 12)) == (2, 2, 2, 0, 1, 1, 0)            # due, and served the same bytes
+    site.pages["https://a.test/notices"] = '<a href="/n/1">1</a> <a href="/n/2">2</a>'
+    fourth = go("r4", 24)
+    assert counts(fourth) == (2, 2, 2, 1, 0, 1, 1) and "https://a.test/n/2" in site.fetched and "https://a.test/n/1" not in site.fetched
+    times = json.loads((tmp_path / "store" / "state" / "watch.json").read_text())
+    assert times == dict.fromkeys(("https://a.test/gone", "https://a.test/notices"), (NOW + dt.timedelta(hours=24)).isoformat())
+
+
+def test_watched_pages_take_at_most_a_fifth_of_the_fetch_cap_oldest_due_first(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", **{f"https://a.test/w{i}": "" for i in range(5)}})
+    store = LocalStore(tmp_path / "store")
+    (tmp_path / "store" / "state").mkdir(parents=True)
+    last = {f"https://a.test/w{i}": (NOW - dt.timedelta(hours=10 - i)).isoformat() for i in (1, 2, 3)}   # w1 the oldest; w0 and w4 never
+    (tmp_path / "store" / "state" / "watch.json").write_text(json.dumps(last))
+    watch = [{"id": f"w{i}", "url": f"https://a.test/w{i}", "every_hours": 1.0} for i in range(5)]
+    engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=14, now=lambda: NOW, watch=watch))
+    assert (stats["watch_due"], stats["watch_fetched"], stats["total"]) == (5, 2, 3)        # floor(14 x 0.2) = 2, and the seed
+    assert site.fetched[:2] == ["https://a.test/w0", "https://a.test/w4"]
+
+
+def test_without_a_watch_file_no_watch_state_is_read_or_written(tmp_path: Path) -> None:
+    class Watching(LocalStore):
+        def get(self, remote: str, local: Path) -> bool:
+            assert remote != "state/watch.json"
+            return super().get(remote, local)
+
+    store = Watching(tmp_path / "store")
+    engine = Engine(store, FakeSite({"https://a.test/": ""}), workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=5, now=lambda: NOW))
+    assert stats["total"] == 1 and stats["watch_entries"] == stats["watch_fetched"] == 0 and not (tmp_path / "store" / "state" / "watch.json").exists()
 
 
 def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path: Path) -> None:

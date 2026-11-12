@@ -1,11 +1,12 @@
 # Runs the crawler against the store named by the repository's secrets: a crawl four times a day
-# for 85 minutes, scanned PDFs read once a day, or either by hand. Nothing here runs for pull
+# for 85 minutes, scanned PDFs read once a day, the derived clients once a day, or any of them by hand. Nothing here runs for pull
 # requests. The log carries counts only.
 name: crawl
 on:
   schedule:
     - cron: "17 0,6,12,18 * * *"
     - cron: "47 3 * * *"   # ocr, between two crawls
+    - cron: "47 9 * * *"   # derived, between two crawls
   workflow_dispatch:
     inputs:
       command:
@@ -29,7 +30,7 @@ jobs:
       CRAWLER_HF_REPO: ${{ secrets.HF_REPO }}
       JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
-      COMMAND: ${{ inputs.command || (github.event.schedule == '47 3 * * *' && 'ocr') || 'crawl' }}
+      COMMAND: ${{ inputs.command || (github.event.schedule == '47 3 * * *' && 'ocr') || (github.event.schedule == '47 9 * * *' && 'derived') || 'crawl' }}
       MAX_MINUTES: ${{ inputs.max_minutes || '85' }}
     steps:
       - uses: actions/checkout@v4

@@ -15,7 +15,7 @@ Environment:
     CRAWLER_VERBOSE              set to log fetch failures and other detail. Off by default: see below.
 
 Configuration is read from the store: config/seeds.jsonl, config/questions.json (optional),
-config/steer.json (optional) and config/clients/*.json. What a run did is written to the store as runs/<run id>.json. Only counts
+config/steer.json (optional), config/watch.json (optional) and config/clients/*.json. What a run did is written to the store as runs/<run id>.json. Only counts
 are printed, so a run's log says how much was done and not where.
 """
 
@@ -40,6 +40,7 @@ import httpx
 from frontier_crawler import capture as capture_module
 from frontier_crawler import derived as derived_module
 from frontier_crawler.frontier import crawl, load_seeds
+from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _guard_request
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge import questions as judging
@@ -97,6 +98,34 @@ def _steer(store: Store, workdir: Path) -> Tuple[Dict[str, float], int]:
         return {}, 1
 
 
+def _watch(store: Store, workdir: Path) -> Tuple[List[Dict[str, Any]], int, int]:
+    """config/watch.json: {"version": 1, "urls": [{"id": slug, "url": absolute url, "every_hours": number > 0}]}.
+    (valid entries, 1 for a file that is not that, entries ignored: a bad or repeated id, a bad url or interval).
+    Nothing here stops a crawl."""
+    path = _config(store, workdir, "config/watch.json")
+    if path is None:
+        return [], 0, 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data["version"] != 1 or not isinstance(data["urls"], list):
+            raise ValueError("unknown version, or urls is not a list")
+    except Exception:
+        return [], 1, 0
+    entries: List[Dict[str, Any]] = []
+    ignored = 0
+    for item in data["urls"]:
+        try:
+            entry = {"id": item["id"], "url": normalise(item["url"]), "every_hours": float(item["every_hours"])}
+            if (not isinstance(entry["id"], str) or not re.fullmatch(r"[\w.-]+", entry["id"]) or entry["id"] in {e["id"] for e in entries}
+                    or not entry["url"] or not math.isfinite(entry["every_hours"]) or entry["every_hours"] <= 0):
+                raise ValueError("bad entry")
+        except Exception:
+            ignored += 1
+            continue
+        entries.append(entry)
+    return entries, 0, ignored
+
+
 def _specs(store: Store, workdir: Path) -> List[derived_module.Spec]:
     for remote in store.list("config/clients"):
         if remote.endswith(".json"):
@@ -118,11 +147,13 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         seeds = load_seeds(seeds_path)
         _configure_questions(store, Path(workdir))
         steer, steer_ignored = _steer(store, Path(workdir))
+        watch, watch_file_ignored, watch_entries_ignored = _watch(store, Path(workdir))
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=HostThrottle(args.min_interval)) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
-                                sitemaps=cascade.sitemap_entries)
+                                sitemaps=cascade.sitemap_entries, watch=watch)
     stats["steer_file_ignored"] = steer_ignored
+    stats["watch_file_ignored"], stats["watch_entries_ignored"] = watch_file_ignored, watch_entries_ignored
     _report(ctx, stats)
     if stats["errors"] or stats["seeds_with_nothing"]:
         ctx["status"] = "partial"

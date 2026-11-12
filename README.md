@@ -28,6 +28,7 @@ Read from the store's `config/` folder at the start of a run:
 | `seeds.jsonl` | starting pages, one JSON object per line |
 | `questions.json` | optional: the questions asked about each document and how the answers combine into relevance. The format and the built-in default are `EXAMPLE` in `frontier_crawler/judge/questions.py` |
 | `steer.json` | optional: a weight per site, `{"version": 1, "sites": {"example.com": 0.5}}`, keyed by registered domain (subdomains included). It multiplies priority: 1 is neutral, below 1 sinks a site, above 1 lifts it, 0 stops fetching from it while keeping its queue. A malformed file is ignored and counted in the run record |
+| `watch.json` | optional: pages to re-read on a schedule, `{"version": 1, "urls": [{"id": "notices", "url": "https://example.com/notices", "every_hours": 24}]}`. At the start of a crawl, each one never read or read at least `every_hours` ago is fetched before the ranked queue, oldest due first, up to a fifth of the run's fetches. Its fetch row has `line_id` `watch:<id>`; when its bytes changed, the links on it that the queue has not seen are queued under its site's line. A malformed file or entry is ignored and counted in the run record |
 | `clients/*.json` | optional: derived client specs |
 
 Judging uses [Jev](https://docs.typesafe.ai) and needs `JEV_API_KEY`. Without it pages are stored and left pending.
@@ -44,7 +45,7 @@ Parquet shards in the store, in folders by the UTC day the fetching run started 
 | `ocr_text` | scanned PDF read with Tesseract |
 | `judgement_calls`, `judgements` | Jev call about a document, and each answer in it |
 
-Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served, the set of stored body hashes and Jev spend.
+Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served, when each watched page was last read, the set of stored body hashes and Jev spend.
 
 ## Logs
 
@@ -52,7 +53,8 @@ A run prints counts only. What it fetched, and anything that went wrong, is writ
 
 - `seed_url_problems`: starting URLs that served nothing, a block page or a thin page (HTML under 20 words, such as an outage notice). Each is tried again in the next run. A thin page counts as no content in its line's yield.
 - `seed_url_redirects`: starting URLs that were sent to another site, with the site they ended on.
-- `sitemap_sites_read`, `sitemaps_read`, `sitemap_failures`, `sitemap_urls_queued`: a seed's starting sites, and sites on a domain steered above 1, have their `robots.txt` and the sitemaps it names (else `/sitemap.xml`) read at most once a week; up to 500 new URLs a site, newest first, join the queue as ordinary links. This only finds pages: `robots.txt` rules are not applied. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
+- `sitemap_sites_read`, `sitemaps_read`, `sitemap_failures`, `sitemap_urls_queued`: a seed's starting sites, and sites on a domain steered above 1, have their `robots.txt` and the sitemaps it names (else `/sitemap.xml`) read at most once a week; up to 500 new URLs a site, newest first, join the queue as ordinary links. This only finds pages: `robots.txt` rules are not applied.
+- `watch_entries`, `watch_due`, `watch_fetched`, `watch_changed`, `watch_unchanged`, `watch_failed`, `watch_links_queued`, `watch_file_ignored`, `watch_entries_ignored`: the watched pages of `config/watch.json`. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
 
 ## Tests
 

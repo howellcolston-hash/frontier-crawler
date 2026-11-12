@@ -21,6 +21,24 @@ def test_a_steering_file_is_optional_and_a_broken_one_is_ignored_and_counted(tmp
         assert cli._steer(store, tmp_path / f"w{n + 1}") == expected, text
 
 
+def test_a_watch_file_is_optional_and_a_broken_one_or_bad_entries_are_ignored_and_counted(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path / "store")
+    assert cli._watch(store, tmp_path / "w0") == ([], 0, 0)
+    good = {"id": "notices", "url": "https://A.test/notices#top", "every_hours": 6}
+    bad = [{"id": "notices", "url": "https://a.test/again", "every_hours": 1}, {"id": "rel", "url": "/notices", "every_hours": 1},
+           {"id": "zero", "url": "https://a.test/z", "every_hours": 0}, {"id": "nan", "url": "https://a.test/n", "every_hours": "nan"},
+           {"id": "a b", "url": "https://a.test/s", "every_hours": 1}, {"id": 7, "url": "https://a.test/i", "every_hours": 1},
+           {"url": "https://a.test/missing"}, "not an object"]
+    (tmp_path / "store" / "config").mkdir(parents=True)
+    for n, (text, expected) in enumerate([
+        (json.dumps({"version": 1, "generated": "2026-11-12T00:00:00Z", "urls": [good, *bad]}),
+         ([{"id": "notices", "url": "https://a.test/notices", "every_hours": 6.0}], 0, len(bad))),
+        ('{"version": 2, "urls": []}', ([], 1, 0)), ('{"version": 1, "urls": {}}', ([], 1, 0)), ("[1]", ([], 1, 0)), ("not json", ([], 1, 0)),
+    ]):
+        (tmp_path / "store" / "config" / "watch.json").write_text(text)
+        assert cli._watch(store, tmp_path / f"w{n + 1}") == expected, text
+
+
 def test_a_run_prints_counts_only_and_records_the_rest_in_the_store(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "open_store", lambda: LocalStore(tmp_path))
 
