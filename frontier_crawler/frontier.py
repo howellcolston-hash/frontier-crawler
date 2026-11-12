@@ -194,7 +194,7 @@ ARM_REFRESH = 8                 # PROVISIONAL: arms drawn at random whose sample
 HOT_ENTRIES = 100_000           # PROVISIONAL: entries a run loads at its first take, best groups first: about a dozen runs' takes
 HOT_PER_GROUP = 64              # PROVISIONAL: entries of one group loaded at a time; its next ones load when these run out
 COLD_SAMPLE = 2_000             # PROVISIONAL: groups outside the hot set drawn uniformly each run, their best entry loaded
-MAX_QUEUED_PER_GROUP = 1_000    # PROVISIONAL: a group's lowest-ranked entries past this are cut at save
+MAX_QUEUED_PER_GROUP = 2_000    # PROVISIONAL: a group's lowest-ranked entries past this are cut at save; equal to the per-host cap, so migration cuts nothing
 MAX_QUEUED = 5_000_000          # PROVISIONAL: queued entries in all; past it the lowest-ranked groups are cut at save
 
 logger = logging.getLogger("frontier_crawler.frontier")
