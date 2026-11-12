@@ -51,7 +51,12 @@ best entry of each, ranked by this priority too. There are no source tiers: any 
 can be followed.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
-needed the PDF or browser tier, refusals, failures and dead links.
+needed the PDF or browser tier, refusals, failures and dead links; and when its sitemaps were last read.
+
+Sitemaps. At the start of a run, a seed's starting sites and the sites with a line on a domain steered above 1 have
+their robots.txt and the sitemaps it names (else /sitemap.xml) read, at most once per SITEMAP_EVERY, and up to
+SITEMAP_MAX_URLS new URLs each, newest first, are queued as ordinary links (add_sitemap). Discovery only: robots.txt
+rules are not applied.
 
 A page that timed out is retried once, with a longer limit, through take()'s retry lane; a second timeout fails it,
 and so does waiting longer than RETRY_MAX_AGE for the retry.
@@ -83,7 +88,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 import pyarrow as pa
@@ -91,7 +96,7 @@ import pyarrow.parquet as pq
 from tld import get_fld
 
 from frontier_crawler.harvester.cascade import Target, timed
-from frontier_crawler.harvester.readers import normalise
+from frontier_crawler.harvester.readers import newest_first, normalise
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
 from frontier_crawler.storage.store import Store
@@ -123,6 +128,8 @@ JUDGE_GRACE_SECONDS = 60.0      # how long the end of a crawl waits for judgemen
 FLUSH_EVERY_SECONDS = 5.0       # how often a crawl asks the engine to upload what it has buffered
 TAKE_WAIT_SECONDS = 0.05        # how long a crawl worker with nothing to take waits before asking again
 THIN_WORDS = 20                 # PROVISIONAL: an HTML page served with fewer words is not content: an outage notice, an empty shell
+SITEMAP_EVERY = dt.timedelta(days=7)   # PROVISIONAL: how often one site's robots.txt and sitemaps are read
+SITEMAP_MAX_URLS = 500          # PROVISIONAL: new URLs queued from one site's sitemaps per read
 
 logger = logging.getLogger("frontier_crawler.frontier")
 
@@ -152,7 +159,8 @@ _FRONTIER_SCHEMA = pa.schema(
     ]
 )
 _HOST_COUNTS = ("fetches", "content", "heavy", "refused", "errors", "error_pages")
-_HOSTS_SCHEMA = pa.schema([("host", pa.string())] + [(name, pa.int64()) for name in _HOST_COUNTS])
+# sitemap_read_at: when its robots.txt and sitemaps were last read (null: never; absent from files saved before sitemaps were read).
+_HOSTS_SCHEMA = pa.schema([("host", pa.string())] + [(name, pa.int64()) for name in _HOST_COUNTS] + [("sitemap_read_at", _TS)])
 
 _LINES_SCHEMA = pa.schema(
     [
@@ -289,6 +297,7 @@ class Frontier:
         self._hosts: Dict[str, Dict[str, int]] = {
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
         }
+        self.sitemap_read: Dict[str, dt.datetime] = {row["host"]: row["sitemap_read_at"] for row in (hosts or []) if row.get("sitemap_read_at")}
         # Lines saved before 2026-11-11 may carry status "frozen", since_thaw and frozen_at: every line is active, and those are dropped on save.
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
         for line in self._lines.values():
@@ -389,7 +398,9 @@ class Frontier:
     def save(self, workdir: Path) -> List[Tuple[Path, str]]:
         out = Path(workdir) / "state-out"
         out.mkdir(parents=True, exist_ok=True)
-        host_rows = [{"host": host, **self._hosts[host]} for host in sorted(self._hosts)]
+        zero = dict.fromkeys(_HOST_COUNTS, 0)
+        host_rows = [{"host": host, **self._hosts.get(host, zero), "sitemap_read_at": self.sitemap_read.get(host)}
+                     for host in sorted(set(self._hosts) | set(self.sitemap_read))]
         files: List[Tuple[Path, str]] = []
         for remote, schema, rows in (
             (FRONTIER_PATH, _FRONTIER_SCHEMA, [self._entries[url] for url in sorted(self._entries)]),
@@ -562,6 +573,34 @@ class Frontier:
                 if self._add(url, seed.id, seed.id, 0, 1.0, now):
                     self._host_line.setdefault(urlsplit(url).netloc, seed.id)
                     added += 1
+        return added
+
+    def sitemap_sites(self, seeds: Sequence[Seed], today: dt.date, now: dt.datetime) -> Dict[str, str]:
+        """host -> origin of each site whose sitemaps are due: an active seed's starting sites and the sites with a line on a
+        registered domain steered above 1, not read in the last SITEMAP_EVERY. A site steered to 0 is not fetched from."""
+        sites: Dict[str, str] = {}
+        for url in (url for seed in seeds if seed.active(today) for url in seed.urls):
+            parts = urlsplit(url)
+            sites.setdefault(parts.netloc, f"{parts.scheme}://{parts.netloc}")
+        for host in self._host_line:
+            if self.factor(host) > 1:
+                sites.setdefault(host, f"https://{host}")   # shortcut: https assumed; an http-only site fails and is counted
+        return {host: origin for host, origin in sorted(sites.items()) if self.factor(host) > 0
+                and (host not in self.sitemap_read or now - self.sitemap_read[host] >= SITEMAP_EVERY)}
+
+    def add_sitemap(self, host: str, entries: Sequence[Tuple[str, str]], now: dt.datetime) -> int:
+        """Queue up to SITEMAP_MAX_URLS URLs the queue has not seen from a site's sitemap entries (url, lastmod), newest first,
+        as ordinary links: of the line covering their host (else the site's), one step from its start, at DEFAULT_LINK_BASE.
+        URLs off the site's registered domain are ignored. Returns how many were queued."""
+        domain = registered_domain(host)
+        added = 0
+        for url, _ in newest_first(list(entries)):
+            if added >= SITEMAP_MAX_URLS:
+                break
+            url_host = urlsplit(url).netloc
+            line_id = self._host_line.get(url_host) or self._host_line.get(host)
+            if line_id is not None and registered_domain(url_host) == domain:
+                added += self._add(url, self._lines[line_id]["seed_id"], line_id, 1, DEFAULT_LINK_BASE, now)
         return added
 
     def add_links(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> int:
@@ -1062,9 +1101,12 @@ async def crawl(
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     clock: Callable[[], float] = time.monotonic,
     steer: Optional[Dict[str, float]] = None,
+    sitemaps: Optional[Callable[[str], Awaitable[Tuple[List[Tuple[str, str]], int, int]]]] = None,
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
+    sitemaps: HarvesterCascade.sitemap_entries, or None to read none. Before the first take, each site sitemap_sites()
+    finds due has its sitemaps read and add_sitemap() queues what they list; a failure is counted and the crawl goes on.
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -1079,7 +1121,7 @@ async def crawl(
     workdir = Path(workdir)
     # Wall-clock seconds by phase, for the run record. time.monotonic, not `clock`, which only drives the deadline.
     began = time.monotonic()
-    seconds: Dict[str, float] = dict.fromkeys(("load_state", "take", "fetching", "judge_wait", "final_save"), 0.0)
+    seconds: Dict[str, float] = dict.fromkeys(("load_state", "sitemaps", "take", "fetching", "judge_wait", "final_save"), 0.0)
     with timed(seconds, "load_state"):
         frontier = Frontier.load(store, workdir, rng_seed=now().strftime("%Y-%m-%dT%H"))   # the run's start hour: re-tests reproducible
     frontier.steer(steer or {})
@@ -1090,6 +1132,8 @@ async def crawl(
     stored_by_seed = {seed.id: 0 for seed in seeds}
     seed_url_problems: Dict[str, str] = {}
     seed_url_redirects: Dict[str, str] = {}   # a starting URL -> the other site it was sent to
+    starting = {url for seed in seeds for url in seed.urls}
+    read = dict.fromkeys(("sitemap_sites_read", "sitemaps_read", "sitemap_failures", "sitemap_urls_queued"), 0)
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered", "steered_down", "steered_up"), 0)
     by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
@@ -1117,13 +1161,13 @@ async def crawl(
         frontier.mark(entry, row, None, now())
         links_added += frontier.add_links(entry, row, None, now())
         kind(entry["url"])["stored"] += row["outcome"] == "stored"   # as the engine counts stored
-        if entry["parent_fetch_id"] is None:  # a seed's own starting URL
+        if entry["url"] in starting:
             final = urlsplit(normalise(row.get("url_final") or "")).netloc
             if final and registered_domain(final) != registered_domain(entry["host"]):
                 seed_url_redirects[entry["url"]] = final
         if row["outcome"] == "stored" and not row["block_marker"] and not thin(row):
             stored_by_seed[entry["seed_id"]] = stored_by_seed.get(entry["seed_id"], 0) + 1
-        elif entry["parent_fetch_id"] is None:
+        elif entry["url"] in starting:
             if not row["block_marker"] and thin(row):
                 problem = f"thin page: {row.get('word_count') or 0} words"
             else:
@@ -1203,6 +1247,26 @@ async def crawl(
             finally:
                 counts["in_flight"] -= 1
 
+    async def read_sitemaps() -> None:
+        slots = asyncio.Semaphore(engine.concurrency)
+
+        async def one(host: str, origin: str) -> None:
+            async with slots:
+                if deadline is not None and clock() >= deadline:
+                    return
+                try:
+                    entries, files_read, files_failed = await sitemaps(origin)  # type: ignore[misc]
+                except Exception:
+                    logger.exception("sitemaps not read")
+                    entries, files_read, files_failed = [], 0, 1
+            frontier.sitemap_read[host] = now()
+            read["sitemap_sites_read"] += 1
+            read["sitemaps_read"] += files_read
+            read["sitemap_failures"] += files_failed
+            read["sitemap_urls_queued"] += frontier.add_sitemap(host, entries, now())
+
+        await asyncio.gather(*(one(host, origin) for host, origin in frontier.sitemap_sites(seeds, now().date(), now()).items()))
+
     done = asyncio.Event()
 
     async def uploads() -> None:
@@ -1224,6 +1288,9 @@ async def crawl(
     workers: List[asyncio.Task] = []
     abandoned = 0
     try:
+        with timed(seconds, "sitemaps"):
+            if sitemaps is not None:
+                await read_sitemaps()
         with timed(seconds, "fetching"):
             workers = [asyncio.create_task(worker()) for _ in range(engine.concurrency)]
             await asyncio.gather(*workers)
@@ -1256,7 +1323,7 @@ async def crawl(
             "lines_active": len(frontier._lines), "lines_spawned": frontier.spawned, "inbound_lifts": frontier.lifts,
             "lines_lifted": len(frontier.lines_lifted), "fetches_by_generation": by_generation,
             "fetches_by_host_page": by_host_page, "fetches_new_domain_share": frontier.new_domain_takes,
-            "seed_urls_requeued": frontier.seed_urls_requeued,
+            "seed_urls_requeued": frontier.seed_urls_requeued, **read,
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,

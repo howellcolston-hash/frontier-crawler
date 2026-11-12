@@ -44,14 +44,15 @@ Parquet shards in the store, in folders by the UTC day the fetching run started 
 | `ocr_text` | scanned PDF read with Tesseract |
 | `judgement_calls`, `judgements` | Jev call about a document, and each answer in it |
 
-Crawl state (`state/`) holds the queue, lines, hosts, what each URL last served, the set of stored body hashes and Jev spend.
+Crawl state (`state/`) holds the queue, lines, hosts (with when their sitemaps were last read), what each URL last served, the set of stored body hashes and Jev spend.
 
 ## Logs
 
 A run prints counts only. What it fetched, and anything that went wrong, is written to the store as `runs/<run id>.json`. Among its fields:
 
 - `seed_url_problems`: starting URLs that served nothing, a block page or a thin page (HTML under 20 words, such as an outage notice). Each is tried again in the next run. A thin page counts as no content in its line's yield.
-- `seed_url_redirects`: starting URLs that were sent to another site, with the site they ended on. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
+- `seed_url_redirects`: starting URLs that were sent to another site, with the site they ended on.
+- `sitemap_sites_read`, `sitemaps_read`, `sitemap_failures`, `sitemap_urls_queued`: a seed's starting sites, and sites on a domain steered above 1, have their `robots.txt` and the sitemaps it names (else `/sitemap.xml`) read at most once a week; up to 500 new URLs a site, newest first, join the queue as ordinary links. This only finds pages: `robots.txt` rules are not applied. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
 
 ## Tests
 

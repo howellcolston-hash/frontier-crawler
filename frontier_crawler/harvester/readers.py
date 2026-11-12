@@ -7,6 +7,7 @@ Input contract:
     pool.close()                    # kills the workers: at the end of a run, and on error
 pool.run raises ReaderFailed when the call's worker died twice or ran past the limit; other exceptions from the
 reader come back as they were raised. The functions sent must be importable at module level.
+read_sitemap reads a sitemap (an index or a URL set, gzipped or not) in a worker too; robots_sitemaps and newest_first are plain text.
 This module imports only the standard library, trafilatura and lxml (pypdfium2 when a PDF is read), so workers stay small.
 """
 
@@ -14,11 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import datetime as dt
 import faulthandler
 import html as html_module
 import multiprocessing
 import re
 import time
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -32,6 +35,7 @@ HTML_SECONDS = 60.0             # PROVISIONAL: a worker reading one HTML or JSON
 MARGIN_SECONDS = 30.0           # PROVISIONAL: past a reader's own time limit (PDF text) before its worker is killed
 MAX_LINKS_PER_PAGE = 300        # PROVISIONAL: links kept from one page, in page order
 MAX_TITLE_CHARS = 300           # PROVISIONAL: a page title is cut to this many characters
+MAX_SITEMAP_BYTES = 50_000_000  # PROVISIONAL: a gzipped sitemap is read up to this size unpacked (the sitemap protocol's own limit)
 
 Links = Tuple[List[Tuple[str, str]], List[str]]
 
@@ -143,6 +147,51 @@ def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], 
     # From the decoded text, so a page in a legacy encoding gets its title in it.
     found = re.search(r"<title(?:\s[^>]*)?>(.*?)</title\s*>", html, re.I | re.S)
     return text, encoding, extract_links(body, url), title_of(html_module.unescape(found.group(1))) if found else None
+
+
+def robots_sitemaps(body: bytes) -> List[str]:
+    """The sitemaps a robots.txt names, in order, normalised. Plain line splitting: nothing here parses markup."""
+    found: List[str] = []
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        name, _, value = line.partition(":")
+        url = normalise(value) if name.strip().lower() == "sitemap" else ""
+        if url and url not in found:
+            found.append(url)
+    return found
+
+
+def read_sitemap(body: bytes) -> Tuple[str, List[Tuple[str, str]]]:
+    """("index" or "urlset", [(normalised loc, lastmod or "")]) of a sitemap, gzipped or not. Raises ValueError for anything else."""
+    from lxml import etree
+
+    if body[:2] == b"\x1f\x8b":
+        body = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, MAX_SITEMAP_BYTES)   # what is past the limit is dropped
+    # No entities, no network, no huge trees; recover reads what it can of a cut or sloppy file.
+    root = etree.fromstring(body, etree.XMLParser(recover=True, resolve_entities=False, no_network=True))
+    kind = etree.QName(root).localname if root is not None and isinstance(root.tag, str) else ""
+    if kind not in ("sitemapindex", "urlset"):
+        raise ValueError("not a sitemap")
+    item_name = "sitemap" if kind == "sitemapindex" else "url"
+    entries = []
+    for item in root:
+        if isinstance(item.tag, str) and etree.QName(item).localname == item_name:
+            fields = {etree.QName(field).localname: (field.text or "").strip() for field in item if isinstance(field.tag, str)}
+            url = normalise(fields.get("loc", ""))
+            if url:
+                entries.append((url, fields.get("lastmod", "")))
+    return ("index" if kind == "sitemapindex" else "urlset"), entries
+
+
+def newest_first(entries: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """(url, lastmod) entries with a lastmod newest first, then those without one (or with one that does not parse), in their order."""
+    def key(entry: Tuple[str, str]) -> Tuple[int, float]:
+        try:
+            when = dt.datetime.fromisoformat(entry[1].replace("Z", "+00:00"))
+        except ValueError:
+            return 1, 0.0
+        return 0, -(when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+    return sorted(entries, key=key)
 
 
 def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str], Optional[str]]:

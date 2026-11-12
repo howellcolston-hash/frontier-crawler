@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import pytest
@@ -184,6 +184,46 @@ def test_pdf_reading_stops_at_the_time_limit_and_says_so(monkeypatch: pytest.Mon
 def test_a_damaged_pdf_is_still_stored() -> None:
     result = _fetch(lambda request: httpx.Response(200, content=b"%PDF-1.4 broken", headers={"content-type": "application/pdf"}))
     assert result.raw_payload == b"%PDF-1.4 broken" and result.error_message.startswith("pdf not read")
+
+
+def _sitemaps(files: Dict[str, bytes], origin: str = "https://a.test") -> Any:
+    async def run() -> Any:
+        served = lambda request: httpx.Response(200, content=files[str(request.url)]) if str(request.url) in files else httpx.Response(404)  # noqa: E731
+        async with HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(served))) as fetcher:
+            return await fetcher.sitemap_entries(origin)
+
+    return asyncio.run(run())
+
+
+def _urlset(*urls: str) -> bytes:
+    return ("<urlset>" + "".join(f"<url><loc>{url}</loc></url>" for url in urls) + "</urlset>").encode()
+
+
+def test_sitemaps_come_from_robots_or_the_default_path_and_indexes_are_followed_one_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gzip
+
+    index = lambda *locs: ("<sitemapindex>" + "".join(f"<sitemap><loc>{loc}</loc><lastmod>{mod}</lastmod></sitemap>" for loc, mod in locs) + "</sitemapindex>").encode()  # noqa: E731
+    files = {
+        "https://a.test/robots.txt": b"User-agent: *\nDisallow: /\nSitemap: https://a.test/index.xml\nSitemap: https://a.test/bad.xml\n",
+        "https://a.test/index.xml": index(("https://a.test/old.xml", "2025-01-01"), ("https://a.test/new.xml.gz", "2026-11-01"), ("https://a.test/deeper.xml", "")),
+        "https://a.test/bad.xml": b"<html>not a sitemap</html>",
+        "https://a.test/new.xml.gz": gzip.compress(_urlset("https://a.test/n1", "https://a.test/n2")),
+        "https://a.test/old.xml": _urlset("https://a.test/o1"),
+        "https://a.test/deeper.xml": index(("https://a.test/never.xml", "")),   # an index inside an index: not followed
+    }
+    entries, read, failed = _sitemaps(files)
+    assert [url for url, _ in entries] == ["https://a.test/n1", "https://a.test/n2", "https://a.test/o1"] and (read, failed) == (4, 1)
+    # No robots.txt (or one naming no sitemap): /sitemap.xml. Nothing there either: one failure, no exception.
+    assert _sitemaps({"https://b.test/sitemap.xml": _urlset("https://b.test/x")}, "https://b.test") == ([("https://b.test/x", "")], 1, 0)
+    assert _sitemaps({}, "https://c.test") == ([], 0, 1)
+    # At most MAX_SITEMAP_FILES files a site, the newest an index lists first.
+    monkeypatch.setattr(cascade_module, "MAX_SITEMAP_FILES", 2)
+    entries, read, failed = _sitemaps(files)
+    assert [url for url, _ in entries] == [] and (read, failed) == (1, 1)
+    del files["https://a.test/bad.xml"]
+    files["https://a.test/robots.txt"] = b"Sitemap: https://a.test/index.xml\n"
+    entries, read, failed = _sitemaps(files)
+    assert [url for url, _ in entries] == ["https://a.test/n1", "https://a.test/n2"] and (read, failed) == (2, 0)
 
 
 @pytest.mark.parametrize("url", ["http://localhost:8080/admin", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/", "http://[::1]/", "http://db.internal/"])

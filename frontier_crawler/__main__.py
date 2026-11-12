@@ -120,7 +120,8 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         steer, steer_ignored = _steer(store, Path(workdir))
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=HostThrottle(args.min_interval)) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
-            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer)
+            stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
+                                sitemaps=cascade.sitemap_entries)
     stats["steer_file_ignored"] = steer_ignored
     _report(ctx, stats)
     if stats["errors"] or stats["seeds_with_nothing"]:

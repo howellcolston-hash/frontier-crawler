@@ -12,8 +12,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from frontier_crawler import frontier as frontier_module
 from frontier_crawler.frontier import (
-    DOMAIN_HALF, GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl,
+    DEFAULT_LINK_BASE, DOMAIN_HALF, GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl,
     fetch_yield, link_base, load_seeds, registered_domain,
 )
 from frontier_crawler.harvester.readers import extract_links, normalise
@@ -174,7 +175,7 @@ def test_host_counts_record_what_fetching_took(tmp_path: Path) -> None:
     store.put_many(frontier.save(tmp_path / "w"), "state")
     import pyarrow.parquet as pq
     (host,) = pq.read_table(tmp_path / "store" / "state" / "hosts.parquet").to_pylist()
-    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1}
+    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1, "sitemap_read_at": None}
     assert frontier.line("s")["content"] == 2
 
 
@@ -480,6 +481,55 @@ def test_a_thin_starting_page_is_reported_and_tried_again_and_a_redirect_to_anot
     assert second["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"}
 
 
+def test_a_sitemap_queues_the_newest_urls_the_queue_has_not_seen_as_ordinary_links(monkeypatch: Any) -> None:
+    monkeypatch.setattr(frontier_module, "SITEMAP_MAX_URLS", 3)
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://www.a.example.com/"), _seed("t", "https://docs.a.example.com/")], NOW)
+    entries = [("https://www.a.example.com/", "2026-11-09"), ("https://www.a.example.com/old", "2025-01-01"),
+               ("https://other.example.org/x", "2026-11-09"), ("https://docs.a.example.com/d", "2026-10-01"),
+               ("https://www.a.example.com/undated", ""), ("https://new.a.example.com/n", "2026-11-08"),
+               ("https://www.a.example.com/newest", "2026-11-09T12:00:00Z")]
+    assert frontier.add_sitemap("www.a.example.com", entries, NOW) == 3   # the seed URL is known; other.example.org is off the site
+    queued = {url: (e["line_id"], e["hops"], e["base"], e["crossing"]) for url, e in frontier._entries.items() if e["parent_fetch_id"] is None and e["hops"]}
+    assert queued == {"https://www.a.example.com/newest": ("s", 1, DEFAULT_LINK_BASE, False),
+                      "https://new.a.example.com/n": ("s", 1, DEFAULT_LINK_BASE, False),     # a host with no line: the site's
+                      "https://docs.a.example.com/d": ("t", 1, DEFAULT_LINK_BASE, False)}    # a host with its own line: that one
+    # Without a seed there, a site is read when its registered domain is steered above 1.
+    assert frontier.sitemap_sites([], NOW.date(), NOW) == {}
+    frontier.steer({"example.com": 1.5})
+    assert frontier.sitemap_sites([], NOW.date(), NOW) == {"docs.a.example.com": "https://docs.a.example.com", "www.a.example.com": "https://www.a.example.com"}
+
+
+def test_a_crawl_reads_due_sitemaps_once_a_week_and_a_failure_does_not_stop_it(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", "https://a.test/from-map": "", "https://b.example.com/": "", "https://b.example.com/m": ""})
+    store = LocalStore(tmp_path / "store")
+    read: List[str] = []
+
+    async def sitemaps(origin: str) -> Any:
+        read.append(origin)
+        if origin == "https://down.test":
+            raise RuntimeError("unreachable")
+        return [(origin + ("/from-map" if origin == "https://a.test" else "/m"), "")], 2, 1
+
+    seeds = [_seed("a", "https://a.test/"), _seed("down", "https://down.test/"), _seed("b", "https://b.example.com/")]
+
+    def go(run: str, when: dt.datetime, steer: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: when, sitemaps=sitemaps, steer=steer))
+
+    first = go("r1", NOW, steer={"example.com": 0.0})   # a site steered to 0 is not read
+    assert sorted(read) == ["https://a.test", "https://down.test"] and "https://a.test/from-map" in site.fetched
+    assert (first["sitemap_sites_read"], first["sitemaps_read"], first["sitemap_failures"], first["sitemap_urls_queued"]) == (2, 2, 2, 1)
+    assert "https://a.test/from-map" not in first["seed_url_problems"] and first["stored"] == 2
+    read.clear()
+    second = go("r2", NOW + dt.timedelta(days=6), steer={"example.com": 2.0})   # read last run: not due; b.example.com now due
+    assert read == ["https://b.example.com"] and second["sitemap_urls_queued"] == 1
+    read.clear()
+    third = go("r3", NOW + dt.timedelta(days=7))
+    assert sorted(read) == ["https://a.test", "https://down.test"] and third["sitemap_urls_queued"] == 0   # nothing new to queue
+    assert Frontier.load(store, tmp_path / "w").sitemap_read["a.test"] == NOW + dt.timedelta(days=7)
+
+
 def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path: Path) -> None:
     site = FakeSite({
         "https://a.test/": '<a href="https://b.test/">b</a>',
@@ -531,7 +581,7 @@ def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
     seconds = stats["seconds"]
-    assert set(seconds) == {"load_state", "take", "fetching", "judge_wait", "final_save", "total"}
+    assert set(seconds) == {"load_state", "sitemaps", "take", "fetching", "judge_wait", "final_save", "total"}
     assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
     assert stats["slot_seconds"]["waiting"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
     assert stats["workers"] == 4 and 1 <= stats["peak_in_flight"] <= 2   # one host: at most MAX_IN_FLIGHT_PER_HOST at once
