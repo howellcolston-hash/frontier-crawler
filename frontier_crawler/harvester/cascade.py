@@ -2,7 +2,8 @@
 
 Input contract: result = await cascade.fetch(url, timeout=None). Network and parse failures come back
 in the result; result.timed_out says the page timed out with nothing served. Only BlockedAddress is
-raised, for a URL the engine must never request. Fetched bytes are read in worker processes (readers.py);
+raised, for a URL the engine must never request.
+entries, read, failed = await cascade.sitemap_entries(origin): the (url, lastmod) pairs a site's sitemaps list. Never raises. Fetched bytes are read in worker processes (readers.py);
 close the cascade (async with) to stop them.
 """
 
@@ -16,7 +17,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import certifi
@@ -45,6 +46,7 @@ BROWSER_HUNG_SECONDS = 120.0
 TIMEOUT_SECONDS = 30.0  # PROVISIONAL: HTTP read and browser page-load timeout, unless a call asks for another
 CONNECT_SECONDS = 10.0  # PROVISIONAL: a host that will not accept a connection this fast is dead or dropping us
 NETWORK_IDLE_SECONDS = 6.0  # PROVISIONAL: after the page has loaded, how long the browser waits for its requests to settle
+MAX_SITEMAP_FILES = 10  # PROVISIONAL: sitemap files fetched per site per read, those robots.txt names and those their indexes list together
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class ScrapeResult:
     timed_out: bool = False  # nothing was served because the request or the page load timed out
     throttle_wait: float = 0.0  # seconds this fetch waited for its host's turn
     links: Optional[Links] = None  # (links, unparseable hrefs) of an HTML page, as its reader found them
+    title: Optional[str] = None  # an HTML page's <title>, a PDF's metadata title
 
 
 @contextlib.contextmanager
@@ -296,9 +299,9 @@ class HarvesterCascade:
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
             rendered = await self._browser(url, result.error_message, result.http_status, timeout, waited)
         if rendered.raw_payload:
-            # Links only: the browser gave the text. Without them the page is still stored.
+            # Links and title only: the browser gave the text. Without them the page is still stored.
             with contextlib.suppress(Exception), timed(self.timings, "extract_html"):
-                rendered.links = (await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url))[2]
+                _, _, rendered.links, rendered.title = await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url)
             return rendered
         # The browser got nothing. Keep what the plain request was served.
         result.error_message = rendered.error_message
@@ -323,8 +326,8 @@ class HarvesterCascade:
             result.too_large_bytes = size
             return result, False
 
-        def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None) -> ScrapeResult:
-            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links)
+        def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None, title: Optional[str] = None) -> ScrapeResult:
+            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links, title=title)
 
         def undecoded(encoding: Optional[str]) -> Optional[str]:
             """Count a page read in a legacy encoding; the note when no encoding fit."""
@@ -341,21 +344,65 @@ class HarvesterCascade:
         if "application/pdf" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".pdf"):
             try:
                 with timed(self.timings, "pdf_text"):  # the round trip to a reader process
-                    text, note = await self._readers.run(PDF_SECONDS + readers.MARGIN_SECONDS, self.read_pdf, body, PDF_SECONDS)
+                    text, note, title = await self._readers.run(PDF_SECONDS + readers.MARGIN_SECONDS, self.read_pdf, body, PDF_SECONDS)
             except Exception as exc:  # encrypted, damaged, not a PDF at all, or the reader crashed or hung
                 return served(None, "PDF", f"pdf not read: {exc}"), False
-            return served(text, "PDF", note), False
+            return served(text, "PDF", note, title=title), False
         try:
             with timed(self.timings, "extract_html"):  # the round trip to a reader process: decoding, text and links
-                text, encoding, links = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
+                text, encoding, links, title = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
             note = undecoded(encoding)
         except Exception as exc:  # the reader crashed or hung: the page is kept, without text or links, and not rendered
             return served(None, "DOM_TRAFILATURA", f"html not read: {exc}"), False
         words = word_count(text or "")
         shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
         if (status == 200 and shell) or status in _BROWSER_RETRY_STATUS:
-            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links), True
-        return served(text, "DOM_TRAFILATURA", note, links), False
+            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links, title), True
+        return served(text, "DOM_TRAFILATURA", note, links, title), False
+
+    async def get(self, url: str) -> Tuple[int, bytes]:
+        """One plain GET through the throttle and the address guard, for a file the crawl reads itself: no tiers, nothing
+        read. The body is b"" when it is over MAX_BYTES."""
+        check_public(url)
+        if self._throttle is not None:
+            await self._throttle.wait(url)
+        async with self._http_client().stream("GET", url) as response:
+            body, _ = await read_capped(response)
+        return response.status_code, body or b""
+
+    async def sitemap_entries(self, origin: str) -> Tuple[List[Tuple[str, str]], int, int]:
+        """(url, lastmod) from the sitemaps the robots.txt of origin ("https://host") names, or from /sitemap.xml when it names
+        none, following sitemap indexes one level (the newest sitemaps they list first); then how many sitemap files were read and how many failed.
+        At most MAX_SITEMAP_FILES files are fetched. Only discovery: robots.txt rules are not read."""
+        try:
+            status, body = await self.get(origin + "/robots.txt")
+            files = readers.robots_sitemaps(body) if status == 200 else []
+        except Exception:
+            files = []
+        entries: List[Tuple[str, str]] = []
+        counts = [0, 0]
+
+        async def read(url: str) -> Tuple[str, List[Tuple[str, str]]]:
+            try:
+                status, body = await self.get(url)
+                if status != 200 or not body:
+                    raise ValueError(f"status {status}")
+                found = await self._readers.run(readers.HTML_SECONDS, readers.read_sitemap, body)
+            except Exception:  # unreachable, refused, not a sitemap, or its reader crashed or hung
+                counts[1] += 1
+                return "", []
+            counts[0] += 1
+            return found
+
+        children: List[Tuple[str, str]] = []
+        for url in (files or [origin + "/sitemap.xml"])[:MAX_SITEMAP_FILES]:
+            kind, found = await read(url)
+            (children if kind == "index" else entries).extend(found)
+        for url, _ in readers.newest_first(children)[:MAX_SITEMAP_FILES - sum(counts)]:
+            kind, found = await read(url)
+            if kind == "urlset":   # one level: an index listed by an index is not followed
+                entries.extend(found)
+        return entries, counts[0], counts[1]
 
     async def _browser(
         self, url: str, prior_note: Optional[str], prior_status: int, timeout: Optional[float] = None, waited: Optional[Dict[str, float]] = None,

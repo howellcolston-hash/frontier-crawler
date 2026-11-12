@@ -6,14 +6,16 @@ import asyncio
 import dataclasses
 import datetime as dt
 import heapq
+import json
 import math
 import random
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from frontier_crawler import frontier as frontier_module
 from frontier_crawler.frontier import (
-    DOMAIN_HALF, GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl,
+    DEFAULT_LINK_BASE, DOMAIN_HALF, GENERATION_DECAY, HOP_DECAY, HOST_HALF, HOST_ROUND_SHARE, MAX_IN_FLIGHT_PER_HOST, NEW_DOMAIN_SHARE, RETEST_SHARE, Frontier, Seed, crawl,
     fetch_yield, link_base, load_seeds, registered_domain,
 )
 from frontier_crawler.harvester.readers import extract_links, normalise
@@ -21,6 +23,7 @@ from frontier_crawler.judge import questions as judging
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 from frontier_crawler.harvester.cascade import ScrapeResult
+import pyarrow.parquet as pq
 
 NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
 TEXT = "The port authority published the berth schedule and the tariff for bulk cargo. " * 12
@@ -48,7 +51,7 @@ def test_links_are_absolute_distinct_and_skip_assets_and_share_buttons() -> None
 
 
 def _content(url: str = "", tier: str = "DOM_TRAFILATURA") -> Dict[str, Any]:
-    return {"outcome": "stored", "http_status": 200, "url_final": url, "tier_used": tier}
+    return {"outcome": "stored", "http_status": 200, "url_final": url, "tier_used": tier, "word_count": 100}
 
 
 DEAD = {"outcome": "error_page", "http_status": 404, "block_marker": "http 404"}
@@ -174,7 +177,7 @@ def test_host_counts_record_what_fetching_took(tmp_path: Path) -> None:
     store.put_many(frontier.save(tmp_path / "w"), "state")
     import pyarrow.parquet as pq
     (host,) = pq.read_table(tmp_path / "store" / "state" / "hosts.parquet").to_pylist()
-    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1}
+    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1, "sitemap_read_at": None}
     assert frontier.line("s")["content"] == 2
 
 
@@ -388,6 +391,12 @@ def test_a_starting_url_is_retried_on_its_own_record_not_its_seeds(tmp_path: Pat
     again.mark(again.entry("https://a.test/main"), {**_content(), "block_marker": "captcha"}, None, NOW)
     again.add_seeds([seed], NOW)
     assert again.entry("https://a.test/main")["status"] == "queued" and again.seed_urls_requeued == 4
+    # Nor is a thin page (a maintenance notice), served new or unchanged.
+    for outcome in ("stored", "unchanged"):
+        again.mark(again.entry("https://a.test/main"), {**_content(), "outcome": outcome, "word_count": 6}, None, NOW)
+        again.add_seeds([seed], NOW)
+        assert again.entry("https://a.test/main")["status"] == "queued"
+    assert again.seed_urls_requeued == 6
 
 
 class FakeSite:
@@ -446,6 +455,138 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     assert deep["parent_fetch_id"] == rows["https://a.test/one"]["fetch_id"]        # every row says which fetch led to it
 
 
+def test_a_thin_starting_page_is_reported_and_tried_again_and_a_redirect_to_another_site_is_recorded(tmp_path: Path) -> None:
+    class Site:
+        fetched: list = []
+
+        async def fetch(self, url: str) -> ScrapeResult:
+            self.fetched.append(url)
+            if url == "https://down.test/":
+                return ScrapeResult(url, 200, b"<html>Down for maintenance</html>", "Down for maintenance", 3, "DOM_TRAFILATURA", None, "text/html", links=([], []))
+            final = {"https://old.test/": "https://www.moved.test/home", "https://www.ok.example.com/": "https://ok.example.com/"}.get(url, url)
+            body = f"<html><p>{TEXT}</p>{url}</html>".encode()
+            return ScrapeResult(final, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html", links=([], []))
+
+    site, store = Site(), LocalStore(tmp_path / "store")
+    seeds = [_seed("down", "https://down.test/"), _seed("old", "https://old.test/"), _seed("ok", "https://www.ok.example.com/")]
+
+    def go(run: str) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW))
+
+    first = go("r1")
+    assert first["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"} and first["seeds_with_nothing"] == ["down"]
+    assert first["stored_by_seed"] == {"down": 0, "old": 1, "ok": 1}
+    assert first["seed_url_redirects"] == {"https://old.test/": "www.moved.test"}   # a subdomain to its registered domain stays on the site
+    second = go("r2")
+    assert site.fetched[3:] == ["https://down.test/"] and second["seed_urls_requeued"] == 1
+    assert second["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"}
+
+
+def test_a_sitemap_queues_the_newest_urls_the_queue_has_not_seen_as_ordinary_links(monkeypatch: Any) -> None:
+    monkeypatch.setattr(frontier_module, "SITEMAP_MAX_URLS", 3)
+    frontier = Frontier()
+    frontier.add_seeds([_seed("s", "https://www.a.example.com/"), _seed("t", "https://docs.a.example.com/")], NOW)
+    entries = [("https://www.a.example.com/", "2026-11-09"), ("https://www.a.example.com/old", "2025-01-01"),
+               ("https://other.example.org/x", "2026-11-09"), ("https://docs.a.example.com/d", "2026-10-01"),
+               ("https://www.a.example.com/undated", ""), ("https://new.a.example.com/n", "2026-11-08"),
+               ("https://www.a.example.com/newest", "2026-11-09T12:00:00Z")]
+    assert frontier.add_sitemap("www.a.example.com", entries, NOW) == 3   # the seed URL is known; other.example.org is off the site
+    queued = {url: (e["line_id"], e["hops"], e["base"], e["crossing"]) for url, e in frontier._entries.items() if e["parent_fetch_id"] is None and e["hops"]}
+    assert queued == {"https://www.a.example.com/newest": ("s", 1, DEFAULT_LINK_BASE, False),
+                      "https://new.a.example.com/n": ("s", 1, DEFAULT_LINK_BASE, False),     # a host with no line: the site's
+                      "https://docs.a.example.com/d": ("t", 1, DEFAULT_LINK_BASE, False)}    # a host with its own line: that one
+    # Without a seed there, a site is read when its registered domain is steered above 1.
+    assert frontier.sitemap_sites([], NOW.date(), NOW) == {}
+    frontier.steer({"example.com": 1.5})
+    assert frontier.sitemap_sites([], NOW.date(), NOW) == {"docs.a.example.com": "https://docs.a.example.com", "www.a.example.com": "https://www.a.example.com"}
+
+
+def test_a_crawl_reads_due_sitemaps_once_a_week_and_a_failure_does_not_stop_it(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", "https://a.test/from-map": "", "https://b.example.com/": "", "https://b.example.com/m": ""})
+    store = LocalStore(tmp_path / "store")
+    read: List[str] = []
+
+    async def sitemaps(origin: str) -> Any:
+        read.append(origin)
+        if origin == "https://down.test":
+            raise RuntimeError("unreachable")
+        return [(origin + ("/from-map" if origin == "https://a.test" else "/m"), "")], 2, 1
+
+    seeds = [_seed("a", "https://a.test/"), _seed("down", "https://down.test/"), _seed("b", "https://b.example.com/")]
+
+    def go(run: str, when: dt.datetime, steer: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: when, sitemaps=sitemaps, steer=steer))
+
+    first = go("r1", NOW, steer={"example.com": 0.0})   # a site steered to 0 is not read
+    assert sorted(read) == ["https://a.test", "https://down.test"] and "https://a.test/from-map" in site.fetched
+    assert (first["sitemap_sites_read"], first["sitemaps_read"], first["sitemap_failures"], first["sitemap_urls_queued"]) == (2, 2, 2, 1)
+    assert "https://a.test/from-map" not in first["seed_url_problems"] and first["stored"] == 2
+    read.clear()
+    second = go("r2", NOW + dt.timedelta(days=6), steer={"example.com": 2.0})   # read last run: not due; b.example.com now due
+    assert read == ["https://b.example.com"] and second["sitemap_urls_queued"] == 1
+    read.clear()
+    third = go("r3", NOW + dt.timedelta(days=7))
+    assert sorted(read) == ["https://a.test", "https://down.test"] and third["sitemap_urls_queued"] == 0   # nothing new to queue
+    assert Frontier.load(store, tmp_path / "w").sitemap_read["a.test"] == NOW + dt.timedelta(days=7)
+
+
+def test_watched_pages_are_read_when_due_and_a_changed_one_queues_its_new_links(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", "https://a.test/notices": '<a href="/n/1">1</a>', "https://a.test/n/1": "", "https://a.test/n/2": ""})
+    store = LocalStore(tmp_path / "store")
+    watch = [{"id": "notices", "url": "https://a.test/notices", "every_hours": 12.0}, {"id": "gone", "url": "https://a.test/gone", "every_hours": 1.0}]
+
+    def go(run: str, hours: float) -> Dict[str, Any]:
+        when = NOW + dt.timedelta(hours=hours)
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
+        site.fetched.clear()
+        return asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / run, max_fetches=10, now=lambda: when, watch=watch))
+
+    def counts(stats: Dict[str, Any]) -> tuple:
+        return tuple(stats[f"watch_{key}"] for key in ("entries", "due", "fetched", "changed", "unchanged", "failed", "links_queued"))
+
+    first = go("r1", 0)
+    assert counts(first) == (2, 2, 2, 1, 0, 1, 1) and site.fetched[:2] == ["https://a.test/notices", "https://a.test/gone"]
+    assert "https://a.test/n/1" in site.fetched                     # its link joined the queue of the site's line
+    rows = [row for path in (tmp_path / "store" / "fetches").rglob("*.parquet") for row in pq.read_table(path).to_pylist()]
+    assert {row["url_requested"]: row["line_id"] for row in rows if row["line_id"].startswith("watch:")} == {
+        "https://a.test/notices": "watch:notices", "https://a.test/gone": "watch:gone"}
+    assert Frontier.load(store, tmp_path / "w1").entry("https://a.test/n/1")["line_id"] == "a"
+    assert counts(go("r2", 6)) == (2, 1, 1, 0, 0, 1, 0)             # read 6 hours ago: not due; the dead one is due hourly
+    assert counts(go("r3", 12)) == (2, 2, 2, 0, 1, 1, 0)            # due, and served the same bytes
+    site.pages["https://a.test/notices"] = '<a href="/n/1">1</a> <a href="/n/2">2</a>'
+    fourth = go("r4", 24)
+    assert counts(fourth) == (2, 2, 2, 1, 0, 1, 1) and "https://a.test/n/2" in site.fetched and "https://a.test/n/1" not in site.fetched
+    times = json.loads((tmp_path / "store" / "state" / "watch.json").read_text())
+    assert times == dict.fromkeys(("https://a.test/gone", "https://a.test/notices"), (NOW + dt.timedelta(hours=24)).isoformat())
+
+
+def test_watched_pages_take_at_most_a_fifth_of_the_fetch_cap_oldest_due_first(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": "", **{f"https://a.test/w{i}": "" for i in range(5)}})
+    store = LocalStore(tmp_path / "store")
+    (tmp_path / "store" / "state").mkdir(parents=True)
+    last = {f"https://a.test/w{i}": (NOW - dt.timedelta(hours=10 - i)).isoformat() for i in (1, 2, 3)}   # w1 the oldest; w0 and w4 never
+    (tmp_path / "store" / "state" / "watch.json").write_text(json.dumps(last))
+    watch = [{"id": f"w{i}", "url": f"https://a.test/w{i}", "every_hours": 1.0} for i in range(5)]
+    engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=14, now=lambda: NOW, watch=watch))
+    assert (stats["watch_due"], stats["watch_fetched"], stats["total"]) == (5, 2, 3)        # floor(14 x 0.2) = 2, and the seed
+    assert site.fetched[:2] == ["https://a.test/w0", "https://a.test/w4"]
+
+
+def test_without_a_watch_file_no_watch_state_is_read_or_written(tmp_path: Path) -> None:
+    class Watching(LocalStore):
+        def get(self, remote: str, local: Path) -> bool:
+            assert remote != "state/watch.json"
+            return super().get(remote, local)
+
+    store = Watching(tmp_path / "store")
+    engine = Engine(store, FakeSite({"https://a.test/": ""}), workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=5, now=lambda: NOW))
+    assert stats["total"] == 1 and stats["watch_entries"] == stats["watch_fetched"] == 0 and not (tmp_path / "store" / "state" / "watch.json").exists()
+
+
 def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path: Path) -> None:
     site = FakeSite({
         "https://a.test/": '<a href="https://b.test/">b</a>',
@@ -497,7 +638,7 @@ def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
     seconds = stats["seconds"]
-    assert set(seconds) == {"load_state", "take", "fetching", "judge_wait", "final_save", "total"}
+    assert set(seconds) == {"load_state", "sitemaps", "take", "fetching", "judge_wait", "final_save", "total"}
     assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
     assert stats["slot_seconds"]["waiting"] >= 0 and stats["fetch_seconds_by_tier"]["DOM_TRAFILATURA"]["n"] == 7
     assert stats["workers"] == 4 and 1 <= stats["peak_in_flight"] <= 2   # one host: at most MAX_IN_FLIGHT_PER_HOST at once
@@ -611,6 +752,9 @@ def test_what_a_fetch_is_worth_to_its_line() -> None:
     assert fetch_yield(DEAD, None) == 0.0
     assert fetch_yield(_content(), None) is None                             # not something Jev reads
     assert fetch_yield(_content(tier="API"), None) is None
+    assert fetch_yield({**_content(), "word_count": 19}, None) == 0.0                 # thin HTML
+    assert fetch_yield({**_content(tier="HEADLESS_PLAYWRIGHT"), "word_count": 0}, None) == 0.0
+    assert fetch_yield({**_content(tier="PDF"), "word_count": 0}, None) is None       # a scan, read later
     assert fetch_yield(_readable(_content()), None) is None                  # Jev would read it but did not
     answers = _Answers(0.4)
     assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
@@ -652,12 +796,16 @@ def test_content_jev_does_not_read_counts_at_the_lines_relevance_and_a_new_line_
     frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
     line = frontier.line("s")
     line.update({"yield": 0.6, "relevance": 0.3})
-    for i, row in enumerate((_content(tier="API"), _content(), {**_readable(_content()), "word_count": 5})):  # data, no text, very short
+    for i, row in enumerate((_content(tier="API"), {**_content(tier="PDF"), "word_count": 0}, _content())):  # data, a scan, unsampled
         frontier._add(f"https://a.test/{i}", "s", "s", 1, 1.0, NOW)
         before = line["yield"]
         frontier.mark(frontier.entry(f"https://a.test/{i}"), row, None, NOW)
         assert line["yield"] == 0.85 * before + 0.15 * 0.3 and line["relevance"] == 0.3
-    assert line["content"] == 3
+    # An HTML page with almost no text (an outage notice, an empty shell) is not content: it counts as a dead link does.
+    frontier._add("https://a.test/thin", "s", "s", 1, 1.0, NOW)
+    before = line["yield"]
+    frontier.mark(frontier.entry("https://a.test/thin"), {**_content(), "word_count": 5}, None, NOW)
+    assert line["yield"] == 0.85 * before and line["content"] == 3
     root = frontier.entry("https://a.test/")
     row = _page_row("https://a.test/", '<a href="https://b.test/">b</a>')
     frontier.mark(root, row, None, NOW)

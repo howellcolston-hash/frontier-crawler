@@ -3,10 +3,11 @@ that crashes or hangs on hostile input costs one page, not the run.
 
 Input contract:
     pool = ReaderPool(counts)       # counts["reader_crashes"], counts["reader_timeouts"] are kept up to date
-    text, encoding, links = await pool.run(HTML_SECONDS, read_html, body, content_type, url)
+    text, encoding, links, title = await pool.run(HTML_SECONDS, read_html, body, content_type, url)
     pool.close()                    # kills the workers: at the end of a run, and on error
 pool.run raises ReaderFailed when the call's worker died twice or ran past the limit; other exceptions from the
 reader come back as they were raised. The functions sent must be importable at module level.
+read_sitemap reads a sitemap (an index or a URL set, gzipped or not) in a worker too; robots_sitemaps and newest_first are plain text.
 This module imports only the standard library, trafilatura and lxml (pypdfium2 when a PDF is read), so workers stay small.
 """
 
@@ -14,10 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import datetime as dt
 import faulthandler
+import html as html_module
 import multiprocessing
 import re
 import time
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -30,6 +34,8 @@ READER_WORKERS = 3              # PROVISIONAL: worker processes reading pages at
 HTML_SECONDS = 60.0             # PROVISIONAL: a worker reading one HTML or JSON body for longer is killed
 MARGIN_SECONDS = 30.0           # PROVISIONAL: past a reader's own time limit (PDF text) before its worker is killed
 MAX_LINKS_PER_PAGE = 300        # PROVISIONAL: links kept from one page, in page order
+MAX_TITLE_CHARS = 300           # PROVISIONAL: a page title is cut to this many characters
+MAX_SITEMAP_BYTES = 50_000_000  # PROVISIONAL: a gzipped sitemap is read up to this size unpacked (the sitemap protocol's own limit)
 
 Links = Tuple[List[Tuple[str, str]], List[str]]
 
@@ -124,33 +130,88 @@ def looks_like_html(content_type: Optional[str], body: bytes) -> bool:
     return not content_type and body.lstrip()[:1] == b"<"
 
 
-def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], Optional[str], Optional[Links]]:
-    """(markdown text, encoding read in, the page's links or None when the bytes do not look like HTML)."""
+def title_of(raw: Any) -> Optional[str]:
+    """A title with its whitespace collapsed, cut to MAX_TITLE_CHARS; None when empty."""
+    return " ".join(str(raw or "").split())[:MAX_TITLE_CHARS] or None
+
+
+def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], Optional[str], Optional[Links], Optional[str]]:
+    """(markdown text, encoding read in, the page's links, its <title>); links and title are None when the bytes do not look like HTML."""
     html, encoding = decode(body, content_type)
     try:
         text = trafilatura.extract(html, output_format="markdown", include_comments=False, include_tables=True)
     except Exception:  # a page trafilatura cannot read is stored without text
         text = None
-    return text, encoding, extract_links(body, url) if looks_like_html(content_type, body) else None
+    if not looks_like_html(content_type, body):
+        return text, encoding, None, None
+    # From the decoded text, so a page in a legacy encoding gets its title in it.
+    found = re.search(r"<title(?:\s[^>]*)?>(.*?)</title\s*>", html, re.I | re.S)
+    return text, encoding, extract_links(body, url), title_of(html_module.unescape(found.group(1))) if found else None
 
 
-def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str]]:
-    """(text of every page, a note when `seconds` ran out first). Scanned pages have no text."""
+def robots_sitemaps(body: bytes) -> List[str]:
+    """The sitemaps a robots.txt names, in order, normalised. Plain line splitting: nothing here parses markup."""
+    found: List[str] = []
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        name, _, value = line.partition(":")
+        url = normalise(value) if name.strip().lower() == "sitemap" else ""
+        if url and url not in found:
+            found.append(url)
+    return found
+
+
+def read_sitemap(body: bytes) -> Tuple[str, List[Tuple[str, str]]]:
+    """("index" or "urlset", [(normalised loc, lastmod or "")]) of a sitemap, gzipped or not. Raises ValueError for anything else."""
+    from lxml import etree
+
+    if body[:2] == b"\x1f\x8b":
+        body = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, MAX_SITEMAP_BYTES)   # what is past the limit is dropped
+    # No entities, no network, no huge trees; recover reads what it can of a cut or sloppy file.
+    root = etree.fromstring(body, etree.XMLParser(recover=True, resolve_entities=False, no_network=True))
+    kind = etree.QName(root).localname if root is not None and isinstance(root.tag, str) else ""
+    if kind not in ("sitemapindex", "urlset"):
+        raise ValueError("not a sitemap")
+    item_name = "sitemap" if kind == "sitemapindex" else "url"
+    entries = []
+    for item in root:
+        if isinstance(item.tag, str) and etree.QName(item).localname == item_name:
+            fields = {etree.QName(field).localname: (field.text or "").strip() for field in item if isinstance(field.tag, str)}
+            url = normalise(fields.get("loc", ""))
+            if url:
+                entries.append((url, fields.get("lastmod", "")))
+    return ("index" if kind == "sitemapindex" else "urlset"), entries
+
+
+def newest_first(entries: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """(url, lastmod) entries with a lastmod newest first, then those without one (or with one that does not parse), in their order."""
+    def key(entry: Tuple[str, str]) -> Tuple[int, float]:
+        try:
+            when = dt.datetime.fromisoformat(entry[1].replace("Z", "+00:00"))
+        except ValueError:
+            return 1, 0.0
+        return 0, -(when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+    return sorted(entries, key=key)
+
+
+def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str], Optional[str]]:
+    """(text of every page, a note when `seconds` ran out first, the title in its metadata). Scanned pages have no text."""
     import pypdfium2
 
     pdf = pypdfium2.PdfDocument(body)
     try:
+        title = title_of(pdf.get_metadata_dict().get("Title"))
         parts = []
         deadline = time.monotonic() + seconds
         for index in range(len(pdf)):
             if time.monotonic() > deadline:
-                return "\n".join(parts), f"text read for the first {index} of {len(pdf)} pages"
+                return "\n".join(parts), f"text read for the first {index} of {len(pdf)} pages", title
             page = pdf[index]
             textpage = page.get_textpage()
             parts.append(textpage.get_text_bounded())
             textpage.close()
             page.close()
-        return "\n".join(parts), None
+        return "\n".join(parts), None, title
     finally:
         pdf.close()
 

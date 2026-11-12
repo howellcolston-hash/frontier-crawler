@@ -16,7 +16,7 @@ import trafilatura
 
 from frontier_crawler.harvester import readers
 from frontier_crawler.harvester.cascade import HarvesterCascade, ScrapeResult, Target
-from frontier_crawler.harvester.readers import ReaderPool, decode, extract_links, read_html
+from frontier_crawler.harvester.readers import ReaderPool, decode, extract_links, newest_first, read_html, read_sitemap, robots_sitemaps
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 
@@ -70,9 +70,53 @@ def test_a_worker_reads_exactly_what_this_process_would() -> None:
         finally:
             pool.close()
 
-    for (url, body), (text, encoding, links) in zip(PAGES.items(), asyncio.run(run())):
+    for (url, body), (text, encoding, links, _) in zip(PAGES.items(), asyncio.run(run())):
         assert (text, links) == _read_here(url, body) and encoding == decode(body, "text/html")[1]
     assert asyncio.run(run())[0][2] == ([("https://a.test/one", "One"), ("https://b.test/x", "B")], ["http://[bad"])
+
+
+def test_a_page_title_is_read_trimmed_and_cut_and_text_without_html_has_none() -> None:
+    long = "Notices " * 60
+    body = f"<html><head><title>\n  Tenders &amp; notices \n</title></head><body><p>{TEXT}</p></body></html>".encode()
+    assert read_html(body, "text/html", "https://a.test/")[3] == "Tenders & notices"
+    assert len(read_html(f"<html><head><title>{long}</title></head></html>".encode(), "text/html", "https://a.test/")[3]) == 300
+    legacy = f"<html><head><title>港口管理局</title></head><body><p>{'港口管理局公布了泊位时间表。' * 40}</p></body></html>".encode("gb18030")
+    assert read_html(legacy, "text/html; charset=gb18030", "https://a.test/")[3] == "港口管理局"
+    assert read_html(b"<html><head><title> </title></head></html>", "text/html", "https://a.test/")[3] is None
+    assert read_html(b"a plain <title>x</title> file", "text/plain", "https://a.test/")[2:] == (None, None)
+
+
+URLSET = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+  <url><loc>https://A.test/old</loc><lastmod>2026-01-01</lastmod></url>
+  <url><loc> https://a.test/new#top </loc><lastmod>2026-11-01T10:00:00Z</lastmod><image:image><image:loc>https://a.test/i.png</image:loc></image:image></url>
+  <url><loc>https://a.test/undated</loc></url>
+  <url><loc>mailto:x@a.test</loc></url>
+  <!-- a comment -->
+</urlset>"""
+
+
+def test_a_sitemap_is_read_plain_gzipped_or_as_an_index_and_anything_else_is_refused() -> None:
+    import gzip
+
+    expected = ("urlset", [("https://a.test/old", "2026-01-01"), ("https://a.test/new", "2026-11-01T10:00:00Z"), ("https://a.test/undated", "")])
+    assert read_sitemap(URLSET) == read_sitemap(gzip.compress(URLSET)) == expected
+    index = b"<sitemapindex xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'><sitemap><loc>https://a.test/s1.xml.gz</loc></sitemap></sitemapindex>"
+    assert read_sitemap(index) == ("index", [("https://a.test/s1.xml.gz", "")])
+    assert read_sitemap(URLSET[:-40])[1][:2] == expected[1][:2]   # a file cut short gives what it holds
+    for bad in (b"", b"not xml at all", b"<html><body><a href='/x'>x</a></body></html>", gzip.compress(b"<rss/>"), b"\x1f\x8b broken gzip"):
+        with pytest.raises(Exception):
+            read_sitemap(bad)
+    # Entities are not expanded.
+    bomb = b'<?xml version="1.0"?><!DOCTYPE u [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><urlset><url><loc>https://a.test/&b;</loc></url></urlset>'
+    assert all("aaaa" not in url for url, _ in read_sitemap(bomb)[1])
+
+
+def test_robots_sitemap_lines_are_found_and_newest_lastmod_sorts_first() -> None:
+    robots = b"User-agent: *\nDisallow: /private\nSitemap: https://a.test/s.xml\nsitemap:https://a.test/news.xml.gz \nSitemap: https://a.test/s.xml\nSitemap: ftp://x\n"
+    assert robots_sitemaps(robots) == ["https://a.test/s.xml", "https://a.test/news.xml.gz"]
+    entries = [("u1", ""), ("u2", "2026-01-01"), ("u3", "2026-11-01T10:00:00+02:00"), ("u4", "garbage"), ("u5", "2026-11-01T09:00:00Z")]
+    assert [url for url, _ in newest_first(entries)] == ["u5", "u3", "u2", "u1", "u4"]
 
 
 def test_a_reader_that_crashes_costs_its_page_its_text_and_nothing_else() -> None:

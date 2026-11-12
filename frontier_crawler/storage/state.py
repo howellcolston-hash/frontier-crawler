@@ -1,4 +1,5 @@
-"""Small state the engine carries between runs: what each URL last served, which bodies are stored, and Jev spend per month.
+"""Small state the engine carries between runs: what each URL last served, which bodies are stored, Jev spend per month,
+and when each watched page was last read.
 
 Each is a single file in the store, read at the start of a run and rewritten at the end.
 A run that dies before the end leaves the previous state in place: the next run then stores
@@ -23,6 +24,7 @@ from frontier_crawler.storage.store import Store
 URL_STATE_PATH = "state/url_state.parquet"
 JEV_SPEND_PATH = "state/jev_spend.json"
 BODY_HASHES_PATH = "state/body_hashes.parquet"
+WATCH_PATH = "state/watch.json"
 
 _URL_SCHEMA = pa.schema(
     [
@@ -131,3 +133,21 @@ def save_spend(spend: Dict[str, Any], workdir: Path) -> Tuple[Path, str]:
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(json.dumps(spend, sort_keys=True, indent=1) + "\n", encoding="utf-8")
     return local, JEV_SPEND_PATH
+
+
+def load_watch_times(store: Store, workdir: Path) -> Dict[str, dt.datetime]:
+    """{watched url: when it was last served}. A missing or unreadable file is no history: every page is due."""
+    local = Path(workdir) / "state-in" / "watch.json"
+    try:
+        if not store.get(WATCH_PATH, local):
+            return {}
+        return {str(url): dt.datetime.fromisoformat(when) for url, when in json.loads(local.read_text(encoding="utf-8")).items()}
+    except Exception:
+        return {}
+
+
+def save_watch_times(times: Dict[str, dt.datetime], workdir: Path) -> Tuple[Path, str]:
+    local = Path(workdir) / "state-out" / "watch.json"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(json.dumps({url: when.isoformat() for url, when in sorted(times.items())}, indent=1) + "\n", encoding="utf-8")
+    return local, WATCH_PATH
