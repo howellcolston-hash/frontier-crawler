@@ -48,7 +48,7 @@ def test_links_are_absolute_distinct_and_skip_assets_and_share_buttons() -> None
 
 
 def _content(url: str = "", tier: str = "DOM_TRAFILATURA") -> Dict[str, Any]:
-    return {"outcome": "stored", "http_status": 200, "url_final": url, "tier_used": tier}
+    return {"outcome": "stored", "http_status": 200, "url_final": url, "tier_used": tier, "word_count": 100}
 
 
 DEAD = {"outcome": "error_page", "http_status": 404, "block_marker": "http 404"}
@@ -388,6 +388,12 @@ def test_a_starting_url_is_retried_on_its_own_record_not_its_seeds(tmp_path: Pat
     again.mark(again.entry("https://a.test/main"), {**_content(), "block_marker": "captcha"}, None, NOW)
     again.add_seeds([seed], NOW)
     assert again.entry("https://a.test/main")["status"] == "queued" and again.seed_urls_requeued == 4
+    # Nor is a thin page (a maintenance notice), served new or unchanged.
+    for outcome in ("stored", "unchanged"):
+        again.mark(again.entry("https://a.test/main"), {**_content(), "outcome": outcome, "word_count": 6}, None, NOW)
+        again.add_seeds([seed], NOW)
+        assert again.entry("https://a.test/main")["status"] == "queued"
+    assert again.seed_urls_requeued == 6
 
 
 class FakeSite:
@@ -444,6 +450,34 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
     deep = rows["https://a.test/deep"]
     assert deep["seed_id"] == "a" and deep["line_id"] == "a" and deep["hops"] == 2
     assert deep["parent_fetch_id"] == rows["https://a.test/one"]["fetch_id"]        # every row says which fetch led to it
+
+
+def test_a_thin_starting_page_is_reported_and_tried_again_and_a_redirect_to_another_site_is_recorded(tmp_path: Path) -> None:
+    class Site:
+        fetched: list = []
+
+        async def fetch(self, url: str) -> ScrapeResult:
+            self.fetched.append(url)
+            if url == "https://down.test/":
+                return ScrapeResult(url, 200, b"<html>Down for maintenance</html>", "Down for maintenance", 3, "DOM_TRAFILATURA", None, "text/html", links=([], []))
+            final = {"https://old.test/": "https://www.moved.test/home", "https://www.ok.example.com/": "https://ok.example.com/"}.get(url, url)
+            body = f"<html><p>{TEXT}</p>{url}</html>".encode()
+            return ScrapeResult(final, 200, body, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "text/html", links=([], []))
+
+    site, store = Site(), LocalStore(tmp_path / "store")
+    seeds = [_seed("down", "https://down.test/"), _seed("old", "https://old.test/"), _seed("ok", "https://www.ok.example.com/")]
+
+    def go(run: str) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW))
+
+    first = go("r1")
+    assert first["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"} and first["seeds_with_nothing"] == ["down"]
+    assert first["stored_by_seed"] == {"down": 0, "old": 1, "ok": 1}
+    assert first["seed_url_redirects"] == {"https://old.test/": "www.moved.test"}   # a subdomain to its registered domain stays on the site
+    second = go("r2")
+    assert site.fetched[3:] == ["https://down.test/"] and second["seed_urls_requeued"] == 1
+    assert second["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"}
 
 
 def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path: Path) -> None:
@@ -611,6 +645,9 @@ def test_what_a_fetch_is_worth_to_its_line() -> None:
     assert fetch_yield(DEAD, None) == 0.0
     assert fetch_yield(_content(), None) is None                             # not something Jev reads
     assert fetch_yield(_content(tier="API"), None) is None
+    assert fetch_yield({**_content(), "word_count": 19}, None) == 0.0                 # thin HTML
+    assert fetch_yield({**_content(tier="HEADLESS_PLAYWRIGHT"), "word_count": 0}, None) == 0.0
+    assert fetch_yield({**_content(tier="PDF"), "word_count": 0}, None) is None       # a scan, read later
     assert fetch_yield(_readable(_content()), None) is None                  # Jev would read it but did not
     answers = _Answers(0.4)
     assert fetch_yield(_readable(_content()), answers) == judging.relevance(answers.nouls())  # type: ignore[arg-type]
@@ -652,12 +689,16 @@ def test_content_jev_does_not_read_counts_at_the_lines_relevance_and_a_new_line_
     frontier.add_seeds([_seed("s", "https://a.test/")], NOW)
     line = frontier.line("s")
     line.update({"yield": 0.6, "relevance": 0.3})
-    for i, row in enumerate((_content(tier="API"), _content(), {**_readable(_content()), "word_count": 5})):  # data, no text, very short
+    for i, row in enumerate((_content(tier="API"), {**_content(tier="PDF"), "word_count": 0}, _content())):  # data, a scan, unsampled
         frontier._add(f"https://a.test/{i}", "s", "s", 1, 1.0, NOW)
         before = line["yield"]
         frontier.mark(frontier.entry(f"https://a.test/{i}"), row, None, NOW)
         assert line["yield"] == 0.85 * before + 0.15 * 0.3 and line["relevance"] == 0.3
-    assert line["content"] == 3
+    # An HTML page with almost no text (an outage notice, an empty shell) is not content: it counts as a dead link does.
+    frontier._add("https://a.test/thin", "s", "s", 1, 1.0, NOW)
+    before = line["yield"]
+    frontier.mark(frontier.entry("https://a.test/thin"), {**_content(), "word_count": 5}, None, NOW)
+    assert line["yield"] == 0.85 * before and line["content"] == 3
     root = frontier.entry("https://a.test/")
     row = _page_row("https://a.test/", '<a href="https://b.test/">b</a>')
     frontier.mark(root, row, None, NOW)

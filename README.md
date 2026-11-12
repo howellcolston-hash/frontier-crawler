@@ -48,7 +48,10 @@ Crawl state (`state/`) holds the queue, lines, hosts, what each URL last served,
 
 ## Logs
 
-A run prints counts only. What it fetched, and anything that went wrong, is written to the store as `runs/<run id>.json`. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
+A run prints counts only. What it fetched, and anything that went wrong, is written to the store as `runs/<run id>.json`. Among its fields:
+
+- `seed_url_problems`: starting URLs that served nothing, a block page or a thin page (HTML under 20 words, such as an outage notice). Each is tried again in the next run. A thin page counts as no content in its line's yield.
+- `seed_url_redirects`: starting URLs that were sent to another site, with the site they ended on. Set `CRAWLER_VERBOSE=1` for detail on a machine whose logs are private.
 
 ## Tests
 

@@ -16,9 +16,10 @@ for good, so a line many sites from its seed stays discounted
 however well its own pages pay.
 
 Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 0 for
-a dead link, a duplicate, an unchanged page or a refusal. New content Jev does not judge counts at
+a dead link, a duplicate, an unchanged page, a refusal or a thin page (HTML with under THIN_WORDS words:
+an outage notice, an empty shell). New content Jev does not judge counts at
 the line's relevance: the running mean of the relevance of its judged pages. That covers content Jev
-does not read (structured data, a scan with no text, a very short page) and pages Jev would read but
+does not read (structured data, a scan with no text) and pages Jev would read but
 does not (out of the sample, no key, the ceiling, an outage, a judgement abandoned at the end of a
 run). Leaving them out instead would let the zeros outweigh the judged pages by one over the sample
 rate. A seed line's relevance starts at 1, a spawned line's at its parent's. A page whose judgement
@@ -121,6 +122,7 @@ JEV_SLOTS = 8                   # judgements running at once in a crawl
 JUDGE_GRACE_SECONDS = 60.0      # how long the end of a crawl waits for judgements still running; the rest stay unjudged
 FLUSH_EVERY_SECONDS = 5.0       # how often a crawl asks the engine to upload what it has buffered
 TAKE_WAIT_SECONDS = 0.05        # how long a crawl worker with nothing to take waits before asking again
+THIN_WORDS = 20                 # PROVISIONAL: an HTML page served with fewer words is not content: an outage notice, an empty shell
 
 logger = logging.getLogger("frontier_crawler.frontier")
 
@@ -170,6 +172,7 @@ _LINES_SCHEMA = pa.schema(
 
 _REFUSED_STATUS = {401, 403, 407, 429, 451, 503}
 _HEAVY_TIERS = {"PDF", "HEADLESS_PLAYWRIGHT"}
+_HTML_TIERS = {"DOM_TRAFILATURA", "HEADLESS_PLAYWRIGHT"}
 
 
 @dataclass(frozen=True)
@@ -238,9 +241,15 @@ def judged_yield(answers: JevResult) -> float:
     return 1.0 if judged is None else max(0.0, min(1.0, judged))
 
 
+def thin(row: Dict[str, Any]) -> bool:
+    """An HTML page served with almost no text. Not JSON or a PDF: a scan has no text until it is read."""
+    return (row.get("outcome") in ("stored", "unchanged", "duplicate") and row.get("tier_used") in _HTML_TIERS
+            and (row.get("word_count") or 0) < THIN_WORDS)
+
+
 def fetch_yield(row: Dict[str, Any], answers: Optional[JevResult]) -> Optional[float]:
-    """What one fetch was worth to its line: 0 to 1, or None for new content not judged (yet)."""
-    if row.get("outcome") != "stored" or row.get("block_marker"):
+    """What one fetch was worth to its line: 0 to 1, or None for new content not judged (yet). A thin page is worth 0."""
+    if row.get("outcome") != "stored" or row.get("block_marker") or thin(row):
         return 0.0
     return None if answers is None else judged_yield(answers)
 
@@ -539,7 +548,7 @@ class Frontier:
             for url in seed.urls:
                 known = self._entries.get(url)
                 if known is not None:
-                    # A starting URL whose own fetch served nothing is tried again each run, whatever the rest of
+                    # A starting URL whose own fetch served nothing (or a thin page) is tried again each run, whatever the rest of
                     # its seed found: the failure may have been temporary, and the run summary then shows the reason.
                     # One fetched before the record existed (null) is tried once more, to find out.
                     if not known.get("stored") and known["status"] in ("fetched", "failed"):
@@ -623,7 +632,7 @@ class Frontier:
         else:
             self._set_status(entry, "failed")
         entry["fetched_at"] = now
-        entry["stored"] = outcome in ("stored", "unchanged", "duplicate") and not row.get("block_marker")
+        entry["stored"] = outcome in ("stored", "unchanged", "duplicate") and not row.get("block_marker") and not thin(row)
         counts = self._hosts.setdefault(entry["host"], {name: 0 for name in _HOST_COUNTS})
         counts["fetches"] += 1
         self._domain_fetches[registered_domain(entry["host"])] += 1
@@ -1080,6 +1089,7 @@ async def crawl(
     links_added = 0
     stored_by_seed = {seed.id: 0 for seed in seeds}
     seed_url_problems: Dict[str, str] = {}
+    seed_url_redirects: Dict[str, str] = {}   # a starting URL -> the other site it was sent to
     data_portals: Dict[str, float] = {}
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered", "steered_down", "steered_up"), 0)
     by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
@@ -1107,11 +1117,19 @@ async def crawl(
         frontier.mark(entry, row, None, now())
         links_added += frontier.add_links(entry, row, None, now())
         kind(entry["url"])["stored"] += row["outcome"] == "stored"   # as the engine counts stored
-        if row["outcome"] == "stored" and not row["block_marker"]:
+        if entry["parent_fetch_id"] is None:  # a seed's own starting URL
+            final = urlsplit(normalise(row.get("url_final") or "")).netloc
+            if final and registered_domain(final) != registered_domain(entry["host"]):
+                seed_url_redirects[entry["url"]] = final
+        if row["outcome"] == "stored" and not row["block_marker"] and not thin(row):
             stored_by_seed[entry["seed_id"]] = stored_by_seed.get(entry["seed_id"], 0) + 1
-        elif entry["parent_fetch_id"] is None:  # a seed's own starting URL
-            reason = row.get("error") or row.get("block_marker") or row.get("tier_note") or ""
-            seed_url_problems[entry["url"]] = f"{row['outcome']}, status {row['http_status']}: {reason}"[:300]
+        elif entry["parent_fetch_id"] is None:
+            if not row["block_marker"] and thin(row):
+                problem = f"thin page: {row.get('word_count') or 0} words"
+            else:
+                reason = row.get("error") or row.get("block_marker") or row.get("tier_note") or ""
+                problem = f"{row['outcome']}, status {row['http_status']}: {reason}"
+            seed_url_problems[entry["url"]] = problem[:300]
 
     async def judge(row: Dict[str, Any], tally: Dict[str, Any]) -> None:
         """Phase 2, in its own task: the page's relevance and its links' scores."""
@@ -1251,7 +1269,7 @@ async def crawl(
             "fetches_steered_down": counts["steered_down"], "fetches_steered_up": counts["steered_up"],
             "queued_held_by_steer": sum(len(g.members) for g in frontier._groups.values() if frontier.factor(g.host) == 0),
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
-            "seed_url_problems": seed_url_problems,
+            "seed_url_problems": seed_url_problems, "seed_url_redirects": seed_url_redirects,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
             "data_portals": dict(sorted(data_portals.items(), key=lambda item: -item[1])[:20]),
             # What the engine chose not to do in this run. Read these when reviewing the limits.
