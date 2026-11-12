@@ -50,6 +50,30 @@ registered domains never fetched (a new subdomain of a fetched one does not qual
 best entry of each, ranked by this priority too. There are no source tiers: any http(s) link
 can be followed.
 
+Two ranking rules for take(), chosen by the optional config/ranking.json (rank(); absent or broken: fixed). Both multiply in
+the seed weight and the site factor (0 still holds a site), keep the retry lane, the per-host in-flight limit, cooled hosts
+and the queue caps, and take a group's best entry in the order above. select() is the fixed rule's.
+
+    fixed    the priority above, with the re-test and new-domain shares.
+    bandit   seed weight x site factor x a draw from the group's arm; no decay, damping, lift or share.
+    shadow   takes as fixed does, and records beside each take what bandit would have taken.
+
+The bandit rule. Each group is an arm; its line holds the evidence (the line, not the registered domain: rewards are
+already credited per line, a line is one site, and one domain's hosts can differ in worth). A fetch's reward is what the
+line's yield is fed. The evidence is Beta counts discounted by 1 - 1/ARM_WINDOW at each reward, so the estimate follows a
+site that dries up and diminishing returns show in a site's own record. A crossing group is the arm of the line it would
+become: mean its finder line's estimate x the link's score, ARM_PRIOR fetches strong, one failure more per fetch from its
+host that started nothing; a seed is that far from its descendants only through this chain. Allocation is Thompson
+sampling, mean + temperature x (draw - mean), over the arms that can take now (a sleeping bandit: an empty group, a full or
+cooled host sits out). Thompson rather than an upper-confidence index: draws spread concurrent takes and late judgements
+over arms where an index would hand every worker the same one, and temperature is then the randomness itself (0: greedy on
+the means, 1: Thompson). A draw is kept until its group is taken, its line's evidence changes, or one of ARM_REFRESH arms
+drawn at random per take is drawn again: a take reads a heap top, and stale arms get at most ARM_REFRESH new draws per
+take however many arms there are. Staleness: an arm's evidence halves every ARM_STALE_DAYS since its line was last
+fetched, down to ARM_PRIOR, so long-untested arms widen and their draws re-test them; their means stay, so recovery is
+still through data. That replaces the re-test and new-domain shares: untried arms start wide. The counts are kept in every
+mode (state/lines.parquet), so switching modes loses nothing.
+
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
 needed the PDF or browser tier, refusals, failures and dead links; and when its sitemaps were last read.
 
@@ -65,7 +89,7 @@ A page that timed out is retried once, with a longer limit, through take()'s ret
 and so does waiting longer than RETRY_MAX_AGE for the retry.
 
 Input contract:
-    frontier = Frontier.load(store, workdir); frontier.add_seeds(seeds, now)
+    frontier = Frontier.load(store, workdir); frontier.add_seeds(seeds, now); frontier.rank(mode, temperature)   # optional: fixed
     picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
     # or in two phases, so nothing waits on Jev: frontier.expect_judgement(fetch_id, line_id), mark and add_links with
@@ -136,6 +160,12 @@ THIN_WORDS = 20                 # PROVISIONAL: an HTML page served with fewer wo
 SITEMAP_EVERY = dt.timedelta(days=7)   # PROVISIONAL: how often one site's robots.txt and sitemaps are read
 SITEMAP_MAX_URLS = 500          # PROVISIONAL: new URLs queued from one site's sitemaps per read
 WATCH_SHARE = 0.2               # PROVISIONAL: most of a run's max_fetches that watched pages may take
+# The bandit rule (config/ranking.json); see the module docstring.
+RANKING_MODES = ("fixed", "bandit", "shadow")
+ARM_WINDOW = 6.0                # PROVISIONAL: fetches an arm's estimate remembers (about as many as the yield's YIELD_ALPHA): each reward discounts the older ones by 1 - 1/ARM_WINDOW
+ARM_PRIOR = 2.0                 # PROVISIONAL: pseudo-fetches behind a new arm's prior, so it starts wide
+ARM_STALE_DAYS = 14.0           # PROVISIONAL: days without a fetch over which an arm's evidence halves, down to ARM_PRIOR
+ARM_REFRESH = 8                 # PROVISIONAL: arms drawn at random whose sample is drawn again at each take
 
 logger = logging.getLogger("frontier_crawler.frontier")
 
@@ -181,6 +211,11 @@ _LINES_SCHEMA = pa.schema(
         ("relevance", pa.float64()),  # running mean of Jev's relevance for its judged pages, at YIELD_ALPHA
         ("inbound", pa.int64()),  # lifts received from links in other lines
         ("generation", pa.int64()),  # 0 for a seed line, its parent's + 1 for a spawned line
+        # The bandit's estimate of a fetch from it: discounted Beta counts, kept in every mode; when it was last fetched.
+        # Null in files saved before they existed: seeded from yield and fetches on load.
+        ("arm_alpha", pa.float64()),
+        ("arm_beta", pa.float64()),
+        ("arm_at", _TS),
     ]
 )
 
@@ -279,13 +314,14 @@ class _Group:
     """The queued entries that share a line, a host and a seed, and so every factor of priority() but the static one.
     members are kept best first: static score down, then url."""
 
-    __slots__ = ("line", "host", "seed", "weight", "members", "version", "slot")
+    __slots__ = ("line", "host", "seed", "weight", "members", "version", "slot", "drawn")
 
     def __init__(self, line: str, host: str, seed: str, weight: float) -> None:
         self.line, self.host, self.seed, self.weight = line, host, seed, weight
         self.members: List[Dict[str, Any]] = []
         self.version = 0
         self.slot = -1   # its place in Frontier._filled while it has members
+        self.drawn = 0   # the version of its current items in the arm heaps
 
     def key(self, entry: Dict[str, Any]) -> Tuple[float, str]:
         return -_static(entry, self.weight), entry["url"]
@@ -331,6 +367,12 @@ class Frontier:
             parent = self._lines.get(line.get("parent_line") or "")
             if parent is not None and line["fetches"] == 0:
                 line["yield"], line["relevance"] = parent["yield"], parent["relevance"]
+        # Lines saved before arms existed: their yield as the mean, their fetches (within ARM_PRIOR..ARM_WINDOW) as the
+        # evidence, last fetched when created (so long-lived ones start a little stale).
+        for line in self._lines.values():
+            if line.get("arm_alpha") is None or line.get("arm_beta") is None:
+                n = min(max(float(line.get("fetches") or 0), ARM_PRIOR), ARM_WINDOW)
+                line.update(arm_alpha=line["yield"] * n, arm_beta=(1.0 - line["yield"]) * n, arm_at=line.get("created_at"))
         self._host_line: Dict[str, str] = {}
         self._queued_per_host: Dict[str, int] = {}
         # The queue, ranked by group: see select(). The heaps are built by the first select() or take(), which bring the seed weights.
@@ -338,6 +380,7 @@ class Frontier:
         self._groups_by_line: Dict[str, List[_Group]] = {}
         self._groups_by_host: Dict[str, List[_Group]] = {}
         self._groups_by_domain: Dict[str, List[_Group]] = {}
+        self._own_by_line: Dict[str, List[_Group]] = {}   # groups made by a line's own (not crossing) entries: its arm's
         # Fetches per registered domain, from the hosts table, kept current by mark(). A fetch only lowers the groups of
         # its domain, so like a host's own it leaves them for _top() to re-score.
         self._domain_fetches: Counter = Counter()
@@ -390,6 +433,19 @@ class Frontier:
         self.lifts = 0
         self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
         self.lines_lifted: set = set()
+        # The ranking rule (see rank()). The arm heaps hold (-score, version, group): by drawn sample and by mean.
+        self._mode, self._temperature = "fixed", 1.0
+        self._arm_heap: Optional[List[Tuple[float, int, _Group]]] = None
+        self._mean_heap: List[Tuple[float, int, _Group]] = []
+        self._drawn = 0
+        self._arm_rng = random.Random(f"{rng_seed}:arms")   # its own, so shadow mode leaves the re-test draws alone
+        self._today: Optional[dt.date] = None
+        self._tags: Dict[str, str] = {}            # url -> what kind of take it was, until its reward is known
+        self._tag_fetch: Dict[str, str] = {}       # fetch_id -> the same, for a page whose judgement is awaited
+        self.rewards: Dict[str, List[float]] = {}  # kind of take -> [fetches rewarded, reward]
+        self.takes_by_kind: Counter = Counter()    # greedy, explore (bandit); agreed, differed (shadow)
+        self.tried: set = set()                    # groups taken from in this run
+        self.shadow = dict.fromkeys(("takes", "agreed", "estimate_fixed", "estimate_bandit"), 0.0)
 
     # ------------------------------------------------------------ persistence
 
@@ -438,6 +494,13 @@ class Frontier:
         self._steer = dict(sites)
         self._weights = None
 
+    def rank(self, mode: str, temperature: float = 1.0) -> None:
+        """Choose the ranking rule for take(): "fixed", "bandit" or "shadow" (fixed, with bandit's choice recorded beside
+        it). temperature scales the bandit's exploration: 0 greedy on its estimates, 1 Thompson sampling."""
+        assert mode in RANKING_MODES and temperature >= 0
+        self._mode, self._temperature = mode, temperature
+        self._weights = None   # every heap is rebuilt for it by the next take()
+
     def factor(self, host: str) -> float:
         return self._steer.get(registered_domain(host), 1.0)
 
@@ -454,15 +517,18 @@ class Frontier:
     # ------------------------------------------------------------ lines
 
     def _new_line(
-        self, line_id: str, seed_id: str, parent: Optional[Dict[str, Any]], root_url: str, now: dt.datetime,
+        self, line_id: str, seed_id: str, parent: Optional[Dict[str, Any]], root_url: str, now: dt.datetime, base: float = 1.0,
     ) -> Dict[str, Any]:
         """A seed line (parent None) starts at yield and relevance 1 and generation 0; a spawned line at its parent's
-        yield and relevance, one generation down."""
+        yield and relevance, one generation down. Its arm starts at the prior of the crossing that found it (base: that
+        link's score); a seed line's at 1."""
+        alpha, beta = self._prior(parent, base) if parent else (ARM_PRIOR, 0.0)
         line = {
             "line_id": line_id, "seed_id": seed_id, "parent_line": parent and parent["line_id"], "root_url": root_url,
             "created_at": now, "fetches": 0, "content": 0, "yield": parent["yield"] if parent else 1.0,
             "relevance": parent["relevance"] if parent else 1.0,
             "inbound": 0, "generation": parent["generation"] + 1 if parent else 0,
+            "arm_alpha": alpha, "arm_beta": beta, "arm_at": None,
         }
         self._lines[line_id] = line
         return line
@@ -474,9 +540,14 @@ class Frontier:
         self._move_yield(line, value)
 
     def _move_yield(self, line: Dict[str, Any], value: Optional[float]) -> None:
-        """One step of the line's running yield toward value (none for None)."""
+        """One step of the line's running yield toward value (none for None), and the same reward for its arm."""
         if value is not None:
             self._set_yield(line, (1.0 - YIELD_ALPHA) * line["yield"] + YIELD_ALPHA * value)
+            keep = 1.0 - 1.0 / ARM_WINDOW
+            line["arm_alpha"] = keep * line["arm_alpha"] + value
+            line["arm_beta"] = keep * line["arm_beta"] + 1.0 - value
+            for group in self._own_by_line.get(line["line_id"], ()):
+                self._draw(group)
 
     def _set_yield(self, line: Dict[str, Any], value: float) -> None:
         """A rise re-ranks the line's groups; a fall is left for _top() to re-score."""
@@ -509,7 +580,7 @@ class Frontier:
         line_id = self._host_line.get(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
-            self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now)
+            self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now, entry["base"])
             self._host_line[host] = line_id
             self.spawned += 1
         self._move(entry, line_id, 0)
@@ -701,15 +772,24 @@ class Frontier:
         fetch_id = row.get("fetch_id")
         if entry.get("crossing"):
             self._judging.pop(fetch_id, None)
+            for group in self._groups_by_host.get(entry["host"], ()):   # one more fetch that started nothing: its arm is lower
+                if group.members and group.members[0].get("crossing"):
+                    self._draw(group)
         else:
             line = self._lines[entry["line_id"]]
             if value is None and fetch_id not in self._judging:
                 value = line["relevance"]   # not judged, and none coming: it counts at what the line's judged pages were worth
             elif answers is not None and value is not None:
                 self._note_relevance(line, value)
+            line["arm_at"] = now
             self._record_yield(line, value)
             if fetch_id in self._judging:   # a crossing's judgement moves the line it started, not the one that found it
                 self._judging[fetch_id] = (line["line_id"], self._judging[fetch_id][1])
+        tag = self._tags.pop(entry["url"], None)
+        if tag is not None and value is None:
+            self._tag_fetch[fetch_id] = tag   # its reward comes with its judgement
+        elif tag is not None:
+            self._reward(tag, value)
         # A redirect target is the same document. Record it so a later link to it is not fetched again.
         final = normalise(row.get("url_final") or "")
         if final and final not in self._entries:
@@ -731,10 +811,15 @@ class Frontier:
         if not line_id:
             return
         line = self._lines[line_id]
+        tag = self._tag_fetch.pop(fetch_id, None)
         if answers is None:
+            if tag is not None:
+                self._reward(tag, line["relevance"])
             self._move_yield(line, line["relevance"])   # it will not be judged: it counts as mark() counts such a page
             return
         value = judged_yield(answers)
+        if tag is not None:
+            self._reward(tag, value)
         self._note_relevance(line, value)
         self._move_yield(line, value)
         base = link_base(answers)
@@ -768,6 +853,8 @@ class Frontier:
             self._groups_by_line.setdefault(key[0], []).append(group)
             self._groups_by_host.setdefault(key[1], []).append(group)
             self._groups_by_domain.setdefault(registered_domain(key[1]), []).append(group)
+            if not entry.get("crossing"):
+                self._own_by_line.setdefault(key[0], []).append(group)
         return group
 
     def _enqueue(self, entry: Dict[str, Any]) -> None:
@@ -778,7 +865,9 @@ class Frontier:
         if len(members) == 1:
             group.slot = len(self._filled)
             self._filled.append(group)
-        if self._weights is not None and self._eligible(group):
+        if len(members) == 1 or (i == 0 and entry.get("crossing")):   # a crossing's arm starts from its best link
+            self._draw(group)
+        if self._weights is not None and self._mode != "bandit" and self._eligible(group):
             extras = self._extras(group)
             # A later entry can still lead: two static scores may round to one score, and then the url decides.
             if i == 0 or self.priority(entry, group.weight, *extras) == self.priority(members[0], group.weight, *extras):
@@ -834,7 +923,7 @@ class Frontier:
         return best
 
     def _push(self, group: _Group) -> None:
-        if self._weights is None or not self._eligible(group):
+        if self._weights is None or self._mode == "bandit" or not self._eligible(group):   # bandit mode reads the arm heaps alone
             return
         score, entry = self._best(group, *self._extras(group))  # type: ignore[misc]
         self._version += 1
@@ -850,16 +939,103 @@ class Frontier:
 
     def _ready(self, seeds: Sequence[Seed], today: dt.date) -> None:
         """Build the heaps for these seed weights, or rebuild them when the weights change or stale items pile up."""
+        self._today = today
         weights = {seed.id: seed.weight for seed in seeds if seed.active(today)}
-        if weights == self._weights and len(self._heap) <= 2 * len(self._groups) + 1000:
+        if weights != self._weights or len(self._heap) > 2 * len(self._groups) + 1000:
+            if weights != self._weights:
+                self._arm_heap = None
+            self._weights = weights
+            self._heap, self._new_heap = [], []
+            for group in self._groups.values():
+                if group.seed in weights and group.weight != weights[group.seed] * self.factor(group.host):
+                    group.weight = weights[group.seed] * self.factor(group.host)
+                    group.members.sort(key=group.key)
+                self._push(group)
+        if self._mode != "fixed" and self._arm_heap is None:
+            self._arm_heap, self._mean_heap = [], []
+            for group in self._groups.values():
+                self._draw(group)
+        elif self._arm_heap is not None and len(self._arm_heap) > 4 * len(self._groups) + 1000:   # drop old items, keep draws
+            self._arm_heap, self._mean_heap = ([item for item in heap if item[1] == item[2].drawn] for heap in (self._arm_heap, self._mean_heap))
+            heapq.heapify(self._arm_heap)
+            heapq.heapify(self._mean_heap)
+
+    # ------------------------------------------------------------ the bandit rule
+    #
+    # Each group is an arm; its line's discounted Beta counts are the evidence (a crossing group's: the prior of the line it
+    # would become). An arm's sample is drawn when it gets items and kept until it is taken, its evidence changes, or a
+    # refresh draws it again, so a take reads the heap top instead of drawing every arm.
+
+    def _prior(self, parent: Dict[str, Any], base: float, zeros: int = 0) -> Tuple[float, float]:
+        """Beta counts for a site found from parent's pages by a link of score base: mean the parent's estimate x base,
+        ARM_PRIOR strong, and one failure for each fetch from it that started nothing."""
+        mean = parent["arm_alpha"] / (parent["arm_alpha"] + parent["arm_beta"]) * base
+        return mean * ARM_PRIOR, (1.0 - mean) * ARM_PRIOR + zeros
+
+    def _arm(self, line_id: str, first: Dict[str, Any], host: str) -> Tuple[float, float]:
+        """(mean, evidence) of a fetch from the group of line_id and host whose best entry is first: its evidence halved
+        every ARM_STALE_DAYS since its line was last fetched, down to ARM_PRIOR (or what it had, if less)."""
+        line = self._lines[line_id]
+        if first.get("crossing"):
+            alpha, beta = self._prior(line, first["base"], self._hosts.get(host, {}).get("fetches", 0))
+            return alpha / (alpha + beta), alpha + beta
+        alpha, beta, at = line["arm_alpha"], line["arm_beta"], line.get("arm_at")
+        n = alpha + beta
+        if at is not None and self._today is not None and self._today > at.date():
+            n = max(min(n, ARM_PRIOR), n * 0.5 ** ((self._today - at.date()).days / ARM_STALE_DAYS))
+        return alpha / (alpha + beta), n
+
+    def _draw(self, group: _Group) -> None:
+        """Draw the group's sample again and push it, and its mean, to the arm heaps."""
+        if self._arm_heap is None or not self._eligible(group):
             return
-        self._weights = weights
-        self._heap, self._new_heap = [], []
-        for group in self._groups.values():
-            if group.seed in weights and group.weight != weights[group.seed] * self.factor(group.host):
-                group.weight = weights[group.seed] * self.factor(group.host)
-                group.members.sort(key=group.key)
-            self._push(group)
+        mean, n = self._arm(group.line, group.members[0], group.host)
+        sample = mean
+        if self._temperature > 0:
+            x = self._arm_rng.betavariate(max(mean * n, 1e-3), max((1.0 - mean) * n, 1e-3))
+            sample = mean + self._temperature * (x - mean)
+        self._drawn += 1
+        group.drawn = self._drawn
+        heapq.heappush(self._arm_heap, (-group.weight * sample, self._drawn, group))
+        heapq.heappush(self._mean_heap, (-group.weight * mean, self._drawn, group))
+
+    def _arm_top(self, heap: List[Tuple[float, int, _Group]]) -> Optional[_Group]:
+        """The best current, eligible group whose host has room, or None."""
+        full = []
+        while heap:
+            _, version, group = heap[0]
+            if version != group.drawn or not self._eligible(group):
+                heapq.heappop(heap)
+            elif self._flight_host.get(group.host, 0) >= MAX_IN_FLIGHT_PER_HOST:
+                full.append(heapq.heappop(heap))
+            else:
+                break
+        best = heap[0][2] if heap else None
+        for kept in full:
+            heapq.heappush(heap, kept)
+        return best
+
+    def _reward(self, kind: str, value: float) -> None:
+        tally = self.rewards.setdefault(kind, [0, 0.0])
+        tally[0] += 1
+        tally[1] += value
+
+    def ranking_record(self) -> Dict[str, Any]:
+        """The run record's ranking figures: counts and means only."""
+        def mean(kind: str) -> Optional[float]:
+            n, total = self.rewards.get(kind, (0, 0.0))
+            return round(total / n, 4) if n else None
+
+        takes = int(self.shadow["takes"])
+        return {
+            "mode": self._mode, "temperature": self._temperature, "arms": len(self._filled), "arms_tried": len(self.tried),
+            "greedy_takes": self.takes_by_kind["greedy"], "exploration_takes": self.takes_by_kind["explore"],
+            "mean_reward_greedy": mean("greedy"), "mean_reward_exploration": mean("explore"),
+            "shadow_takes": takes, "shadow_agreed": int(self.shadow["agreed"]),
+            "shadow_mean_reward_agreed": mean("agreed"), "shadow_mean_reward_differed": mean("differed"),
+            "shadow_mean_estimate_fixed": round(self.shadow["estimate_fixed"] / takes, 4) if takes else None,
+            "shadow_mean_estimate_bandit": round(self.shadow["estimate_bandit"] / takes, 4) if takes else None,
+        }
 
     def _top(self, heap: List[Tuple[float, str, int, _Group]], new_domains: bool = False) -> Optional[Tuple[float, str, int, _Group]]:
         """The heap's first item, once it is current and exact; stale items are dropped and high ones re-scored."""
@@ -883,7 +1059,9 @@ class Frontier:
         The result is exactly that of scoring every queued entry and taking them through a lazily re-scored heap
         (tests/test_frontier.py keeps that version and checks this against it). Here a group stands in the heap for its
         entries, and an entry is scored on its own only when it reaches the top. Entries out with take() count as held.
+        The fixed rule's rounds only: in bandit mode the queue hands out one take() at a time.
         """
+        assert self._mode != "bandit", "select() ranks by the fixed rule"
         self._ready(seeds, today)
         if n <= 0:
             return []
@@ -1002,10 +1180,36 @@ class Frontier:
         is a re-test: the best entry of a group drawn uniformly from the groups with queued entries, under the same
         per-host limits; it falls back to the ranked take after RETEST_DRAWS blocked draws. Before any of that, a page
         waiting for its retry is handed out while fewer than MAX_RETRY_IN_FLIGHT are, and after it, when nothing else can
-        be taken, with no such limit; its status is still "retry"."""
+        be taken, with no such limit; its status is still "retry".
+
+        In bandit mode the ranked take is the bandit rule's, with no re-test or new-domain turns; in shadow mode it is
+        the fixed rule's, and what the bandit rule would have taken is recorded beside it."""
         entry = self.take_retry(seeds, today, MAX_RETRY_IN_FLIGHT)
         if entry is not None:
             return entry
+        if self._mode == "bandit":
+            entry = self._take_bandit()
+        else:
+            would = self._arm_top(self._arm_heap) if self._arm_heap is not None else None
+            would_entry = self._best(would, *self._extras(would))[1] if would is not None else None  # type: ignore[index]
+            entry = self._take_fixed()
+            if self._mode == "shadow" and entry is not None:
+                agreed = entry is would_entry
+                self._tag(entry, "agreed" if agreed else "differed")
+                self.shadow["takes"] += 1
+                self.shadow["agreed"] += agreed
+                self.shadow["estimate_fixed"] += self._arm(entry["line_id"], entry, entry["host"])[0]
+                if would is not None:
+                    self.shadow["estimate_bandit"] += self._arm(would.line, would_entry, would.host)[0]  # type: ignore[arg-type]
+                    self._draw(would)   # its draw is spent, as if it had been taken
+                self._draw(self._groups[(entry["line_id"], entry["host"], entry["seed_id"])])
+                self._refresh()
+        if entry is not None:
+            self.tried.add((entry["line_id"], entry["host"], entry["seed_id"]))
+            return entry
+        return self.take_retry(seeds, today)   # nothing else to take: idle workers work off the retries
+
+    def _take_fixed(self) -> Optional[Dict[str, Any]]:
         self._takes += 1
         if self._takes % round(1 / RETEST_SHARE) == 0:
             for _ in range(RETEST_DRAWS if self._filled else 0):
@@ -1034,7 +1238,31 @@ class Frontier:
                 self._hold(entry)
                 self.new_domain_takes += new_domains
                 return entry
-        return self.take_retry(seeds, today)   # nothing else to take: idle workers work off the retries
+        return None
+
+    def _take_bandit(self) -> Optional[Dict[str, Any]]:
+        """The best entry of the group with the highest sample. A take that is not the group with the highest mean is
+        an exploration take."""
+        group = self._arm_top(self._arm_heap)  # type: ignore[arg-type]
+        if group is None:
+            return None
+        greedy = self._arm_top(self._mean_heap)
+        entry = self._best(group, *self._extras(group))[1]  # type: ignore[index]
+        self._dequeue(entry)
+        self._hold(entry)
+        self._tag(entry, "greedy" if greedy is group else "explore")
+        self._draw(group)   # its next take gets a fresh draw
+        self._refresh()
+        return entry
+
+    def _tag(self, entry: Dict[str, Any], kind: str) -> None:
+        self._tags[entry["url"]] = kind
+        self.takes_by_kind[kind] += 1
+
+    def _refresh(self) -> None:
+        """Draw ARM_REFRESH arms again, picked uniformly, so an arm that drew low once is not held there."""
+        for _ in range(ARM_REFRESH if self._filled else 0):
+            self._draw(self._arm_rng.choice(self._filled))
 
     def take_retry(self, seeds: Sequence[Seed], today: dt.date, limit: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """The oldest page waiting for its retry whose host has room, while fewer than limit retries are in flight."""
@@ -1088,6 +1316,7 @@ class Frontier:
         """Return an entry from take() that was not fetched to the queue (or to the retry lane)."""
         host, line = flight = self._in_flight.pop(entry["url"])
         self._unhold(flight)
+        self._tags.pop(entry["url"], None)
         if entry["status"] == "retry":
             self._retry_flight -= 1
             self._retry[entry["url"]] = entry
@@ -1109,6 +1338,7 @@ async def crawl(
     steer: Optional[Dict[str, float]] = None,
     sitemaps: Optional[Callable[[str], Awaitable[Tuple[List[Tuple[str, str]], int, int]]]] = None,
     watch: Sequence[Dict[str, Any]] = (),
+    ranking: Tuple[str, float] = ("fixed", 1.0),
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
@@ -1117,7 +1347,7 @@ async def crawl(
     watch: watched pages, {"id", "url", "every_hours"} each. Those never served or last served every_hours ago or more
     are fetched before any ranked take, oldest due first, up to WATCH_SHARE of max_fetches. Each is a fetch row with
     line_id "watch:<id>"; the links of a changed one are queued as links of the line covering its host. When each was
-    last served is kept in state/watch.json.
+    last served is kept in state/watch.json. ranking: (mode, temperature) for Frontier.rank().
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -1136,6 +1366,7 @@ async def crawl(
     with timed(seconds, "load_state"):
         frontier = Frontier.load(store, workdir, rng_seed=now().strftime("%Y-%m-%dT%H"))   # the run's start hour: re-tests reproducible
     frontier.steer(steer or {})
+    frontier.rank(*ranking)
     by_id = {seed.id: seed for seed in seeds}
     retries_expired = frontier.expire_retries(now())
     seeds_added = frontier.add_seeds(seeds, now())
@@ -1402,6 +1633,7 @@ async def crawl(
             "fetches_steered_down": counts["steered_down"], "fetches_steered_up": counts["steered_up"],
             "queued_held_by_steer": sum(len(g.members) for g in frontier._groups.values() if frontier.factor(g.host) == 0),
             "seconds": {key: round(value, 1) for key, value in seconds.items()},
+            "ranking": frontier.ranking_record(),
             "seed_url_problems": seed_url_problems, "seed_url_redirects": seed_url_redirects,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
             "data_portals": dict(sorted(data_portals.items(), key=lambda item: -item[1])[:20]),
