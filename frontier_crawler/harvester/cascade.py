@@ -24,6 +24,7 @@ import certifi
 import httpx
 
 from frontier_crawler.harvester import readers
+from frontier_crawler.harvester.courtesy import crawl_delay, sit_out
 from frontier_crawler.harvester.readers import Links, ReaderFailed, ReaderPool, decode, pdf_text, read_html
 from frontier_crawler.harvester.throttle import HostThrottle
 
@@ -79,6 +80,7 @@ class ScrapeResult:
     throttle_wait: float = 0.0  # seconds this fetch waited for its host's turn
     links: Optional[Links] = None  # (links, unparseable hrefs) of an HTML page, as its reader found them
     title: Optional[str] = None  # an HTML page's <title>, a PDF's metadata title
+    cool_host: bool = False  # the server asked for a pause too long to wait out (courtesy.sit_out): leave its host for the run
 
 
 @contextlib.contextmanager
@@ -320,6 +322,7 @@ class HarvesterCascade:
                 content_type = response.headers.get("content-type", "")
                 final_url = str(response.url)
                 body, size = await read_capped(response)
+        pause = sit_out(self._throttle, url, status, response.headers.get("retry-after"))
         if body is None:
             # Not cut short and kept: half a PDF or archive is unreadable.
             result = _failed(final_url, "DOM_TRAFILATURA", "too large", status)
@@ -328,7 +331,8 @@ class HarvesterCascade:
             return result, False
 
         def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None, title: Optional[str] = None) -> ScrapeResult:
-            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links, title=title)
+            return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links, title=title,
+                                cool_host=bool(pause))
 
         def undecoded(encoding: Optional[str]) -> Optional[str]:
             """Count a page read in a legacy encoding; the note when no encoding fit."""
@@ -357,7 +361,7 @@ class HarvesterCascade:
             return served(None, "DOM_TRAFILATURA", f"html not read: {exc}"), False
         words = word_count(text or "")
         shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
-        if (status == 200 and shell) or status in _BROWSER_RETRY_STATUS:
+        if ((status == 200 and shell) or status in _BROWSER_RETRY_STATUS) and pause is None:   # a server asking for a pause gets one
             return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links, title), True
         return served(text, "DOM_TRAFILATURA", note, links, title), False
 
@@ -374,10 +378,18 @@ class HarvesterCascade:
     async def sitemap_entries(self, origin: str) -> Tuple[List[Tuple[str, str]], int, int]:
         """(url, lastmod) from the sitemaps the robots.txt of origin ("https://host") names, or from /sitemap.xml when it names
         none, following sitemap indexes one level (the newest sitemaps they list first); then how many sitemap files were read and how many failed.
-        At most MAX_SITEMAP_FILES files are fetched. Only discovery: robots.txt rules are not read."""
+        At most MAX_SITEMAP_FILES files are fetched. Only discovery and pacing: the robots.txt Crawl-delay for us becomes the
+        host's gap in the throttle (its intervals); its rules are not read."""
         try:
             status, body = await self.get(origin + "/robots.txt")
             files = readers.robots_sitemaps(body) if status == 200 else []
+            if self._throttle is not None and status < 500:   # a 4xx means no robots.txt, so no delay; a 5xx says nothing
+                delay = crawl_delay(body, USER_AGENT) if status == 200 else None
+                host = urlsplit(origin).netloc.lower()
+                if delay:
+                    self._throttle.intervals[host] = delay
+                else:
+                    self._throttle.intervals.pop(host, None)
         except Exception:
             files = []
         entries: List[Tuple[str, str]] = []

@@ -177,7 +177,8 @@ def test_host_counts_record_what_fetching_took(tmp_path: Path) -> None:
     store.put_many(frontier.save(tmp_path / "w"), "state")
     import pyarrow.parquet as pq
     (host,) = pq.read_table(tmp_path / "store" / "state" / "hosts.parquet").to_pylist()
-    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1, "sitemap_read_at": None}
+    assert host == {"host": "a.test", "fetches": 4, "content": 2, "heavy": 1, "refused": 1, "errors": 0, "error_pages": 1, "sitemap_read_at": None,
+                    "crawl_delay_s": None}
     assert frontier.line("s")["content"] == 2
 
 
