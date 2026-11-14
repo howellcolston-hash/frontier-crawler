@@ -70,6 +70,20 @@ def test_a_run_prints_counts_only_and_records_the_rest_in_the_store(tmp_path: Pa
     assert record["status"] == "failed" and "secret.test" in record["notes"][0] and record["stats"]["stored"] == 3
 
 
+def test_a_run_prints_why_judging_stopped_as_numbers(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "open_store", lambda: LocalStore(tmp_path))
+
+    async def job(args, ctx):
+        ctx["stats"] = {"judged": 0, "jev_stopped": "Jev refused 3 calls in a row (HTTP 401); judging stopped for this run",
+                        "jev_stop_status": 401, "jev_rejected_documents": 2, "jev_rejections_by_status": {"401": 3, "422": 2},
+                        "stored_by_seed": {"secret-seed": 4}}
+        ctx["status"] = "partial"
+
+    cli._run(type("Args", (), {"command": "judge"})(), {}, job)
+    assert json.loads(capsys.readouterr().out) == {"status": "partial", "stopped_by": None, "judged": 0, "jev_stop_status": 401,
+                                                   "jev_rejected_documents": 2, "jev_rejections_by_status": {"401": 3, "422": 2}}
+
+
 def test_a_derived_run_paces_by_the_kept_crawl_delays_and_queues_followed_links(tmp_path: Path, monkeypatch, capsys) -> None:
     import datetime as dt
 

@@ -293,6 +293,8 @@ def _run(args: argparse.Namespace, params: Dict[str, Any], job: Any) -> None:
         except Exception as exc:  # the store's own errors name the repository
             print(f"run record not written: {type(exc).__name__}", file=sys.stderr)
     counts = {k: v for k, v in stats.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    # Why judging stopped, as numbers: the HTTP status (null when none) and refusals by status ("malformed" when no status).
+    counts.update({k: stats[k] for k in ("jev_stop_status", "jev_rejections_by_status") if k in stats})
     print(json.dumps({"status": ctx["status"], "stopped_by": stats.get("stopped_by"), **counts}, sort_keys=True, indent=1))
     if error is not None:
         raise SystemExit(f"run failed: {type(error).__name__} (details are in the run record)")

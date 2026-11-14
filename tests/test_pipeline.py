@@ -7,7 +7,7 @@ import dataclasses
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import pyarrow.parquet as pq
@@ -385,7 +385,7 @@ def test_jev_outage_and_refusal_are_different_errors() -> None:
 
     with pytest.raises(JevRejected) as caught:
         asyncio.run(_jev(unauthorised).ask("text", QUESTIONS_V1))
-    assert len(refused) == 1 and "test-key" not in str(caught.value)
+    assert len(refused) == 1 and "test-key" not in str(caught.value) and caught.value.status == 401
 
 
 def test_jev_rejects_a_boolean_noul() -> None:
@@ -394,8 +394,9 @@ def test_jev_rejects_a_boolean_noul() -> None:
         body["answers"]["junk_page_v1"] = {"type": "noul", "noul": True}
         return httpx.Response(200, json=body)
 
-    with pytest.raises(JevRejected):
+    with pytest.raises(JevRejected) as caught:
         asyncio.run(_jev(handler).ask("text", QUESTIONS_V1))
+    assert caught.value.status is None   # a malformed reply has no status of its own
 
 
 def test_relevance_and_threshold() -> None:
@@ -511,6 +512,59 @@ def test_repeated_refusals_stop_judging_for_the_run(tmp_path: Path) -> None:
     engine = _engine(tmp_path, FakeCascade(pages), "r1", jev=_jev(unauthorised), monthly_usd=8, concurrency=1)
     stats = asyncio.run(engine.run([_job(url) for url in pages]))
     assert stats["stored"] == 6 and len(hits) == 3 and "refused 3 calls" in stats["jev_stopped"]
+    assert stats["jev_stop_status"] == 401 and stats["jev_rejected_documents"] == 0 and stats["jev_rejections_by_status"] == {"401": 3}
+
+
+def _refusing(tmp_path: Path, replies: List[int], pages: int) -> Tuple[Dict[str, Any], List[int]]:
+    """A crawl run of `pages` documents, one at a time, with Jev replying replies[i] to call i (200 once they run out; 0: malformed)."""
+    pages_by_url = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(pages)}
+    hits: List[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = replies[len(hits)] if len(hits) < len(replies) else 200
+        hits.append(status)
+        return httpx.Response(200, json={"answers": None}) if status == 0 else httpx.Response(status, json=_jev_body() if status == 200 else {})
+
+    engine = _engine(tmp_path, FakeCascade(pages_by_url), "r1", jev=_jev(handler), monthly_usd=8, concurrency=1)
+    return asyncio.run(engine.run([_job(url) for url in pages_by_url])), hits
+
+
+def test_documents_refused_for_themselves_do_not_stop_judging(tmp_path: Path) -> None:
+    stats, hits = _refusing(tmp_path, [400, 413, 422, 0, 400, 200, 401, 401, 422, 401], 12)
+    assert len(hits) == 12 and stats["jev_stopped"] is None and stats["jev_stop_status"] is None
+    assert stats["judged"] == 3 and stats["pending"] == 9 and stats["jev_rejected_documents"] == 6
+    assert stats["jev_rejections_by_status"] == {"400": 2, "413": 1, "422": 2, "malformed": 1, "401": 3}
+    calls = _rows(tmp_path / "store", "judgement_calls")
+    assert sorted(call["status"] for call in calls) == ["ok"] * 3 + ["rejected"] * 9
+    assert {call["error"] for call in calls if call["status"] == "rejected"} == {"HTTP 400", "HTTP 401", "HTTP 413", "HTTP 422", "reply has no answers object"}
+
+
+def test_a_long_run_of_document_refusals_stops_judging(tmp_path: Path) -> None:
+    stats, hits = _refusing(tmp_path, [422] * 60, 55)
+    assert len(hits) == 50 and stats["jev_stop_status"] == 422 and "refused 50 calls" in stats["jev_stopped"]
+    assert stats["jev_rejected_documents"] == 50 and stats["pending"] == 55 and stats["judged"] == 0
+
+
+def test_the_backlog_is_judged_newest_day_first(tmp_path: Path) -> None:
+    older, newer = DAY - dt.timedelta(days=2), DAY - dt.timedelta(days=1)
+    for n, day in enumerate((older, newer, DAY)):
+        text = f"document from day {n}. " + DOC
+        _old_format_shard(tmp_path, [{"fetch_id": f"f{n}", "outcome": "stored", "tier_used": "DOM_TRAFILATURA", "sha256": f"{n:02d}" * 32,
+                                      "text": text, "word_count": len(text.split())}], day)
+    asked: List[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(json.loads(request.content)["state"].split(".")[0])
+        return httpx.Response(200, json=_jev_body())
+
+    engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / "work-j", jev=_jev(handler), monthly_usd=8, now=lambda: NOW, run_id="j", concurrency=1)
+
+    async def go() -> Dict[str, Any]:
+        await engine.start()
+        await engine.judge_days([older, newer, DAY])
+        return await engine.finish()
+
+    assert asyncio.run(go())["judged"] == 3 and asked == ["document from day 2", "document from day 1", "document from day 0"]
 
 
 def test_a_run_uploads_its_tables_and_state_in_one_commit(tmp_path: Path) -> None:

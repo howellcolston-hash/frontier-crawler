@@ -35,7 +35,14 @@ class JevUnavailable(Exception):
 
 
 class JevRejected(Exception):
-    """Jev refused the request (bad key, bad body, or an answer missing from the reply)."""
+    """Jev refused the request (bad key, bad body, or an answer missing from the reply).
+
+    status is the HTTP status Jev returned, or None when the reply (or the request) was malformed.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -156,7 +163,7 @@ class JevClient:
                     if retry_after.isdigit():
                         wait = min(float(retry_after), 60.0)
                 else:
-                    raise JevRejected(f"HTTP {status}")
+                    raise JevRejected(f"HTTP {status}", status)
             if attempt < self._retries:
                 await self._sleep(wait)
         raise JevUnavailable(last)
