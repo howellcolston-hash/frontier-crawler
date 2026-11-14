@@ -77,7 +77,8 @@ still through data. That replaces the re-test and new-domain shares: untried arm
 mode (state/lines.parquet), so switching modes loses nothing.
 
 state/hosts.parquet counts, per host, what fetching it took: fetches, content, fetches that
-needed the PDF or browser tier, refusals, failures and dead links; and when its sitemaps were last read.
+needed the PDF or browser tier, refusals, failures and dead links; when its sitemaps were last read; and the
+Crawl-delay its robots.txt asked of us (harvester/courtesy.py), which crawl hands to the throttle so later runs keep it.
 
 The queue on disk (storage/queue.py: state/queue/). Queued entries live in bucket files sorted by group; every other URL
 the queue has known is a 64-bit key in a seen set (a never-seen URL is wrongly taken as seen with probability n / 2^64 for
@@ -100,8 +101,14 @@ seen set and in the links table, which holds every link of every stored page.
 
 Sitemaps. At the start of a run, a seed's starting sites and the sites with a line on a domain steered above 1 have
 their robots.txt and the sitemaps it names (else /sitemap.xml) read, at most once per SITEMAP_EVERY, and up to
-SITEMAP_MAX_URLS new URLs each, newest first, are queued as ordinary links (add_sitemap). Discovery only: robots.txt
-rules are not applied.
+SITEMAP_MAX_URLS new URLs each, newest first, are queued as ordinary links (add_sitemap). Its Crawl-delay for us, when
+longer than the throttle's gap, becomes that host's gap. Discovery and pacing only: robots.txt rules are not applied.
+
+Sitting out. A host that answers 429, or 503 with a Retry-After, waits that long in the throttle; one whose wait would be
+past courtesy.MAX_SIT_OUT_S, or that gives a 429 no wait, is cooled for the rest of the run (row["cool_host"]), as the
+breaker cools one after COOL_AFTER fetches in a row that served nothing.
+
+Derived clients' list pages may name detail pages to follow (derived.py); add_followed queues them as ordinary links.
 
 Watched pages (crawl's watch, from config/watch.json) are fetched before any ranked take when due, outside the queue,
 up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as links of its site's line.
@@ -150,6 +157,7 @@ from tld import get_fld
 
 from frontier_crawler.harvester.cascade import Target, timed
 from frontier_crawler.harvester.readers import newest_first, normalise
+from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
 from frontier_crawler.storage.queue import QueueFiles, group_key, kept as kept_whole, starting as is_start
@@ -207,7 +215,9 @@ LINES_PATH = "state/lines.parquet"
 _TS = pa.timestamp("us", tz="UTC")
 _HOST_COUNTS = ("fetches", "content", "heavy", "refused", "errors", "error_pages")
 # sitemap_read_at: when its robots.txt and sitemaps were last read (null: never; absent from files saved before sitemaps were read).
-_HOSTS_SCHEMA = pa.schema([("host", pa.string())] + [(name, pa.int64()) for name in _HOST_COUNTS] + [("sitemap_read_at", _TS)])
+# crawl_delay_s: the Crawl-delay its robots.txt asks of us, capped (null: none; absent from files saved before it was read).
+_HOSTS_SCHEMA = pa.schema([("host", pa.string())] + [(name, pa.int64()) for name in _HOST_COUNTS]
+                          + [("sitemap_read_at", _TS), ("crawl_delay_s", pa.float64())])
 
 _LINES_SCHEMA = pa.schema(
     [
@@ -233,6 +243,14 @@ _LINES_SCHEMA = pa.schema(
 _REFUSED_STATUS = {401, 403, 407, 429, 451, 503}
 _HEAVY_TIERS = {"PDF", "HEADLESS_PLAYWRIGHT"}
 _HTML_TIERS = {"DOM_TRAFILATURA", "HEADLESS_PLAYWRIGHT"}
+
+
+def crawl_delays(store: Store, workdir: Path) -> Dict[str, float]:
+    """host -> the Crawl-delay kept in state/hosts.parquet, for a run that does not load the whole frontier."""
+    local = Path(workdir) / "state-in" / "hosts.parquet"
+    if not store.get(HOSTS_PATH, local):
+        return {}
+    return Frontier(hosts=pq.read_table(local).to_pylist()).crawl_delay
 
 
 @dataclass(frozen=True)
@@ -371,6 +389,7 @@ class Frontier:
             row["host"]: {name: int(row.get(name) or 0) for name in _HOST_COUNTS} for row in (hosts or [])
         }
         self.sitemap_read: Dict[str, dt.datetime] = {row["host"]: row["sitemap_read_at"] for row in (hosts or []) if row.get("sitemap_read_at")}
+        self.crawl_delay: Dict[str, float] = {row["host"]: row["crawl_delay_s"] for row in (hosts or []) if row.get("crawl_delay_s")}
         # Lines saved before 2026-11-11 may carry status "frozen", since_thaw and frozen_at: every line is active, and those are dropped on save.
         self._lines: Dict[str, Dict[str, Any]] = {line["line_id"]: line for line in (lines or [])}
         for line in self._lines.values():
@@ -557,8 +576,9 @@ class Frontier:
         out = Path(workdir) / "state-out"
         out.mkdir(parents=True, exist_ok=True)
         zero = dict.fromkeys(_HOST_COUNTS, 0)
-        host_rows = [{"host": host, **self._hosts.get(host, zero), "sitemap_read_at": self.sitemap_read.get(host)}
-                     for host in sorted(set(self._hosts) | set(self.sitemap_read))]
+        host_rows = [{"host": host, **self._hosts.get(host, zero), "sitemap_read_at": self.sitemap_read.get(host),
+                      "crawl_delay_s": self.crawl_delay.get(host)}
+                     for host in sorted(set(self._hosts) | set(self.sitemap_read) | set(self.crawl_delay))]
         files: List[Tuple[Path, str]] = []
         for remote, schema, rows in (
             (HOSTS_PATH, _HOSTS_SCHEMA, host_rows),
@@ -868,6 +888,17 @@ class Frontier:
                 added += self._add(url, self._lines[line_id]["seed_id"], line_id, 1, DEFAULT_LINK_BASE, now)
         return added
 
+    def add_followed(self, seed_id: str, urls: Sequence[str], now: dt.datetime) -> int:
+        """Queue the detail pages a derived client's list pages link to, as ordinary links of the seed's line (else the line
+        covering their host), one step from its start, at DEFAULT_LINK_BASE. Returns how many were new; a URL with no line
+        to join is not queued."""
+        added = 0
+        for url in urls:
+            line_id = seed_id if seed_id in self._lines else self._host_line.get(urlsplit(url).netloc)
+            if line_id is not None:
+                added += self._add(url, self._lines[line_id]["seed_id"], line_id, 1, DEFAULT_LINK_BASE, now)
+        return added
+
     def add_links(self, entry: Dict[str, Any], row: Dict[str, Any], answers: Optional[JevResult], now: dt.datetime) -> int:
         """Queue the links of a stored HTML page, row["links"] as the engine extracted them. Returns how many were new."""
         if row.get("outcome") != "stored" or row.get("block_marker") or not row.get("links"):
@@ -926,7 +957,7 @@ class Frontier:
         outcome = row.get("outcome")
         # A timeout or a connection error (nothing served) is a strike; anything served clears them.
         self._strikes[entry["host"]] = self._strikes.get(entry["host"], 0) + 1 if outcome == "error" else 0
-        if self._strikes[entry["host"]] >= COOL_AFTER:
+        if self._strikes[entry["host"]] >= COOL_AFTER or row.get("cool_host"):
             self.cooled.add(entry["host"])   # its entries stay queued for later runs; the heaps drop its groups
         if outcome != "error":
             self._set_status(entry, "fetched")
@@ -1713,6 +1744,7 @@ async def crawl(
     sitemaps: Optional[Callable[[str], Awaitable[Tuple[List[Tuple[str, str]], int, int]]]] = None,
     watch: Sequence[Dict[str, Any]] = (),
     ranking: Tuple[str, float] = ("fixed", 1.0),
+    throttle: Optional[HostThrottle] = None,
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
@@ -1721,7 +1753,8 @@ async def crawl(
     watch: watched pages, {"id", "url", "every_hours"} each. Those never served or last served every_hours ago or more
     are fetched before any ranked take, oldest due first, up to WATCH_SHARE of max_fetches. Each is a fetch row with
     line_id "watch:<id>"; the links of a changed one are queued as links of the line covering its host. When each was
-    last served is kept in state/watch.json. ranking: (mode, temperature) for Frontier.rank().
+    last served is kept in state/watch.json. ranking: (mode, temperature) for Frontier.rank(). throttle: the cascade's; the
+    Crawl-delays kept in state/hosts.parquet become its intervals at the start, and its intervals are kept at the end.
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
@@ -1741,6 +1774,8 @@ async def crawl(
         frontier = Frontier.load(store, workdir, rng_seed=now().strftime("%Y-%m-%dT%H"))   # the run's start hour: re-tests reproducible
     frontier.steer(steer or {})
     frontier.rank(*ranking)
+    if throttle is not None:
+        throttle.intervals.update(frontier.crawl_delay)
     by_id = {seed.id: seed for seed in seeds}
     retries_expired = frontier.expire_retries(now())
     seeds_added = frontier.add_seeds(seeds, now())
@@ -1982,6 +2017,8 @@ async def crawl(
         raise
     done.set()
     await uploader
+    if throttle is not None:
+        frontier.crawl_delay = dict(throttle.intervals)
     with timed(seconds, "final_save"):
         stats = dict(await engine.finish(frontier.save(workdir) + ([save_watch_times(
             {w["url"]: watch_times[w["url"]] for w in watch if w["url"] in watch_times}, workdir)] if watch else [])))

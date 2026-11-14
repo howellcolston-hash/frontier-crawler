@@ -153,7 +153,8 @@ def test_a_later_page_failing_is_reported_without_calling_the_client_broken(tmp_
         return httpx.Response(200, json={"data": {"items": [{"vessel": "MV A", "eta": "2026-11-12"}]}})
 
     stats = _run(tmp_path, _spec(tmp_path), handler)
-    assert stats["clients"]["port-vessels"] == {"status": "ok", "pages": 1, "records": 1, "stopped": "page 2: status 429"}
+    assert stats["clients"]["port-vessels"] == {"status": "ok", "pages": 1, "records": 1,
+                                                    "stopped": "page 2: status 429; the host is left alone for the rest of the run"}
 
 
 def test_a_client_that_gets_no_reply_is_broken_and_the_next_one_still_runs(tmp_path: Path) -> None:
@@ -214,3 +215,125 @@ def test_capture_helpers_sort_data_requests_from_noise() -> None:
     assert "secret" not in json.dumps(headers)
     assert json_shape({"data": {"items": [{"vessel": "A", "berth": 3}], "page": 1}}) == {
         "data": {"items": {"list_len": 1, "item": {"vessel": "str", "berth": "int"}}, "page": "int"}}
+
+
+# ---------------------------------------------------------------- html list clients
+
+LIST = {
+    "id": "notices", "entity": "Example notices", "seed_id": "example-port", "reply": "html",
+    "request": {"method": "POST", "url": "https://list.test/search", "form": {"q": "", "type": "all"}},
+    "paginate": {"in": "form", "field": "page", "start": 1, "step": 1, "max_pages": 5000},
+    "fingerprint": {"contains": ["Notice list"], "min_bytes": 40},
+    "follow": r"^https://list\.test/notice/\d+$",
+    "min_interval_s": 3,
+}
+
+
+def _list_site(pages: int = 3, marker: str = "Notice list") -> Any:
+    """Form-posted list pages of two notices each; past the last page the site serves the last page again."""
+    calls: List[Dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = dict(httpx.QueryParams(request.content.decode()))
+        calls.append({**form, "method": request.method, "sent_as": request.headers["content-type"]})
+        page = min(int(form["page"]), pages)
+        rows = "".join(f'<li><a href="/notice/{page}{i}">Notice {page}{i}</a></li>' for i in range(2))
+        return httpx.Response(200, text=f'<html><body><h1>{marker}</h1><a href="/about">About</a><ul>{rows}</ul></body></html>',
+                              headers={"content-type": "text/html"})
+
+    handler.calls = calls  # type: ignore[attr-defined]
+    return handler
+
+
+def test_a_list_spec_posts_a_form_and_its_paging_and_bad_specs_are_refused(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, **LIST)
+    assert (spec.reply, spec.contains, spec.min_bytes, spec.min_interval_s, spec.pages) == ("html", ("Notice list",), 40, 3.0, 5000)
+    method, url, _, body, key = page_request(spec, 1)
+    assert (method, url, body) == ("POST", "https://list.test/search", "q=&type=all&page=2") and key.startswith(url + "#form-")
+    assert key != page_request(spec, 0)[4] and spec.request["form"] == {"q": "", "type": "all"}
+    for bad, why in ((dict(fingerprint={}), "contains"), (dict(reply="xml"), "reply"), (dict(follow="("), "unterminated"),
+                     (dict(request={"method": "GET", "url": "https://list.test/s", "form": {}}), "form"),
+                     (dict(reply="json", records_path="items"), "follow"), (dict(min_interval_s=-1), "min_interval_s")):
+        with pytest.raises(ValueError, match=why):
+            _spec(tmp_path, **{**LIST, **bad})
+
+
+def test_a_list_client_pages_until_the_site_repeats_and_queues_the_detail_pages(tmp_path: Path) -> None:
+    from frontier_crawler.frontier import Frontier, Seed
+    from frontier_crawler.harvester.throttle import HostThrottle
+
+    site = _list_site(pages=3)
+    frontier = Frontier()
+    frontier.add_seeds([Seed(id="example-port", entity="port", urls=("https://port.test/",))], NOW)
+    async def no_sleep(_: float) -> None:
+        return None
+
+    throttle = HostThrottle(0.0, sleep=no_sleep)
+
+    async def go() -> Dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(site)) as http:
+            fetcher = DerivedFetcher(http, throttle)
+            engine = Engine(LocalStore(tmp_path / "store"), fetcher, workdir=tmp_path / "work", now=lambda: NOW, run_id="r1", concurrency=1)
+            await engine.start()
+            results = await run_derived(engine, [_spec(tmp_path, **LIST)], fetcher, frontier, now=lambda: NOW)
+            await engine.finish()
+            return results
+
+    results = asyncio.run(go())
+    assert results["notices"] == {"status": "ok", "pages": 3, "followed": 6}
+    assert [call["page"] for call in site.calls] == ["1", "2", "3", "4"]       # page 4 repeats page 3: the end
+    assert site.calls[0]["method"] == "POST" and site.calls[0]["sent_as"] == "application/x-www-form-urlencoded"
+    queued = frontier.entry("https://list.test/notice/31")
+    assert queued["line_id"] == "example-port" and queued["hops"] == 1 and frontier.entry("https://list.test/about") is None
+    assert throttle.intervals == {"list.test": 3.0}
+    rows = _fetch_rows(tmp_path)
+    assert rows[0]["tier_used"] == "API" and "Notice 10" in rows[0]["text"] and rows[3]["outcome"] == "duplicate"
+
+
+@pytest.mark.parametrize("marker,body_bytes,expected", [
+    ("Notice list", 0, "ok"),
+    ("Maintenance", 0, "broken: page lacks ['Notice list']"),
+    ("Notice list", 100_000, "broken: "),
+])
+def test_an_html_client_is_broken_when_its_markers_or_bytes_go(tmp_path: Path, marker: str, body_bytes: int, expected: str) -> None:
+    spec = _spec(tmp_path, **{**LIST, "fingerprint": {"contains": ["Notice list"], "min_bytes": body_bytes}})
+    assert health(spec, 200, f"<html><h1>{marker}</h1></html>".encode()).startswith(expected)
+
+
+def test_a_list_ends_at_a_page_without_its_markers_and_a_429_first_page_is_not_a_break(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = dict(httpx.QueryParams(request.content.decode()))["page"]
+        if request.url.host == "busy.test":
+            return httpx.Response(429)
+        return _list_site(pages=9, marker="Notice list" if page == "1" else "No results")(request)
+
+    specs = [_spec(tmp_path, **{**LIST, "follow": None}),
+             _spec(tmp_path, **{**LIST, "id": "busy-a", "follow": None, "request": {"method": "POST", "url": "https://busy.test/s"}}),
+             _spec(tmp_path, **{**LIST, "id": "busy-b", "follow": None, "request": {"method": "POST", "url": "https://busy.test/t"}})]
+    stats = _run(tmp_path, specs[0], handler)
+    assert stats["clients"]["notices"] == {"status": "ok", "pages": 1}
+
+    async def go() -> Dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            fetcher = DerivedFetcher(http)
+            engine = Engine(LocalStore(tmp_path / "s2"), fetcher, workdir=tmp_path / "w2", now=lambda: NOW, run_id="r2", concurrency=1)
+            await engine.start()
+            results = await run_derived(engine, specs[1:], fetcher)
+            return {**(await engine.finish()), "clients": results}
+
+    busy = asyncio.run(go())
+    assert busy["clients"]["busy-a"] == {"status": "ok", "pages": 0, "stopped": "page 1: status 429; the host is left alone for the rest of the run"}
+    assert busy["clients"]["busy-b"]["stopped"] == "page 1: the host is left alone for the rest of the run" and busy["total"] == 2
+
+
+def test_a_short_retry_after_is_waited_and_the_page_asked_again(tmp_path: Path) -> None:
+    seen: List[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(503, headers={"retry-after": "0"})
+        return httpx.Response(200, json={"data": {"items": [{"vessel": "MV A", "eta": "2026-11-12"}]}})
+
+    stats = _run(tmp_path, _spec(tmp_path, paginate=None), handler)
+    assert stats["clients"]["port-vessels"] == {"status": "ok", "pages": 1, "records": 1} and len(seen) == 2

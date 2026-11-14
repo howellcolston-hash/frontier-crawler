@@ -316,7 +316,8 @@ class Engine:
     async def fetch(self, target: Target, **limits: float) -> Dict[str, Any]:
         """Fetch one target, buffer its row and count it. Returns the row with two keys that are not stored columns:
         row["links"], (links, unparseable hrefs) of a stored HTML page as its reader found them, else None;
-        and row["timed_out"], set when nothing was served because of a timeout. limits (timeout=, connect=) go to the fetcher."""
+        row["timed_out"], set when nothing was served because of a timeout; and row["cool_host"], set when the server asked
+        for a pause too long to wait out. limits (timeout=, connect=) go to the fetcher."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
             row, scraped, links = await self._fetch_row(target, limits)
@@ -336,6 +337,8 @@ class Engine:
             self._judgeable_seen += 1
             if not self.sampled(row):
                 self.stats["not_sampled"] += 1
+        if scraped is not None and scraped.cool_host:
+            row = {**row, "cool_host": True}
         if scraped is not None and scraped.timed_out:
             return {**row, "links": links, "timed_out": True}
         return {**row, "links": links}

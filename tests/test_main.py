@@ -68,3 +68,42 @@ def test_a_run_prints_counts_only_and_records_the_rest_in_the_store(tmp_path: Pa
     assert json.loads(printed.out) == {"status": "failed", "stopped_by": "max_minutes", "stored": 3}
     (record,) = [json.loads(p.read_text()) for p in (tmp_path / "runs").glob("*-crawl.json")]
     assert record["status"] == "failed" and "secret.test" in record["notes"][0] and record["stats"]["stored"] == 3
+
+
+def test_a_derived_run_paces_by_the_kept_crawl_delays_and_queues_followed_links(tmp_path: Path, monkeypatch, capsys) -> None:
+    import datetime as dt
+
+    import httpx
+
+    from frontier_crawler.frontier import Frontier, Seed
+    from frontier_crawler.harvester import throttle as throttle_module
+
+    now = dt.datetime(2026, 11, 14, tzinfo=dt.timezone.utc)
+    store = LocalStore(tmp_path / "store")
+    frontier = Frontier(hosts=[{"host": "list.test", "crawl_delay_s": 2.5}])
+    frontier.add_seeds([Seed(id="s", entity="s", urls=("https://list.test/",))], now)
+    store.put_many(frontier.save(tmp_path / "w"), "state")
+    clients = tmp_path / "clients"
+    clients.mkdir()
+    (clients / "notices.json").write_text(json.dumps({
+        "id": "notices", "entity": "notices", "seed_id": "s", "reply": "html", "follow": r"/notice/\d+$",
+        "request": {"url": "https://list.test/notices"}, "fingerprint": {"contains": ["Notices"]}}), encoding="utf-8")
+    page = '<html><h1>Notices</h1><a href="/notice/1">one</a><a href="/help">help</a></html>'
+    monkeypatch.setattr(cli, "open_store", lambda: store)
+    monkeypatch.setattr(cli, "_api_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, text=page, headers={"content-type": "text/html"}))))
+    gaps = []
+    original = throttle_module.HostThrottle.__init__
+
+    def spy(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        gaps.append(dict(self.intervals))
+
+    monkeypatch.setattr(throttle_module.HostThrottle, "__init__", spy)
+    args = type("Args", (), {"command": "derived", "check": None, "clients": str(clients), "min_interval": 1.0})()
+    cli._run(args, {}, cli._derived)
+    assert gaps == [{"list.test": 2.5}] and "list.test" not in capsys.readouterr().out
+    (record,) = [json.loads(p.read_text()) for p in (tmp_path / "store" / "runs").glob("*-derived.json")]
+    assert record["stats"]["clients"] == {"notices": {"status": "ok", "pages": 1, "followed": 1}}
+    later = Frontier.load(store, tmp_path / "check")
+    assert later._known("https://list.test/notice/1") and later.crawl_delay == {"list.test": 2.5}

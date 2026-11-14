@@ -39,7 +39,7 @@ import httpx
 
 from frontier_crawler import capture as capture_module
 from frontier_crawler import derived as derived_module
-from frontier_crawler.frontier import RANKING_MODES, crawl, load_seeds
+from frontier_crawler.frontier import RANKING_MODES, Frontier, crawl, crawl_delays, load_seeds
 from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _guard_request
 from frontier_crawler.harvester.throttle import HostThrottle
@@ -165,10 +165,11 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         steer, steer_ignored = _steer(store, Path(workdir))
         watch, watch_file_ignored, watch_entries_ignored = _watch(store, Path(workdir))
         ranking, ranking_ignored = _ranking(store, Path(workdir))
-        async with httpx.AsyncClient() as http, HarvesterCascade(throttle=HostThrottle(args.min_interval)) as cascade:
+        throttle = HostThrottle(args.min_interval)
+        async with httpx.AsyncClient() as http, HarvesterCascade(throttle=throttle) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
-                                sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking)
+                                sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle)
     stats["steer_file_ignored"], stats["ranking_file_ignored"] = steer_ignored, ranking_ignored
     stats["watch_file_ignored"], stats["watch_entries_ignored"] = watch_file_ignored, watch_entries_ignored
     _report(ctx, stats)
@@ -235,13 +236,15 @@ async def _derived(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
                     raise SystemExit(f"no client named {args.check}")
                 print(json.dumps(await derived_module.check(spec, http), indent=1, ensure_ascii=False))
                 return
-            fetcher = derived_module.DerivedFetcher(http, HostThrottle(args.min_interval))
+            # The crawl's Crawl-delays apply here too; the queue is loaded only for a client that follows links.
+            fetcher = derived_module.DerivedFetcher(http, HostThrottle(args.min_interval, intervals=crawl_delays(store, Path(workdir))))
+            frontier = Frontier.load(store, Path(workdir)) if any(spec.follow for spec in specs) else None
             engine = Engine(store, fetcher, workdir=Path(workdir), concurrency=1)
             await engine.start()
             try:
-                results = await derived_module.run_derived(engine, specs, fetcher)
+                results = await derived_module.run_derived(engine, specs, fetcher, frontier)
             finally:
-                stats = await engine.finish()
+                stats = await engine.finish(frontier.save(Path(workdir)) if frontier is not None else ())
     broken = {name: result["status"] for name, result in results.items() if result["status"] != "ok"}
     _report(ctx, {**stats, "clients": results, "broken_clients": broken})
     if broken:
