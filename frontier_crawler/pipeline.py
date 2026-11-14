@@ -64,8 +64,12 @@ _BLOCK_PHRASE_MAX_WORDS = 400
 _ERROR_PAGE_MAX_WORDS = 150
 # PROVISIONAL: a page with fewer words than this has nothing for Jev to read.
 _MIN_JUDGE_WORDS = 20
-# PROVISIONAL: stop calling Jev for the rest of a run after this many refusals in a row (a bad key, a changed API).
+# PROVISIONAL: stop calling Jev for the rest of a run after this many account refusals in a row (a bad key, no credit).
 _MAX_REJECTIONS = 3
+_ACCOUNT_STATUSES = (401, 402, 403)
+# PROVISIONAL: a refusal of one document (another 4xx, a malformed reply) does not count toward that stop, but this
+# many in a row means something systemic (a changed API) and stops the run too.
+_MAX_DOCUMENT_REJECTIONS = 50
 # PROVISIONAL: a crawl run must see at least this many judgeable pages for its count to become the
 # forecast of the next run's need, so a short manual run does not shrink the sample.
 _MIN_FORECAST_PAGES = 500
@@ -169,6 +173,7 @@ class Engine:
         self._last_upload = time.monotonic()
         self._seen: Dict[str, str] = {}
         self._rejections = 0
+        self._document_rejections = 0
         self._sample_rate = 1.0
         self._judgeable_seen = 0
         # Measurement only: seconds summed over fetch slots, per-tier fetch durations, Jev call and upload time.
@@ -183,6 +188,7 @@ class Engine:
             "run_id": self.run_id, "total": 0, "stored": 0, "unchanged": 0, "duplicate": 0, "error_pages": 0,
             "too_large": 0, "errors": 0, "blocked": 0, "judged": 0, "pending": 0, "scans_read": 0,
             "jev_input_tokens": 0, "jev_usd_month": 0.0, "jev_stopped": None, "shards": [],
+            "jev_rejected_documents": 0, "jev_stop_status": None, "jev_rejections_by_status": {},
             "not_sampled": 0, "jev_sample_rate": 1.0,
             "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
             "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
@@ -480,12 +486,21 @@ class Engine:
             refused = isinstance(exc, JevRejected)
             calls.add({**call, "status": "rejected" if refused else "unavailable", "error": str(exc)})
             self.stats["pending"] += 1
-            self._rejections = self._rejections + 1 if refused else 0
-            if self._rejections >= _MAX_REJECTIONS:
-                self.stats["jev_stopped"] = f"Jev refused {self._rejections} calls in a row ({exc}); judging stopped for this run"
+            status = exc.status if refused else None
+            account = refused and status in _ACCOUNT_STATUSES
+            self._rejections = self._rejections + 1 if account else 0
+            self._document_rejections = self._document_rejections + 1 if refused and not account else 0
+            if refused:
+                by_status = self.stats["jev_rejections_by_status"]
+                key = "malformed" if status is None else str(status)
+                by_status[key] = by_status.get(key, 0) + 1
+                self.stats["jev_rejected_documents"] += 0 if account else 1
+            if self._rejections >= _MAX_REJECTIONS or self._document_rejections >= _MAX_DOCUMENT_REJECTIONS:
+                self.stats["jev_stop_status"] = status
+                self.stats["jev_stopped"] = f"Jev refused {max(self._rejections, self._document_rejections)} calls in a row ({exc}); judging stopped for this run"
                 logger.error(self.stats["jev_stopped"])
             return None
-        self._rejections = 0
+        self._rejections = self._document_rejections = 0
         month["input_tokens"] += result.input_tokens
         month["calls"] += 1
         self.stats["judged"] += 1
@@ -507,13 +522,14 @@ class Engine:
         return result
 
     async def judge_days(self, days: Sequence[dt.date]) -> None:
-        """Judge the documents of the given fetch days that have no successful Jev call yet.
+        """Judge the documents of the given fetch days that have no successful Jev call yet, newest day first,
+        so the most recent backlog is scored first and an old day cannot hold up the rest.
 
         shortcut: each day's fetch files are downloaded whole to read their text; read only the
         needed columns over the network once a day's files run to gigabytes.
         """
         columns = ["fetch_id", "sha256", "outcome", "block_marker", "tier_used", "word_count", "text"]
-        for day in days:
+        for day in sorted(days, reverse=True):
             judged = set()
             for remote in await asyncio.to_thread(self._store.list, day_folder("judgement_calls", day)):
                 local = self._workdir / "in" / remote
