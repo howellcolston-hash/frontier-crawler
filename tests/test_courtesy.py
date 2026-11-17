@@ -115,3 +115,41 @@ def test_a_crawl_keeps_crawl_delays_for_later_runs_and_cools_a_host_that_asks(tm
     later = HostThrottle(0.0)
     _crawl(tmp_path, Site(3), run="r2", store=LocalStore(tmp_path / "store"), throttle=later)
     assert later.intervals == {"h1.test": 4.0}
+
+
+def test_request_rate_counts_as_a_gap_and_the_longer_one_wins() -> None:
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 1/10s\n", USER_AGENT) == 10.0
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 6/1m 0900-1700\nCrawl-delay: 4\n", USER_AGENT) == 10.0
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 0/5s\nRequest-rate: soon\n", USER_AGENT) is None
+    assert crawl_delay("﻿User-agent: *\nCrawl-delay: 3\n".encode(), USER_AGENT) == 3.0   # a byte-order mark hides nothing
+
+
+def test_the_throttle_learns_a_slower_gap_from_slow_or_refused_replies_and_never_a_faster_one() -> None:
+    clock = [0.0]
+    slept: List[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock[0] += seconds
+
+    throttle = HostThrottle(2.0, clock=lambda: clock[0], sleep=sleep, intervals={"slow.test": 10.0})
+    throttle.record("https://a.test/1", 0.1, 200)
+    assert throttle.learned["a.test"] == 2.0   # a fast reply never goes below the set gap
+    throttle.record("https://a.test/2", 6.0, 200)
+    assert throttle.learned["a.test"] == 6.0   # a slow one counts at once
+    throttle.record("https://a.test/3", 0.0, 200)
+    assert throttle.learned["a.test"] == 3.0   # a fast one halfway back
+    throttle.record("https://a.test/4", 0.0, 503)
+    assert throttle.learned["a.test"] == 6.0   # a refusal doubles it
+    for _ in range(10):
+        throttle.record("https://a.test/5", 0.0, 429)
+    assert throttle.learned["a.test"] == 60.0
+    throttle.record("https://slow.test/1", 0.0, 200)
+    assert throttle.learned["slow.test"] == 10.0   # a Crawl-delay is a floor too
+
+    async def run() -> None:
+        await throttle.wait("https://a.test/6")
+        await throttle.wait("https://a.test/7")
+
+    asyncio.run(run())
+    assert slept == [60.0]
