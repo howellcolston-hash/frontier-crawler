@@ -11,7 +11,8 @@ changed later and applied to old documents without asking Jev again.
 The questions are configuration, not code: `configure` takes them as a JSON object (the store's
 config/questions.json). EXAMPLE shows the format and is what runs until `configure` is called.
 The crawl reads two answers by name when they are asked: `leads_to_records` (how much a page's
-links are worth) and `data_portal` (candidates for a derived client).
+links are worth) and `data_portal` (candidates for a derived client). An optional `jev_sample`, 0 to 1,
+is the largest share of documents Jev is asked about (pipeline.py samples by content hash).
 """
 
 from __future__ import annotations
@@ -65,22 +66,31 @@ EXAMPLE: Dict[str, Any] = {
 
 _questions: Sequence[Question] = ()
 _rule: Dict[str, Any] = {}
+_jev_sample: Optional[float] = None
 
 
 def configure(config: Mapping[str, Any]) -> None:
     """Set the questions and the relevance rule. Raises ValueError on a config that could not work."""
-    global _questions, _rule
+    global _questions, _rule, _jev_sample
     questions = tuple(Question(q["id"], int(q["version"]), q["type"], q["instructions"], q.get("criteria")) for q in config["questions"])
     rule = dict(config["relevance"])
     nouls = {q.id for q in questions if q.type == "noul"}
     unknown = [name for part in ("all", "any", "none") for name in rule.get(part, []) if name not in nouls]
     if unknown or len({q.id for q in questions}) != len(questions) or float(rule["miss_to_junk_cost"]) <= 0:
         raise ValueError(f"questions config: duplicate ids, a bad cost, or relevance names that are not noul questions: {unknown}")
-    _questions, _rule = questions, rule
+    sample = config.get("jev_sample")
+    if sample is not None and not (isinstance(sample, (int, float)) and not isinstance(sample, bool) and 0 <= sample <= 1):
+        raise ValueError("questions config: jev_sample must be a number from 0 to 1")
+    _questions, _rule, _jev_sample = questions, rule, sample
 
 
 def active() -> Sequence[Question]:
     return _questions
+
+
+def jev_sample() -> Optional[float]:
+    """The configured upper bound on the share of documents judged, or None."""
+    return _jev_sample
 
 
 def relevance_version() -> str:

@@ -39,7 +39,7 @@ import httpx
 
 from frontier_crawler import capture as capture_module
 from frontier_crawler import derived as derived_module
-from frontier_crawler.frontier import RANKING_MODES, Frontier, crawl, crawl_delays, load_seeds
+from frontier_crawler.frontier import RANKING_MODES, SCOPES, SEED_RUN_SHARE, Frontier, crawl, crawl_delays, load_seeds
 from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _guard_request
 from frontier_crawler.harvester.throttle import HostThrottle
@@ -98,20 +98,23 @@ def _steer(store: Store, workdir: Path) -> Tuple[Dict[str, float], int]:
         return {}, 1
 
 
-def _ranking(store: Store, workdir: Path) -> Tuple[Tuple[str, float], int]:
-    """config/ranking.json: {"version": 1, "mode": "fixed" | "bandit" | "shadow", "temperature": number >= 0 (default 1)}.
-    ((mode, temperature), 1) for a file that is not that, which runs the fixed rule: nothing here stops a crawl."""
+def _ranking(store: Store, workdir: Path) -> Tuple[Tuple[str, float], str, int]:
+    """config/ranking.json: {"version": 1, "mode": "fixed" | "bandit" | "shadow", "temperature": number >= 0 (default 1),
+    "scope": "source" (default) | "open"}. ((mode, temperature), scope, 1) for a file that is not that, which runs the fixed
+    rule and the source scope: nothing here stops a crawl."""
     path = _config(store, workdir, "config/ranking.json")
     if path is None:
-        return ("fixed", 1.0), 0
+        return ("fixed", 1.0), "source", 0
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         temperature = float(data.get("temperature", 1.0))
-        if data["version"] != 1 or data["mode"] not in RANKING_MODES or not math.isfinite(temperature) or temperature < 0:
-            raise ValueError("unknown version or mode, or a temperature that is not a number >= 0")
-        return (data["mode"], temperature), 0
+        scope = data.get("scope", "source")
+        if (data["version"] != 1 or data["mode"] not in RANKING_MODES or not math.isfinite(temperature) or temperature < 0
+                or scope not in SCOPES):
+            raise ValueError("unknown version, mode or scope, or a temperature that is not a number >= 0")
+        return (data["mode"], temperature), scope, 0
     except Exception:
-        return ("fixed", 1.0), 1
+        return ("fixed", 1.0), "source", 1
 
 
 def _watch(store: Store, workdir: Path) -> Tuple[List[Dict[str, Any]], int, int]:
@@ -164,12 +167,13 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         _configure_questions(store, Path(workdir))
         steer, steer_ignored = _steer(store, Path(workdir))
         watch, watch_file_ignored, watch_entries_ignored = _watch(store, Path(workdir))
-        ranking, ranking_ignored = _ranking(store, Path(workdir))
+        ranking, scope, ranking_ignored = _ranking(store, Path(workdir))
         throttle = HostThrottle(args.min_interval)
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=throttle) as cascade:
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
-                                sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle)
+                                sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle,
+                                scope=scope, run_share=SEED_RUN_SHARE)
     stats["steer_file_ignored"], stats["ranking_file_ignored"] = steer_ignored, ranking_ignored
     stats["watch_file_ignored"], stats["watch_entries_ignored"] = watch_file_ignored, watch_entries_ignored
     _report(ctx, stats)
