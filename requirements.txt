@@ -1,5 +1,6 @@
 pyarrow==26.0.1  # pinned: parquet bytes carry the writer version, so an upgrade would rewrite every file a run touches
 httpx>=0.27
+curl_cffi>=0.17  # a browser's TLS fingerprint for the retry after a refusal; its "safe" redirects refuse private addresses (~14 MB wheel)
 certifi
 cryptography>=42  # reading certificates to complete a server's chain
 trafilatura>=2

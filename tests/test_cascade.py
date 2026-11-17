@@ -11,7 +11,9 @@ import pytest
 
 from frontier_crawler.harvester import cascade as cascade_module
 from frontier_crawler.harvester import readers
-from frontier_crawler.harvester.cascade import BlockedAddress, HarvesterCascade, ScrapeResult, check_public
+from frontier_crawler.harvester.cascade import BlockedAddress, HarvesterCascade, ScrapeResult, check_public, is_tracker
+
+REAL_CURL_GET = HarvesterCascade._curl_get   # conftest swaps it for an offline stand-in during each test
 
 WORDS = "The port authority published the berth schedule and the tariff for bulk cargo. " * 15
 # Three pages, one line of text each, made with reportlab.
@@ -145,6 +147,94 @@ def test_a_dead_link_does_not_launch_a_browser_but_a_refusal_does(monkeypatch: p
     assert len(browser) == 1 and refused.http_status == 403 and b"Forbidden" in refused.raw_payload
 
 
+def _curl_serves(monkeypatch: pytest.MonkeyPatch, status: int, body: bytes, final_url: str = "") -> List[str]:
+    """The fingerprint tier answers with status and body; returns the URLs it was asked for."""
+    asked: List[str] = []
+
+    async def served(self: Any, url: str, limits: Any) -> Any:
+        asked.append(url)
+        return status, {"content-type": "text/html"}, final_url or url, body
+
+    monkeypatch.setattr(HarvesterCascade, "_curl_get", served)
+    return asked
+
+
+def test_a_refusal_is_asked_again_with_a_browsers_fingerprint_before_the_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _curl_serves(monkeypatch, 200, f"<html><body><p>{WORDS}</p></body></html>".encode())
+    browser: List[str] = []
+    result = _fetch(_html("Forbidden", 403), browser=browser, monkeypatch=monkeypatch)
+    assert asked == ["https://a.test/x"] and not browser
+    assert result.tier_used == "HTTP_IMPERSONATE" and result.http_status == 200 and result.word_count >= 150
+
+
+def test_a_fingerprint_also_refused_goes_on_to_the_browser_and_a_dead_link_is_not_asked_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _curl_serves(monkeypatch, 403, b"<html><body>Forbidden</body></html>")
+    browser: List[str] = []
+    _fetch(_html("Not found", 404), browser=browser, monkeypatch=monkeypatch)
+    assert not asked and not browser
+    result = _fetch(_html("Forbidden", 403), browser=browser, monkeypatch=monkeypatch)
+    assert asked and browser == ["https://a.test/x"] and result.http_status == 403
+
+
+def test_a_server_that_hangs_up_on_httpx_is_asked_with_a_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
+    _curl_serves(monkeypatch, 200, f"<html><body><p>{WORDS}</p></body></html>".encode())
+
+    def hangs_up(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+
+    assert _fetch(hangs_up).tier_used == "HTTP_IMPERSONATE"
+
+
+def test_the_fingerprint_tier_refuses_a_private_final_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    _curl_serves(monkeypatch, 200, b"<html>x</html>", final_url="http://169.254.169.254/latest")
+    with pytest.raises(BlockedAddress):
+        _fetch(_html("Forbidden", 403))
+
+
+def test_curl_refuses_a_redirect_to_a_private_address_and_a_file_over_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins curl_cffi's own guards, which the fingerprint tier relies on. A local server only: nothing leaves the machine."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/away":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/ok")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"x" * (5000 if self.path == "/big" else 10))
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(HarvesterCascade, "_curl_get", REAL_CURL_GET)
+    monkeypatch.setattr(cascade_module, "MAX_BYTES", 1000)
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    async def run() -> List[Any]:
+        async with HarvesterCascade() as fetcher:
+            outcomes = []
+            for path in ("/ok", "/away", "/big"):
+                try:
+                    outcomes.append((await fetcher._curl_get(base + path, (10.0, 5.0)))[0])
+                except Exception as exc:
+                    outcomes.append(str(exc))
+            return outcomes
+
+    try:
+        ok, away, big = asyncio.run(run())
+    finally:
+        server.shutdown()
+    assert ok == 200 and "internal IP" in away and "maximum allowed file size" in big
+
+
 def test_a_dead_host_is_a_failed_result_not_an_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     browser: List[str] = []
 
@@ -199,7 +289,7 @@ def _urlset(*urls: str) -> bytes:
     return ("<urlset>" + "".join(f"<url><loc>{url}</loc></url>" for url in urls) + "</urlset>").encode()
 
 
-def test_sitemaps_come_from_robots_or_the_default_path_and_indexes_are_followed_one_level(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sitemaps_come_from_robots_or_the_default_path_and_indexes_are_followed_within_the_file_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     import gzip
 
     index = lambda *locs: ("<sitemapindex>" + "".join(f"<sitemap><loc>{loc}</loc><lastmod>{mod}</lastmod></sitemap>" for loc, mod in locs) + "</sitemapindex>").encode()  # noqa: E731
@@ -209,10 +299,11 @@ def test_sitemaps_come_from_robots_or_the_default_path_and_indexes_are_followed_
         "https://a.test/bad.xml": b"<html>not a sitemap</html>",
         "https://a.test/new.xml.gz": gzip.compress(_urlset("https://a.test/n1", "https://a.test/n2")),
         "https://a.test/old.xml": _urlset("https://a.test/o1"),
-        "https://a.test/deeper.xml": index(("https://a.test/never.xml", "")),   # an index inside an index: not followed
+        "https://a.test/deeper.xml": index(("https://a.test/deep.xml", ""), ("https://a.test/index.xml", "")),   # an index in an index, and a loop
+        "https://a.test/deep.xml": _urlset("https://a.test/d1"),
     }
     entries, read, failed = _sitemaps(files)
-    assert [url for url, _ in entries] == ["https://a.test/n1", "https://a.test/n2", "https://a.test/o1"] and (read, failed) == (4, 1)
+    assert [url for url, _ in entries] == ["https://a.test/n1", "https://a.test/n2", "https://a.test/o1", "https://a.test/d1"] and (read, failed) == (5, 1)
     # No robots.txt (or one naming no sitemap): /sitemap.xml. Nothing there either: one failure, no exception.
     assert _sitemaps({"https://b.test/sitemap.xml": _urlset("https://b.test/x")}, "https://b.test") == ([("https://b.test/x", "")], 1, 0)
     assert _sitemaps({}, "https://c.test") == ([], 0, 1)
@@ -262,7 +353,9 @@ def test_the_cascade_times_its_phases_and_counts_timeouts() -> None:
     fetcher = asyncio.run(run())
     assert fetcher.timings["http"] > 0 and fetcher.timings["extract_html"] > 0
     assert fetcher.counts == {"connect_timeouts": 0, "read_timeouts": 1, "browser_timeouts": 0, "browser_launches": 0, "browser_pages": 0,
-                              "browser_relaunches": 0, "decoded_non_utf8": 0, "reader_crashes": 0, "reader_timeouts": 0}
+                              "browser_relaunches": 0, "decoded_non_utf8": 0, "reader_crashes": 0, "reader_timeouts": 0,
+                              "impersonate_tries": 0, "impersonate_served": 0, "impersonate_failures": 0, "browser_requests_skipped": 0,
+                              "browser_requests_private": 0, "browser_shadow_pages": 0, "browser_api_pages": 0}
 
 
 def test_a_timeout_is_flagged_and_one_call_can_ask_for_longer_limits() -> None:
@@ -331,6 +424,9 @@ class FakeChromium:
         self.died: List[str] = []
         self.loads: List[str] = []
         self.waits: List[tuple] = []
+        self.routes: List[Any] = []
+        self.listeners: List[tuple] = []
+        self.scripts: List[str] = []
         self.active = self.peak = 0
 
     def async_playwright(self) -> Any:
@@ -369,8 +465,17 @@ class FakeChromium:
                 if "busy" in self.url:
                     raise fake.TimeoutError(f"Timeout {timeout}ms exceeded")
 
+            def on(self, event: str, listener: Any) -> None:
+                fake.listeners.append((event, listener))
+
+            async def evaluate(self, script: str) -> Any:
+                fake.scripts.append(script)
+                if "shadowRoot" in script and "shadow" in self.url:
+                    return "<html><body>rendered text<x-card><shadow-root>" + WORDS + "</shadow-root></x-card></body></html>"
+                return None
+
             async def inner_text(self, selector: str) -> str:
-                return "rendered text"
+                return "rendered\u200b text"
 
             async def content(self) -> str:
                 return "<html><body>rendered text</body></html>"
@@ -378,6 +483,9 @@ class FakeChromium:
         class Context:
             def __init__(self, browser: Any) -> None:
                 self.browser, self.closed = browser, False
+
+            async def route(self, pattern: str, handler: Any) -> None:
+                fake.routes.append(handler)
 
             async def new_page(self) -> Any:
                 return Page(self.browser)
@@ -449,7 +557,8 @@ def _render(urls: List[str], browser_slots: int = 4) -> Any:
 
 
 def _browser_counts(fetcher: HarvesterCascade) -> dict:
-    return {key: value for key, value in fetcher.counts.items() if key.startswith("browser_")}
+    lifecycle = ("browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches")
+    return {key: value for key, value in fetcher.counts.items() if key in lifecycle}
 
 
 def test_one_browser_serves_every_page_and_each_context_is_closed(chromium: FakeChromium) -> None:
@@ -476,6 +585,55 @@ def test_a_page_load_timeout_is_flagged_and_leaves_the_browser_running(chromium:
 def test_closing_the_cascade_closes_browser_and_playwright(chromium: FakeChromium) -> None:
     _render(["https://a.test/1"])
     assert not chromium.browsers[0].connected and chromium.drivers[0].stopped
+
+
+def test_a_rendered_page_skips_private_addresses_trackers_and_images_and_counts_its_backend_replies(chromium: FakeChromium) -> None:
+    class Route:
+        def __init__(self, url: str, kind: str) -> None:
+            self.request = type("Request", (), {"url": url, "resource_type": kind})()
+            self.done = ""
+
+        async def abort(self) -> None:
+            self.done = "aborted"
+
+        async def continue_(self) -> None:
+            self.done = "sent"
+
+    _, fetcher = _render(["https://a.test/1"])
+    routes = [Route("http://10.0.0.1/admin", "fetch"), Route("https://www.google-analytics.com/g", "script"),
+              Route("https://a.test/logo.png", "image"), Route("https://a.test/app.js", "script"), Route("https://a.test/site.css", "stylesheet")]
+
+    async def screen() -> None:
+        for route in routes:
+            await chromium.routes[0](route)
+
+    asyncio.run(screen())
+    assert [route.done for route in routes] == ["aborted", "aborted", "aborted", "sent", "sent"]
+    assert fetcher.counts["browser_requests_private"] == 1 and fetcher.counts["browser_requests_skipped"] == 2
+    assert is_tracker("stats.g.doubleclick.net") and not is_tracker("doubleclick.net.example.com") and not is_tracker("")
+
+    def reply(kind: str, content_type: str) -> Any:
+        return type("Reply", (), {"url": "https://a.test/api", "headers": {"content-type": content_type},
+                                  "request": type("Request", (), {"resource_type": kind})()})()
+
+    assert [event for event, _ in chromium.listeners] == ["response"]
+    noted: List[str] = []
+    for sample in (reply("xhr", "application/json"), reply("fetch", "text/html"), reply("document", "application/json"), None):
+        cascade_module._note_api(sample, noted)   # None: a reply that cannot be read is skipped, not raised
+    assert noted == ["https://a.test/api"]
+
+
+def test_open_shadow_roots_are_read_into_the_stored_html_and_its_text(chromium: FakeChromium) -> None:
+    async def run() -> ScrapeResult:
+        shell = lambda request: httpx.Response(200, content=b'<html><body><x-card></x-card></body></html>', headers={"content-type": "text/html"})  # noqa: E731
+        async with HarvesterCascade(client=httpx.AsyncClient(transport=httpx.MockTransport(shell))) as fetcher:
+            return await fetcher.fetch("https://a.test/shadow")
+
+    result = asyncio.run(run())
+    assert result.tier_used == "HEADLESS_PLAYWRIGHT" and result.shadow and b"<shadow-root>" in result.raw_payload
+    assert result.word_count >= 150   # the shadow root's text, which inner_text alone missed
+    plain, _ = _render(["https://a.test/1"])
+    assert not plain[0].shadow and plain[0].markdown_content == "rendered text"   # zero-width characters are dropped
 
 
 def test_a_browser_that_dies_is_relaunched_and_the_page_retried(chromium: FakeChromium) -> None:

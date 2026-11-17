@@ -371,3 +371,24 @@ def test_every_link_of_a_stored_page_is_written_once_in_page_order_including_tho
     frontier = _frontier(tmp_path)
     assert frontier.entry("https://a.test/deep") is None and stats["skipped"]["hop_limit"] == 1   # declined, still written
     assert stats["links_written"] == 5 and stats["shard_bytes"]["links"] > 0 and stats["shard_bytes"]["bodies"] > 0
+
+
+def test_a_feeds_items_stay_inside_the_scope_fence_and_backend_pages_are_listed(tmp_path: Path) -> None:
+    from frontier_crawler.harvester.readers import read_html
+
+    feed = (b"<rss><channel><title>Notices</title><item><link>https://a.test/n/1</link></item>"
+            b"<item><link>https://elsewhere.example.net/n/2</link></item></channel></rss>")
+    fetched: List[str] = []
+
+    class Fed:
+        async def fetch(self, url: str, timeout: Any = None, connect: Any = None) -> ScrapeResult:
+            fetched.append(url)
+            if url == ROOT:
+                _, _, links, title = read_html(feed, "application/rss+xml", url)
+                return ScrapeResult(url, 200, feed, TEXT, len(TEXT.split()), "DOM_TRAFILATURA", None, "application/rss+xml", links=links, title=title)
+            body = f"<html><body><p>{url} {TEXT}</p></body></html>".encode()
+            return ScrapeResult(url, 200, body, TEXT, len(TEXT.split()), "HEADLESS_PLAYWRIGHT", None, "text/html; rendered", api_responses=2)
+
+    stats = _crawl(tmp_path, Fed(), scope="source")
+    assert fetched == [ROOT, "https://a.test/n/1"] and stats["links_out_of_scope"] == 1
+    assert stats["api_backed_pages"] == {"https://a.test/n/1": 2}
