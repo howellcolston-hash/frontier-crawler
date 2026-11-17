@@ -9,6 +9,7 @@ the configured questions (judge/questions.py) about each new document and store 
 A document Jev was not asked about (no key, the monthly ceiling reached, Jev unavailable)
 stays pending. When the budget cannot cover a run, run judges a sample of its documents, chosen
 by content hash, so the allowance is spread over the whole run; the rest are counted not_sampled.
+The questions' jev_sample, when set, caps that share for every document, backlog and scans included.
 Judging can be re-run; fetching is never repeated for it.
 
 Input contract:
@@ -102,6 +103,11 @@ def block_marker(status: int, text: str) -> Optional[str]:
             if phrase in lowered:
                 return phrase
     return None
+
+
+def _in_share(sha256: str, rate: float) -> bool:
+    """Whether a content hash falls inside the first rate of the hash space: the same documents at every rerun."""
+    return int(sha256[:8], 16) / 2**32 < rate
 
 
 def judgeable(row: Dict[str, Any]) -> bool:
@@ -209,6 +215,8 @@ class Engine:
         if pages and priced:
             available = max(0, self._ceiling_tokens - month["input_tokens"])
             self._sample_rate = min(1.0, available / (pages * priced[-1]["input_tokens"] / priced[-1]["calls"]))
+        if judging.jev_sample() is not None:
+            self._sample_rate = min(self._sample_rate, judging.jev_sample())
         self.stats["jev_sample_rate"] = round(self._sample_rate, 4)
 
     # ------------------------------------------------------------ writing
@@ -352,7 +360,7 @@ class Engine:
     def sampled(self, row: Dict[str, Any]) -> bool:
         """Whether judge() will ask Jev about this row: new readable content within the run's sample."""
         # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
-        return judgeable(row) and int(row["sha256"][:8], 16) / 2**32 < self._sample_rate
+        return judgeable(row) and _in_share(row["sha256"], self._sample_rate)
 
     async def judge(self, row: Dict[str, Any]) -> Optional[JevResult]:
         """Jev's answers about a row from fetch(), or None: not sampled, or left pending."""
@@ -467,6 +475,10 @@ class Engine:
 
     async def _judge(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str) -> Optional[JevResult]:
         """Ask Jev about one document and write the call and its answers. None when it stays pending."""
+        cap = judging.jev_sample()
+        if cap is not None and not _in_share(sha256, cap):   # backlog and scans too; a crawl's sampled() already applied it
+            self.stats["not_sampled"] += 1
+            return None
         month = self._spend[self._month]
         if self._jev is None or self.stats["jev_stopped"] or month["input_tokens"] >= self._ceiling_tokens:
             self.stats["pending"] += 1

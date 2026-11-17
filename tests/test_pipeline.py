@@ -804,3 +804,42 @@ def test_the_forecast_is_kept_from_the_last_sizeable_crawl_run(tmp_path: Path) -
     few = {f"https://a.test/f{i}": _page(f"https://a.test/f{i}", body=f"few {i}".encode()) for i in range(3)}
     asyncio.run(_engine(tmp_path, FakeCascade(few), "r2").run([_job(url) for url in few]))
     assert spend()[FORECAST_KEY] == 500   # a short run does not replace it
+
+
+def test_jev_sample_caps_the_share_judged_by_content_hash_in_a_run_and_in_the_backlog(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        judging.configure({**judging.EXAMPLE, "jev_sample": 1.5})
+    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(200)}
+    answering = lambda request: httpx.Response(200, json=_jev_body())  # noqa: E731
+    in_sample = lambda row: int(row["sha256"][:8], 16) / 2**32 < 0.25  # noqa: E731
+    try:
+        judging.configure({**judging.EXAMPLE, "jev_sample": 0.25})
+        # Budget to spare (no forecast): the cap alone sets the rate, and the same hashes are picked as by budget sampling.
+        stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1", jev=_jev(answering), monthly_usd=8).run([_job(url) for url in pages]))
+        picked = [row for row in _rows(tmp_path / "store", "fetches") if in_sample(row)]
+        assert stats["jev_sample_rate"] == 0.25 and stats["judged"] == len(picked) and 30 <= len(picked) <= 70
+        assert stats["not_sampled"] == 200 - len(picked) and stats["pending"] == 0
+        # The backlog asks about none of the rest: they wait.
+        engine = Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / "work-j", jev=_jev(answering), monthly_usd=8, now=lambda: NOW, run_id="j1")
+
+        async def backlog() -> Dict[str, Any]:
+            await engine.start()
+            await engine.judge_days([DAY])
+            return await engine.finish()
+
+        later = asyncio.run(backlog())
+        assert later["judged"] == 0 and later["not_sampled"] == 200 - len(picked)
+    finally:
+        judging.configure(judging.EXAMPLE)
+
+
+def test_jev_sample_and_the_budget_sample_combine_by_the_smaller_rate(tmp_path: Path) -> None:
+    _write_spend(tmp_path / "store", {"2026-11": {"input_tokens": 700, "calls": 1}, FORECAST_KEY: 1000})   # a budget rate of 0.25
+    try:
+        for cap, expected in ((0.5, 0.25), (0.1, 0.1)):
+            judging.configure({**judging.EXAMPLE, "jev_sample": cap})
+            engine = _engine(tmp_path, FakeCascade({}), f"r{cap}", monthly_usd=_usd_for(175_700 * 720 / 212))
+            asyncio.run(engine.engine.start())
+            assert engine.engine.stats["jev_sample_rate"] == pytest.approx(expected, abs=1e-4)
+    finally:
+        judging.configure(judging.EXAMPLE)
