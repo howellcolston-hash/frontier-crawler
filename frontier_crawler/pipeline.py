@@ -83,7 +83,7 @@ _OCR_LIMIT_S = ocr.OCR_SECONDS + 300.0
 # Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
 _UPLOAD_EVERY_S = 600.0
 # What is kept of a stored PDF. text_only: a PDF whose text was read in full keeps its text in fetches and writes no body;
-# a scan (under ocr.SCAN_MAX_WORDS words) or a PDF cut short by the reader's time limit keeps its bytes. keep: every PDF keeps them.
+# a scan (under ocr.SCAN_MAX_WORDS words) a PDF cut short by the reader's time limit or one with no text on many of its pages keeps its bytes. keep: every PDF keeps them.
 PDF_BODIES = ("text_only", "keep")
 
 Observer = Callable[[Target, Dict[str, Any], Optional[JevResult]], None]
@@ -126,7 +126,7 @@ def judgeable(row: Dict[str, Any]) -> bool:
 
 
 def text_only_pdf(row: Dict[str, Any]) -> bool:
-    """A PDF whose text was read in full: not a scan (the OCR command's test) and not cut short by the reader's time limit."""
+    """A PDF whose text was read in full: not a scan (the OCR command's test) not cut short by the reader's time limit and not partly a scan (the reader left no note)."""
     return row.get("tier_used") == "PDF" and (row.get("word_count") or 0) >= ocr.SCAN_MAX_WORDS and row.get("tier_note") is None
 
 
