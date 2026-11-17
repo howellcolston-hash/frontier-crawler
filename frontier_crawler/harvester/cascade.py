@@ -1,4 +1,5 @@
-"""Fetch one URL: plain HTTP first (JSON, PDF, HTML), then a browser when the page needs one.
+"""Fetch one URL: plain HTTP first (JSON, PDF, HTML); when the server refuses it, the same request again with a browser's
+TLS fingerprint (curl_cffi); then a browser when the page needs one.
 
 Input contract: result = await cascade.fetch(url, timeout=None). Network and parse failures come back
 in the result; result.timed_out says the page timed out with nothing served. Only BlockedAddress is
@@ -29,6 +30,23 @@ from frontier_crawler.harvester.readers import Links, ReaderFailed, ReaderPool, 
 from frontier_crawler.harvester.throttle import HostThrottle
 
 USER_AGENT = "Mozilla/5.0 (compatible; frontier-crawler/1.0; +https://github.com/howellcolston-hash/frontier-crawler)"
+# Sent by both plain tiers, as a browser sends them: some firewalls refuse a request without them. The User-Agent stays our own.
+REQUEST_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+IMPERSONATE = "chrome"  # PROVISIONAL: the browser whose TLS and HTTP/2 fingerprint curl_cffi presents (its newest Chrome)
+MAX_REDIRECTS = 20      # as httpx's default, so both plain tiers follow the same chains
+# PROVISIONAL. Browser-tier requests that carry nothing a page's text or links need (Scrapling's disable_resources, less stylesheets,
+# which decide what is hidden, and websockets, which some pages load their data over).
+SKIPPED_RESOURCES = frozenset({"font", "image", "media", "beacon", "object", "imageset", "texttrack", "csp_report"})
+# PROVISIONAL. Hosts (and their subdomains) that only report on the visitor; the browser tier does not load them.
+TRACKER_DOMAINS = frozenset({
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "facebook.net", "segment.io", "segment.com", "hotjar.com", "clarity.ms", "newrelic.com", "nr-data.net",
+    "sentry.io", "datadoghq.com", "intercom.io", "scorecardresearch.com", "quantserve.com", "adnxs.com", "criteo.com",
+})
 # PROVISIONAL. A larger file is recorded (URL, size, type) and not downloaded, so it can be fetched on purpose later.
 MAX_BYTES = 50_000_000
 # PROVISIONAL. A page built by JavaScript arrives nearly empty. Under MIN_WORDS of text and
@@ -72,7 +90,7 @@ class ScrapeResult:
     raw_payload: bytes
     markdown_content: Optional[str]
     word_count: int
-    tier_used: str  # API | DOM_TRAFILATURA | PDF | HEADLESS_PLAYWRIGHT
+    tier_used: str  # API | DOM_TRAFILATURA | HTTP_IMPERSONATE (HTML served after a refusal) | PDF | HEADLESS_PLAYWRIGHT
     error_message: Optional[str]
     content_type: str = ""
     too_large_bytes: Optional[int] = None
@@ -81,6 +99,8 @@ class ScrapeResult:
     links: Optional[Links] = None  # (links, unparseable hrefs) of an HTML page, as its reader found them
     title: Optional[str] = None  # an HTML page's <title>, a PDF's metadata title
     cool_host: bool = False  # the server asked for a pause too long to wait out (courtesy.sit_out): leave its host for the run
+    api_responses: int = 0  # browser tier: JSON replies to the page's own background requests (a backend a derived client could call)
+    shadow: bool = False  # browser tier: raw_payload includes the page's open shadow roots, which inner_text misses
 
 
 @contextlib.contextmanager
@@ -114,6 +134,12 @@ def check_public(url: str) -> None:
         return
     if not address.is_global:
         raise BlockedAddress(url)
+
+
+def is_tracker(host: str) -> bool:
+    """host is in TRACKER_DOMAINS, or a subdomain of one (Scrapling's suffix walk)."""
+    parts = host.lower().split(".")
+    return any(".".join(parts[i:]) in TRACKER_DOMAINS for i in range(len(parts) - 1))
 
 
 def word_count(text: str) -> int:
@@ -242,11 +268,13 @@ class HarvesterCascade:
         self._launch_lock = asyncio.Lock()  # two pages must not both launch
         self._chromium: Optional[Tuple[Any, Any]] = None  # (playwright, browser), shared by every page of the run
         # Measurement only, read by the engine at the end of a run: seconds summed over fetch slots, and counts.
-        self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "extract_html", "pdf_text", "browser"), 0.0)
+        self.timings: Dict[str, float] = dict.fromkeys(("throttle_wait", "http", "impersonate", "extract_html", "pdf_text", "browser"), 0.0)
         self.counts: Dict[str, int] = dict.fromkeys(
             ("connect_timeouts", "read_timeouts", "browser_timeouts", "browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8",
-             "reader_crashes", "reader_timeouts"), 0
+             "reader_crashes", "reader_timeouts", "impersonate_tries", "impersonate_served", "impersonate_failures",
+             "browser_requests_skipped", "browser_requests_private", "browser_shadow_pages", "browser_api_pages"), 0
         )
+        self._curl: Any = None  # curl_cffi's AsyncSession, opened on the first refusal
         self._readers = ReaderPool(self.counts)
         # Module-level functions, as a worker process must import them. Tests swap in readers that crash or hang.
         self.read_html, self.read_pdf = read_html, pdf_text
@@ -261,6 +289,10 @@ class HarvesterCascade:
             if self._owned is not None:
                 await self._owned.aclose()
                 self._owned = None
+            if self._curl is not None:
+                with contextlib.suppress(Exception):
+                    await self._curl.close()
+                self._curl = None
         finally:
             self._readers.close()
 
@@ -271,7 +303,7 @@ class HarvesterCascade:
             self._owned = httpx.AsyncClient(
                 timeout=self._timeout_s,
                 follow_redirects=True,
-                headers={"User-Agent": USER_AGENT},
+                headers=REQUEST_HEADERS,
                 event_hooks={"request": [_guard_request]},
                 transport=_ChainCompleter(),
             )
@@ -290,6 +322,14 @@ class HarvesterCascade:
         timeout = limits[0]
         try:
             result, wants_browser = await self._http(url, httpx.Timeout(timeout, connect=limits[1]), waited)
+            if wants_browser and result.http_status in _BROWSER_RETRY_STATUS:
+                result, wants_browser = await self._impersonated(url, limits, waited) or (result, wants_browser)
+        except httpx.RemoteProtocolError as exc:
+            # A server that hangs up on a plain client's TLS handshake or first request: try a browser's fingerprint once.
+            tried = await self._impersonated(url, limits, waited)
+            if tried is None:
+                return _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
+            result, wants_browser = tried
         except httpx.HTTPError as exc:
             # A dead host or a timeout. A browser would meet the same wall.
             failed = _failed(url, "DOM_TRAFILATURA", f"{type(exc).__name__}: {exc}")
@@ -302,9 +342,11 @@ class HarvesterCascade:
         with timed(self.timings, "browser"):  # includes the browser's own throttle wait
             rendered = await self._browser(url, result.error_message, result.http_status, timeout, waited)
         if rendered.raw_payload:
-            # Links and title only: the browser gave the text. Without them the page is still stored.
+            # Links and title: the browser gave the text, unless shadow roots hold text it missed. Without them the page is still stored.
             with contextlib.suppress(Exception), timed(self.timings, "extract_html"):
-                _, _, rendered.links, rendered.title = await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url)
+                text, _, rendered.links, rendered.title = await self._readers.run(readers.HTML_SECONDS, self.read_html, rendered.raw_payload, rendered.content_type, rendered.url)
+                if rendered.shadow and word_count(text or "") > rendered.word_count:
+                    rendered.markdown_content, rendered.word_count = text, word_count(text or "")
             return rendered
         # The browser got nothing. Keep what the plain request was served.
         result.error_message = rendered.error_message
@@ -317,15 +359,60 @@ class HarvesterCascade:
             with timed(self.timings, "throttle_wait"), timed(waited, "throttle_wait"):
                 await self._throttle.wait(url)
         with timed(self.timings, "http"):
+            started = time.monotonic()
             async with self._http_client().stream("GET", url, timeout=timeout) as response:
+                answered = time.monotonic() - started
                 status = response.status_code
                 content_type = response.headers.get("content-type", "")
                 final_url = str(response.url)
                 body, size = await read_capped(response)
-        pause = sit_out(self._throttle, url, status, response.headers.get("retry-after"))
-        if body is None:
+        if self._throttle is not None:
+            self._throttle.record(url, answered, status)
+        return await self._read(url, status, content_type, final_url, body, size, response.headers.get("retry-after"), "DOM_TRAFILATURA")
+
+    async def _impersonated(self, url: str, limits: Tuple[float, float], waited: Dict[str, float]) -> Optional[Tuple[ScrapeResult, bool]]:
+        """The GET again, through the throttle, with a browser's TLS and HTTP/2 fingerprint (curl_cffi) and our own headers;
+        redirects to private addresses are refused by curl. What _read makes of the reply, or None when it failed."""
+        self.counts["impersonate_tries"] += 1
+        if self._throttle is not None:
+            with timed(self.timings, "throttle_wait"), timed(waited, "throttle_wait"):
+                await self._throttle.wait(url)
+        try:
+            with timed(self.timings, "impersonate"):
+                started = time.monotonic()
+                status, headers, final_url, body = await self._curl_get(url, limits)
+                answered = time.monotonic() - started
+            check_public(final_url)
+        except BlockedAddress:
+            raise
+        except Exception:  # not installed, unreachable, over MAX_BYTES (curl stops it), or a redirect curl refused
+            self.counts["impersonate_failures"] += 1
+            return None
+        if self._throttle is not None:
+            self._throttle.record(url, answered, status)
+        self.counts["impersonate_served"] += status not in _BROWSER_RETRY_STATUS
+        return await self._read(url, status, headers.get("content-type", ""), final_url, body, len(body), headers.get("retry-after"), "HTTP_IMPERSONATE")
+
+    async def _curl_get(self, url: str, limits: Tuple[float, float]) -> Tuple[int, Dict[str, str], str, bytes]:
+        """(status, headers with lower-case names, final URL, body). Tests replace this."""
+        from curl_cffi import CurlOpt
+        from curl_cffi.requests import AsyncSession
+
+        if self._curl is None:
+            # "safe": curl refuses a redirect whose address resolves to a private network, checked after DNS.
+            self._curl = AsyncSession(impersonate=IMPERSONATE, default_headers=False, headers=REQUEST_HEADERS, allow_redirects="safe",
+                                      max_redirects=MAX_REDIRECTS, verify=certifi.where(),
+                                      curl_options={CurlOpt.MAXFILESIZE_LARGE: MAX_BYTES})
+        reply = await self._curl.get(url, timeout=(limits[1], limits[0]))
+        return reply.status_code, {k.lower(): v for k, v in reply.headers.items()}, str(reply.url), reply.content
+
+    async def _read(self, url: str, status: int, content_type: str, final_url: str, body: Optional[bytes], size: int,
+                    retry_after_header: Optional[str], html_tier: str) -> Tuple[ScrapeResult, bool]:
+        """Read what a plain tier was served. Returns (the result, whether the browser tier should try)."""
+        pause = sit_out(self._throttle, url, status, retry_after_header)
+        if body is None or size > MAX_BYTES:
             # Not cut short and kept: half a PDF or archive is unreadable.
-            result = _failed(final_url, "DOM_TRAFILATURA", "too large", status)
+            result = _failed(final_url, html_tier, "too large", status)
             result.content_type = content_type
             result.too_large_bytes = size
             return result, False
@@ -358,12 +445,13 @@ class HarvesterCascade:
                 text, encoding, links, title = await self._readers.run(readers.HTML_SECONDS, self.read_html, body, content_type, final_url)
             note = undecoded(encoding)
         except Exception as exc:  # the reader crashed or hung: the page is kept, without text or links, and not rendered
-            return served(None, "DOM_TRAFILATURA", f"html not read: {exc}"), False
+            return served(None, html_tier, f"html not read: {exc}"), False
         words = word_count(text or "")
-        shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS
+        # A feed has links but no <a>: its reader's links count too.
+        shell = words < MIN_WORDS and body.lower().count(b"<a ") < MIN_LINKS and len(links[0] if links else ()) < MIN_LINKS
         if ((status == 200 and shell) or status in _BROWSER_RETRY_STATUS) and pause is None:   # a server asking for a pause gets one
-            return served(text, "DOM_TRAFILATURA", f"plain request: status {status}, {words} words", links, title), True
-        return served(text, "DOM_TRAFILATURA", note, links, title), False
+            return served(text, html_tier, f"plain request: status {status}, {words} words", links, title), True
+        return served(text, html_tier, note, links, title), False
 
     async def get(self, url: str) -> Tuple[int, bytes]:
         """One plain GET through the throttle and the address guard, for a file the crawl reads itself: no tiers, nothing
@@ -377,7 +465,7 @@ class HarvesterCascade:
 
     async def sitemap_entries(self, origin: str) -> Tuple[List[Tuple[str, str]], int, int]:
         """(url, lastmod) from the sitemaps the robots.txt of origin ("https://host") names, or from /sitemap.xml when it names
-        none, following sitemap indexes one level (the newest sitemaps they list first); then how many sitemap files were read and how many failed.
+        none, following sitemap indexes, and indexes they list (the newest sitemaps they list first); then how many sitemap files were read and how many failed.
         At most MAX_SITEMAP_FILES files are fetched. Only discovery and pacing: the robots.txt Crawl-delay for us becomes the
         host's gap in the throttle (its intervals); its rules are not read."""
         try:
@@ -408,12 +496,21 @@ class HarvesterCascade:
             return found
 
         children: List[Tuple[str, str]] = []
-        for url in (files or [origin + "/sitemap.xml"])[:MAX_SITEMAP_FILES]:
+        named = (files or [origin + "/sitemap.xml"])[:MAX_SITEMAP_FILES]
+        seen = set(named)
+        for url in named:
             kind, found = await read(url)
             (children if kind == "index" else entries).extend(found)
-        for url, _ in readers.newest_first(children)[:MAX_SITEMAP_FILES - sum(counts)]:
+        children = readers.newest_first(children)
+        while children and sum(counts) < MAX_SITEMAP_FILES:   # indexes inside indexes too, within the same file budget
+            url, _ = children.pop(0)
+            if url in seen:
+                continue
+            seen.add(url)
             kind, found = await read(url)
-            if kind == "urlset":   # one level: an index listed by an index is not followed
+            if kind == "index":
+                children = readers.newest_first(children + found)
+            else:
                 entries.extend(found)
         return entries, counts[0], counts[1]
 
@@ -457,24 +554,51 @@ class HarvesterCascade:
 
         timeout_ms = int(timeout * 1000)
         context = await browser.new_context(user_agent=USER_AGENT)
+        api_calls: List[str] = []
         try:
+            await context.route("**/*", self._screen)
             page = await context.new_page()
+            page.on("response", lambda reply: _note_api(reply, api_calls))
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             # Give scripts a moment to fill the page in. Some pages never stop loading: take what is there.
             with contextlib.suppress(PlaywrightError):
                 await page.wait_for_load_state("networkidle", timeout=int(NETWORK_IDLE_SECONDS * 1000))
             check_public(page.url or url)  # a script may have sent the page somewhere else
-            text = await page.inner_text("body")
-            html = await page.content()
+            shadow = None
+            with contextlib.suppress(PlaywrightError):
+                shadow = await page.evaluate(SHADOW_SNAPSHOT_JS)
+            html = shadow or await page.content()
+            # The bytes are kept as rendered; hidden elements are then removed from the live page so its text leaves them out.
+            with contextlib.suppress(PlaywrightError):
+                await page.evaluate(DROP_HIDDEN_JS)
+            text = readers.clean_text(await page.inner_text("body")) or ""
             status = response.status if response is not None else prior_status
+            self.counts["browser_shadow_pages"] += bool(shadow)
+            self.counts["browser_api_pages"] += bool(api_calls)
             return ScrapeResult(
                 page.url or url, status, html.encode("utf-8"), text, word_count(text),
-                "HEADLESS_PLAYWRIGHT", prior_note, "text/html; rendered",
+                "HEADLESS_PLAYWRIGHT", prior_note, "text/html; rendered", api_responses=len(api_calls), shadow=bool(shadow),
             )
         finally:
             # An open context keeps its pages' memory. Bounded: a dead or hung browser may never answer.
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(context.close(), self._timeout_s)
+
+    async def _screen(self, route: Any) -> None:
+        """Every request a rendered page makes: none to a private address (the page itself was checked; what it loads was
+        not), and none for images, fonts, media or trackers."""
+        request = route.request
+        try:
+            check_public(request.url)
+        except BlockedAddress:
+            self.counts["browser_requests_private"] += 1
+            await route.abort()
+            return
+        if request.resource_type in SKIPPED_RESOURCES or is_tracker(urlsplit(request.url).hostname or ""):
+            self.counts["browser_requests_skipped"] += 1
+            await route.abort()
+            return
+        await route.continue_()
 
     async def _shared_browser(self, async_playwright: Any) -> Any:
         """The run's one Chromium: launched on first use, and again once the last one died."""
@@ -505,6 +629,69 @@ class HarvesterCascade:
                 await asyncio.wait_for(browser.close(), self._timeout_s)
             with contextlib.suppress(Exception):
                 await playwright.stop()
+
+
+def _note_api(reply: Any, into: List[str]) -> None:
+    """Note a JSON reply to a page's own background request (Scrapling's network recording, counted rather than kept)."""
+    with contextlib.suppress(Exception):
+        if reply.request.resource_type in ("xhr", "fetch") and "json" in (reply.headers.get("content-type") or "").lower():
+            into.append(reply.url)
+
+
+# The page's HTML with each open shadow root copied in as a <shadow-root> element, or null when it has none. From Scrapling
+# (scrapling/engines/toolbelt/convertor.py, BSD-3-Clause, Copyright (c) 2024 Karim Shoair; licence in licenses/Scrapling-BSD-3-Clause.txt).
+SHADOW_SNAPSHOT_JS = r"""
+() => {
+    if (!Array.from(document.querySelectorAll('*')).some(node => node.shadowRoot)) return null;
+    const documentCopy = document.implementation.createHTMLDocument('');
+    let roots = 0;
+    function copy(node, pierce = true) {
+        if (node.nodeType !== Node.ELEMENT_NODE) return node.cloneNode(true);
+        const name = node.prefix ? `${node.prefix}:${node.localName}` : node.localName;
+        const target = documentCopy.createElementNS(node.namespaceURI, name);
+        for (const attr of node.attributes) target.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
+        if (pierce && node instanceof HTMLSlotElement && node.getRootNode() instanceof ShadowRoot) {
+            const assigned = node.assignedNodes();
+            for (const child of assigned.length ? assigned : node.childNodes) target.append(copy(child));
+            return target;
+        }
+        if (pierce && node.shadowRoot) {
+            roots++;
+            const shadow = documentCopy.createElement('shadow-root');
+            for (const child of node.shadowRoot.childNodes) shadow.append(copy(child));
+            target.append(shadow);
+        } else {
+            const template = node instanceof HTMLTemplateElement;
+            const source = template ? node.content : node;
+            const destination = template ? target.content : target;
+            for (const child of source.childNodes) destination.append(copy(child, pierce && !template));
+        }
+        return target;
+    }
+    const root = copy(document.documentElement);
+    if (!roots) return null;
+    document.adoptNode(root);
+    const doctype = document.doctype ? new XMLSerializer().serializeToString(document.doctype) : '';
+    return doctype + root.outerHTML;
+}
+"""
+# Removes, from the live page, elements a reader cannot see but inner_text keeps: aria-hidden, transparent, zero-size
+# text or a zero box that clips its content. The same rule as readers.is_hidden, read from computed style.
+DROP_HIDDEN_JS = r"""
+() => {
+    let dropped = 0;
+    for (const el of Array.from(document.querySelectorAll('body *'))) {
+        if (!el.isConnected) continue;
+        const style = getComputedStyle(el);
+        const clipped = (style.height === '0px' || style.width === '0px') && style.overflow === 'hidden';
+        if (el.getAttribute('aria-hidden') === 'true' || style.opacity === '0' || parseFloat(style.fontSize) === 0 || clipped) {
+            el.remove();
+            dropped++;
+        }
+    }
+    return dropped;
+}
+"""
 
 
 def _failed(url: str, tier: str, message: str, status: int = 0) -> ScrapeResult:

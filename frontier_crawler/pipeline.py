@@ -57,7 +57,8 @@ from frontier_crawler.storage.store import Store
 logger = logging.getLogger("frontier_crawler.pipeline")
 
 # PROVISIONAL: phrases that mark a page as a block or error page when the page is short.
-_BLOCK_PHRASES = ("access denied", "cloudflare ray id", "attention required", "captcha", "enable javascript", "404 not found")
+_BLOCK_PHRASES = ("access denied", "cloudflare ray id", "attention required", "captcha", "enable javascript", "404 not found",
+                  "verify you are human", "verifying you are human", "security of your connection")
 _BLOCK_PHRASE_MAX_WORDS = 400
 # PROVISIONAL: a non-200 response with fewer words than this is an error page: the attempt is
 # recorded and its bytes are dropped. With more, it is kept, since some servers send real
@@ -328,10 +329,11 @@ class Engine:
         return timed(self._slot, key)
 
     async def fetch(self, target: Target, **limits: float) -> Dict[str, Any]:
-        """Fetch one target, buffer its row and count it. Returns the row with two keys that are not stored columns:
+        """Fetch one target, buffer its row and count it. Returns the row with keys that are not stored columns:
         row["links"], (links, unparseable hrefs) of a stored HTML page as its reader found them, else None;
         row["timed_out"], set when nothing was served because of a timeout; and row["cool_host"], set when the server asked
-        for a pause too long to wait out. limits (timeout=, connect=) go to the fetcher."""
+        for a pause too long to wait out; row["api_responses"], set when a rendered page loaded JSON from a backend.
+        limits (timeout=, connect=) go to the fetcher."""
         took: Dict[str, float] = {}
         with timed(took, "fetch"):
             row, scraped, links = await self._fetch_row(target, limits)
@@ -353,6 +355,8 @@ class Engine:
                 self.stats["not_sampled"] += 1
         if scraped is not None and scraped.cool_host:
             row = {**row, "cool_host": True}
+        if scraped is not None and scraped.api_responses:
+            row = {**row, "api_responses": scraped.api_responses}
         if scraped is not None and scraped.timed_out:
             return {**row, "links": links, "timed_out": True}
         return {**row, "links": links}

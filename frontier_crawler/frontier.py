@@ -258,7 +258,7 @@ _LINES_SCHEMA = pa.schema(
 
 _REFUSED_STATUS = {401, 403, 407, 429, 451, 503}
 _HEAVY_TIERS = {"PDF", "HEADLESS_PLAYWRIGHT"}
-_HTML_TIERS = {"DOM_TRAFILATURA", "HEADLESS_PLAYWRIGHT"}
+_HTML_TIERS = {"DOM_TRAFILATURA", "HTTP_IMPERSONATE", "HEADLESS_PLAYWRIGHT"}
 
 
 def crawl_delays(store: Store, workdir: Path) -> Dict[str, float]:
@@ -1974,6 +1974,7 @@ async def crawl(
     watch_tally = dict.fromkeys(("taken", "stored", "judged", "relevance"), 0)   # judge() wants one; not reported
     read = dict.fromkeys(("sitemap_sites_read", "sitemaps_read", "sitemap_failures", "sitemap_urls_queued"), 0)
     data_portals: Dict[str, float] = {}
+    api_backed: Dict[str, int] = {}   # rendered pages that loaded JSON from a backend: candidates for a derived client
     counts = dict.fromkeys(("taken", "in_flight", "peak_in_flight", "retries", "retry_recovered", "steered_down", "steered_up"), 0)
     by_generation = dict.fromkeys(("0", "1", "2", "3", "4-7", "8+"), 0)   # fetches by the generation they are priced at
     by_host_page = dict.fromkeys(("1", "2-5", "6-20", "21+"), 0)   # fetches by their page number on their host
@@ -2004,6 +2005,8 @@ async def crawl(
             final = urlsplit(normalise(row.get("url_final") or "")).netloc
             if final and registered_domain(final) != registered_domain(entry["host"]):
                 seed_url_redirects[entry["url"]] = final
+        if row.get("api_responses") and row["outcome"] == "stored":
+            api_backed[row["url_final"]] = row["api_responses"]
         if row["outcome"] == "stored" and not row["block_marker"] and not thin(row):
             stored_by_seed[entry["seed_id"]] = stored_by_seed.get(entry["seed_id"], 0) + 1
         elif entry["url"] in starting:
@@ -2231,6 +2234,8 @@ async def crawl(
             "seed_url_problems": seed_url_problems, "seed_url_redirects": seed_url_redirects,
             # Pages Jev read as data portals whose figures load from a backend: candidates for a derived client.
             "data_portals": dict(sorted(data_portals.items(), key=lambda item: -item[1])[:20]),
+            # Rendered pages whose own background requests got JSON back, by how many: candidates for a derived client too.
+            "api_backed_pages": dict(sorted(api_backed.items(), key=lambda item: -item[1])[:20]),
             # What the engine chose not to do in this run. Read these when reviewing the limits.
             "skipped": {**frontier.skipped, "too_large": stats["too_large"],
                         "host_cooled": sum(frontier._queued_per_host.get(host, 0) for host in frontier.cooled)},

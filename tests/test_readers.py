@@ -104,7 +104,7 @@ def test_a_sitemap_is_read_plain_gzipped_or_as_an_index_and_anything_else_is_ref
     index = b"<sitemapindex xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'><sitemap><loc>https://a.test/s1.xml.gz</loc></sitemap></sitemapindex>"
     assert read_sitemap(index) == ("index", [("https://a.test/s1.xml.gz", "")])
     assert read_sitemap(URLSET[:-40])[1][:2] == expected[1][:2]   # a file cut short gives what it holds
-    for bad in (b"", b"not xml at all", b"<html><body><a href='/x'>x</a></body></html>", gzip.compress(b"<rss/>"), b"\x1f\x8b broken gzip"):
+    for bad in (b"", b"not xml at all", b"<html><body><a href='/x'>x</a></body></html>", gzip.compress(b"<nope/>"), b"\x1f\x8b broken gzip"):
         with pytest.raises(Exception):
             read_sitemap(bad)
     # Entities are not expanded.
@@ -219,3 +219,39 @@ def test_a_rendered_page_gets_its_links_from_a_worker_and_keeps_the_browsers_tex
     result = asyncio.run(run())
     assert result.tier_used == "HEADLESS_PLAYWRIGHT" and result.markdown_content == "what the browser read"
     assert result.links == extract_links(rendered, "https://a.test/app") and len(result.links[0]) == 2
+
+
+def test_hidden_elements_and_invisible_characters_are_kept_out_of_the_text() -> None:
+    page = (f"<html><body><article><p>{TEXT}</p>"
+            "<p style='display: none'>HIDDEN-A</p><div aria-hidden='true'>HIDDEN-B</div><p style='font-size:0px'>HIDDEN-C</p>"
+            "<p hidden>HIDDEN-D</p><p style='opacity:/**/0 !important'>HIDDEN-E</p><template><p>HIDDEN-F</p></template>"
+            "<p style='opacity:0.95; line-height:0.9'>KEPT-G</p><p>zero\u200bwidth</p></article></body></html>").encode()
+    text = read_html(page, "text/html", "https://a.test/p")[0]
+    assert "HIDDEN" not in text and "KEPT-G" in text and "zerowidth" in text
+    from lxml import html as lxml_html
+    assert not readers.is_hidden(lxml_html.fromstring("<p style='content:\"display:none\"'>x</p>"))   # inside a string is not CSS
+
+
+def test_a_feed_gives_its_item_links_and_title_and_feed_links_on_a_page_are_followed() -> None:
+    import gzip
+
+    rss = (b"<?xml version='1.0'?><rss version='2.0'><channel><title>Port notices</title>"
+           b"<item><title>One</title><link>https://a.test/n/1</link><pubDate>Mon, 16 Nov 2026 10:00:00 GMT</pubDate></item>"
+           b"<item><title>Two</title><link>https://a.test/n/2</link></item></channel></rss>")
+    atom = (b"<feed xmlns='http://www.w3.org/2005/Atom'><title>Atom notices</title><entry><link rel='self' href='https://a.test/self'/>"
+            b"<link href='https://a.test/n/3'/><updated>2026-11-16T10:00:00Z</updated></entry></feed>")
+    _, _, links, title = read_html(rss, "application/rss+xml", "https://a.test/feed")
+    assert title == "Port notices" and links == ([("https://a.test/n/1", ""), ("https://a.test/n/2", "")], [])
+    assert read_html(atom, "application/atom+xml", "https://a.test/atom")[2] == ([("https://a.test/n/3", "")], [])
+    assert read_sitemap(gzip.compress(atom)) == ("urlset", [("https://a.test/n/3", "2026-11-16T10:00:00Z")])   # a feed in robots.txt
+    assert read_html(b"a,b\n1,2\n", "text/csv", "https://a.test/c.csv")[2] is None
+    page = (b"<html><head><link rel='alternate' type='application/rss+xml' href='/feed.xml'><link rel='stylesheet' href='/s.css'></head>"
+            b"<body><map><area href='/zone/1' alt='Zone 1'></map><a href='/icon' title='Berths'><img src='i.png'></a></body></html>")
+    assert extract_links(page, "https://a.test/")[0] == [("https://a.test/feed.xml", ""), ("https://a.test/zone/1", "Zone 1"), ("https://a.test/icon", "Berths")]
+
+
+def test_a_sitemap_lists_its_pages_in_other_languages_and_a_robots_bom_hides_nothing() -> None:
+    urlset = (b"<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9' xmlns:xhtml='http://www.w3.org/1999/xhtml'><url><loc>https://a.test/en/</loc>"
+              b"<xhtml:link rel='alternate' hreflang='fr' href='https://a.test/fr/'/><xhtml:link rel='alternate' hreflang='en' href='https://a.test/en/'/></url></urlset>")
+    assert read_sitemap(urlset) == ("urlset", [("https://a.test/en/", ""), ("https://a.test/fr/", "")])
+    assert robots_sitemaps("﻿Sitemap: https://a.test/s.xml\n".encode()) == ["https://a.test/s.xml"]

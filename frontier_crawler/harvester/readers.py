@@ -7,7 +7,10 @@ Input contract:
     pool.close()                    # kills the workers: at the end of a run, and on error
 pool.run raises ReaderFailed when the call's worker died twice or ran past the limit; other exceptions from the
 reader come back as they were raised. The functions sent must be importable at module level.
-read_sitemap reads a sitemap (an index or a URL set, gzipped or not) in a worker too; robots_sitemaps and newest_first are plain text.
+read_sitemap reads a sitemap (an index or a URL set, or an RSS or Atom feed, gzipped or not) in a worker too; robots_sitemaps and
+newest_first are plain text. read_html reads a feed's item links as its links. Text read from HTML has hidden elements and
+invisible characters removed first (drop_hidden, clean_text), so a model that reads it later is not handed hidden instructions;
+the stored bytes stay as served.
 This module imports only the standard library, trafilatura and lxml (pypdfium2 when a PDF is read), so workers stay small.
 """
 
@@ -49,6 +52,23 @@ _SHARE_MARKERS = ("/sharer", "/share?", "/intent/tweet", "/shareArticle", "wa.me
 # Legacy charsets as browsers read them: pages labelled with one routinely use its superset's extra characters.
 _SUPERSETS = {"gb2312": "gb18030", "gbk": "gb18030", "big5": "big5hkscs", "shift_jis": "cp932", "euc_kr": "cp949"}
 
+# Hidden-content filter, adapted from Scrapling's prompt-injection sanitizer (scrapling/core/shell.py, BSD-3-Clause,
+# Copyright (c) 2024 Karim Shoair; licence in licenses/Scrapling-BSD-3-Clause.txt).
+_HIDDEN_XPATH = ".//*[@style] | .//*[@aria-hidden='true'] | .//*[@hidden] | .//template"
+_HIDING_DECLARATIONS = frozenset({("display", "none"), ("visibility", "hidden")})
+_ZERO_HIDING_PROPERTIES = frozenset({"opacity", "font-size", "height", "width", "max-height", "max-width"})
+_CSS_NEWLINE = re.compile(r"\r\n?|\f")
+# Escapes, strings and unquoted url() first, so a /*, a quote or a ; inside them is never read as CSS.
+_STYLE_TOKEN = re.compile(
+    r"""(\\.)|"(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?"""
+    r"""|(?<![\w-])url\((?![ \t\n]*["'])(?:[^)\\]|\\.?)*\)?|(/\*.*?(?:\*/|\Z))""",
+    re.S | re.I,
+)
+_ZERO_VALUE = re.compile(r"[+-]?(?:0+(?:\.0+)?|\.0+)(?:e[+-]?[0-9]+)?[a-z%]*")
+_IMPORTANT = re.compile(r"![ \t\n]*important$")
+_INVISIBLE = re.compile(r"[\u200b\u200c\u200d\ufeff\u2060\u180e\x00-\x08\x0b\x0c\x0e-\x1f]")
+_GZIP = b"\x1f\x8b"
+
 
 class ReaderFailed(Exception):
     """The reader's worker process died, or the read ran past its limit."""
@@ -78,6 +98,47 @@ def decode(body: bytes, content_type: str) -> Tuple[str, Optional[str]]:
     return body.decode("utf-8", errors="replace"), None
 
 
+def _blank_style_token(match: "re.Match[str]") -> str:
+    """Keep an escape; a comment becomes a space (so no/**/ne never reads as none), a string or url() an empty string."""
+    if match.group(1):
+        return match.group(1)
+    return " " if match.group(2) else '""'
+
+
+def is_hidden(element: Any) -> bool:
+    """Whether an element is hidden from a page's readers by markup or inline style, declaration by declaration
+    (opacity:0.95 and line-height:0.9 stay)."""
+    if element.tag == "template" or element.get("aria-hidden") == "true" or element.get("hidden") is not None:
+        return True
+    style = _STYLE_TOKEN.sub(_blank_style_token, _CSS_NEWLINE.sub("\n", element.get("style") or ""))
+    for declaration in style.split(";"):
+        prop, _, value = declaration.partition(":")
+        prop = prop.strip(" \t\n").lower()
+        value = _IMPORTANT.sub("", value.strip(" \t\n").lower()).rstrip(" \t\n")
+        if (prop, value) in _HIDING_DECLARATIONS or (prop in _ZERO_HIDING_PROPERTIES and _ZERO_VALUE.fullmatch(value)):
+            return True
+    return False
+
+
+def drop_hidden(tree: Any) -> int:
+    """Remove the hidden elements of an lxml tree in place; how many were removed."""
+    hidden = [element for element in tree.xpath(_HIDDEN_XPATH) if isinstance(element.tag, str) and is_hidden(element)]
+    for element in hidden:   # collected first: dropping mid-walk sends the iterator into the detached subtree
+        if element.getparent() is not None:
+            element.drop_tree()
+    return len(hidden)
+
+
+def clean_text(text: Optional[str]) -> Optional[str]:
+    """Text without zero-width and control characters, which can hide instructions from a human reader."""
+    return _INVISIBLE.sub("", text) if text else text
+
+
+def gunzip(body: bytes, limit: int) -> bytes:
+    """The bytes unpacked when they are gzipped, up to limit (what is past it is dropped: a gzip bomb stops there)."""
+    return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, limit) if body[:2] == _GZIP else body
+
+
 def normalise(url: str) -> str:
     """Lower-case scheme and host, drop the fragment. Empty when the URL is not http(s) or does not parse.
 
@@ -103,7 +164,11 @@ def extract_links(body: bytes, base_url: str, limit: int = MAX_LINKS_PER_PAGE) -
     own = normalise(base_url)
     found: Dict[str, str] = {}
     unparseable: List[str] = []
-    for anchor in tree.iter("a"):
+    for anchor in tree.iter("a", "area", "link"):
+        # A <link> counts only when it names the page's RSS or Atom feed.
+        if anchor.tag == "link" and not ("alternate" in (anchor.get("rel") or "").lower()
+                                         and any(kind in (anchor.get("type") or "").lower() for kind in ("rss", "atom"))):
+            continue
         href = (anchor.get("href") or "").strip()
         if not href:
             continue
@@ -117,7 +182,7 @@ def extract_links(body: bytes, base_url: str, limit: int = MAX_LINKS_PER_PAGE) -
         lowered = url.lower()
         if urlsplit(lowered).path.endswith(_SKIP_EXTENSIONS) or any(marker.lower() in lowered for marker in _SHARE_MARKERS):
             continue
-        found[url] = " ".join((anchor.text_content() or "").split())[:200]
+        found[url] = " ".join((anchor.text_content() or anchor.get("title") or anchor.get("alt") or "").split())[:200]
         if len(found) >= limit:
             break
     return list(found.items()), unparseable
@@ -136,14 +201,23 @@ def title_of(raw: Any) -> Optional[str]:
 
 
 def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], Optional[str], Optional[Links], Optional[str]]:
-    """(markdown text, encoding read in, the page's links, its <title>); links and title are None when the bytes do not look like HTML."""
+    """(markdown text, encoding read in, the page's links, its <title>). An RSS or Atom feed gives its item links and title;
+    links and title are None for other bytes that do not look like HTML."""
     html, encoding = decode(body, content_type)
     try:
-        text = trafilatura.extract(html, output_format="markdown", include_comments=False, include_tables=True)
+        from trafilatura.utils import load_html
+
+        tree = load_html(html)
+        if tree is not None:
+            drop_hidden(tree)
+        text = clean_text(trafilatura.extract(tree, output_format="markdown", include_comments=False, include_tables=True)) if tree is not None else None
     except Exception:  # a page trafilatura cannot read is stored without text
         text = None
     if not looks_like_html(content_type, body):
-        return text, encoding, None, None
+        feed = read_feed(body)
+        if feed is None:
+            return text, encoding, None, None
+        return text, encoding, ([(link, "") for link, _ in feed[1]][:MAX_LINKS_PER_PAGE], []), feed[0]
     # From the decoded text, so a page in a legacy encoding gets its title in it.
     found = re.search(r"<title(?:\s[^>]*)?>(.*?)</title\s*>", html, re.I | re.S)
     return text, encoding, extract_links(body, url), title_of(html_module.unescape(found.group(1))) if found else None
@@ -152,7 +226,7 @@ def read_html(body: bytes, content_type: str, url: str) -> Tuple[Optional[str], 
 def robots_sitemaps(body: bytes) -> List[str]:
     """The sitemaps a robots.txt names, in order, normalised. Plain line splitting: nothing here parses markup."""
     found: List[str] = []
-    for line in body.decode("utf-8", errors="replace").splitlines():
+    for line in body.decode("utf-8-sig", errors="replace").splitlines():   # -sig: a byte-order mark would hide the first line
         name, _, value = line.partition(":")
         url = normalise(value) if name.strip().lower() == "sitemap" else ""
         if url and url not in found:
@@ -160,15 +234,63 @@ def robots_sitemaps(body: bytes) -> List[str]:
     return found
 
 
-def read_sitemap(body: bytes) -> Tuple[str, List[Tuple[str, str]]]:
-    """("index" or "urlset", [(normalised loc, lastmod or "")]) of a sitemap, gzipped or not. Raises ValueError for anything else."""
+def _xml_root(body: bytes) -> Any:
+    """The root element of XML bytes, gzipped or not, or None."""
     from lxml import etree
 
-    if body[:2] == b"\x1f\x8b":
-        body = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, MAX_SITEMAP_BYTES)   # what is past the limit is dropped
     # No entities, no network, no huge trees; recover reads what it can of a cut or sloppy file.
-    root = etree.fromstring(body, etree.XMLParser(recover=True, resolve_entities=False, no_network=True))
-    kind = etree.QName(root).localname if root is not None and isinstance(root.tag, str) else ""
+    try:
+        root = etree.fromstring(gunzip(body, MAX_SITEMAP_BYTES), etree.XMLParser(recover=True, resolve_entities=False, no_network=True))
+    except Exception:
+        return None
+    return root if root is not None and isinstance(root.tag, str) else None
+
+
+def read_feed(body: bytes) -> Optional[Tuple[Optional[str], List[Tuple[str, str]]]]:
+    """(title, [(normalised item link, its date or "")]) of an RSS or Atom feed, gzipped or not; None for anything else.
+    Elements are matched by local name, so namespaced feeds read the same."""
+    from lxml import etree
+
+    try:
+        head = gunzip(body[:4096], 4096).lstrip()[:200].lower()
+    except zlib.error:
+        return None
+    if not (head.startswith(b"<?xml") or head.startswith(b"<rss") or head.startswith(b"<feed") or head.startswith(b"<rdf")):
+        return None
+    root = _xml_root(body)
+    if root is None or etree.QName(root).localname.lower() not in ("rss", "feed", "rdf"):
+        return None
+    name = lambda element: etree.QName(element).localname.lower() if isinstance(element.tag, str) else ""  # noqa: E731
+    title = None
+    entries: List[Tuple[str, str]] = []
+    for element in root.iter():
+        kind = name(element)
+        if kind == "title" and title is None:
+            title = title_of(element.text)
+        if kind not in ("item", "entry"):
+            continue
+        fields = {name(field): field for field in element if name(field) != "link"}
+        # Atom may list several links: the entry's own page is the one with no rel or rel="alternate".
+        link = next((field for field in element if name(field) == "link" and field.get("rel", "alternate") == "alternate"), None)
+        href = ((link.get("href") or link.text or "") if link is not None else "").strip()
+        when = next(((fields[key].text or "").strip() for key in ("updated", "published", "pubdate", "date") if key in fields), "")
+        url = normalise(href)
+        if url:
+            entries.append((url, when))
+    return title, entries
+
+
+def read_sitemap(body: bytes) -> Tuple[str, List[Tuple[str, str]]]:
+    """("index" or "urlset", [(normalised loc, lastmod or "")]) of a sitemap, gzipped or not, with its alternate-language
+    links (xhtml:link rel="alternate"). An RSS or Atom feed, which the sitemap protocol accepts, reads as a urlset.
+    Raises ValueError for anything else."""
+    from lxml import etree
+
+    feed = read_feed(body)
+    if feed is not None:
+        return "urlset", feed[1]
+    root = _xml_root(body)
+    kind = etree.QName(root).localname if root is not None else ""
     if kind not in ("sitemapindex", "urlset"):
         raise ValueError("not a sitemap")
     item_name = "sitemap" if kind == "sitemapindex" else "url"
@@ -179,6 +301,11 @@ def read_sitemap(body: bytes) -> Tuple[str, List[Tuple[str, str]]]:
             url = normalise(fields.get("loc", ""))
             if url:
                 entries.append((url, fields.get("lastmod", "")))
+            for field in item:   # the same page in other languages
+                if isinstance(field.tag, str) and etree.QName(field).localname == "link" and field.get("rel") == "alternate":
+                    alternate = normalise(field.get("href") or "")
+                    if alternate and alternate != url:
+                        entries.append((alternate, fields.get("lastmod", "")))
     return ("index" if kind == "sitemapindex" else "urlset"), entries
 
 

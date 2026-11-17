@@ -1,4 +1,4 @@
-"""Courtesy pacing, so a site has no reason to ban the crawler: the Crawl-delay a robots.txt asks for, and sitting out
+"""Courtesy pacing, so a site has no reason to ban the crawler: the Crawl-delay or Request-rate a robots.txt asks for, and sitting out
 when a server says it is overloaded.
 
 Input contract:
@@ -11,22 +11,33 @@ from __future__ import annotations
 import datetime as dt
 import email.utils
 import math
+import re
 from typing import Optional
 
 from frontier_crawler.harvester.throttle import HostThrottle
 
 MAX_CRAWL_DELAY_S = 30.0   # PROVISIONAL: a longer Crawl-delay is taken as this
 MAX_SIT_OUT_S = 300.0      # PROVISIONAL: a longer Retry-After (or a 429 without one) leaves the host alone for the rest of the run
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _rate_seconds(value: str) -> Optional[float]:
+    """Seconds per request of a Request-rate value ("1/10s", "3/1m", optionally followed by a time window), or None."""
+    found = re.match(r"(\d+)\s*/\s*(\d+)\s*([smhd]?)", value.lower())
+    if not found or int(found.group(1)) == 0:
+        return None
+    return int(found.group(2)) * _UNIT_SECONDS[found.group(3) or "s"] / int(found.group(1))
 
 
 def crawl_delay(robots: bytes, user_agent: str) -> Optional[float]:
-    """The Crawl-delay of the robots.txt group naming us (a User-agent value found in user_agent), else of the * group,
-    capped at MAX_CRAWL_DELAY_S. Only the delay is read: rules are not applied."""
+    """The gap the robots.txt group naming us (a User-agent value found in user_agent) asks for, else the * group's:
+    the longer of its Crawl-delay and its Request-rate, capped at MAX_CRAWL_DELAY_S. Only the pace is read: rules are
+    not applied."""
     ours: Optional[float] = None
     anyone: Optional[float] = None
     agents: list = []
     in_rules = False
-    for line in robots.decode("utf-8", errors="replace").splitlines():
+    for line in robots.decode("utf-8-sig", errors="replace").splitlines():
         name, _, value = line.split("#", 1)[0].partition(":")
         name, value = name.strip().lower(), value.strip()
         if name == "user-agent":
@@ -35,19 +46,22 @@ def crawl_delay(robots: bytes, user_agent: str) -> Optional[float]:
             agents.append(value.lower())
         elif name:
             in_rules = True
-            if name != "crawl-delay":
+            if name == "crawl-delay":
+                try:
+                    seconds: Optional[float] = float(value)
+                except ValueError:
+                    continue
+            elif name == "request-rate":   # read as Scrapling's robots handling does (protego)
+                seconds = _rate_seconds(value)
+            else:
                 continue
-            try:
-                seconds = float(value)
-            except ValueError:
-                continue
-            if not math.isfinite(seconds) or seconds < 0:
+            if seconds is None or not math.isfinite(seconds) or seconds < 0:
                 continue
             for agent in agents:
-                if agent == "*" and anyone is None:
-                    anyone = seconds
-                elif agent not in ("", "*") and agent in user_agent.lower() and ours is None:
-                    ours = seconds
+                if agent == "*":
+                    anyone = max(anyone or 0.0, seconds)
+                elif agent and agent in user_agent.lower():
+                    ours = max(ours or 0.0, seconds)
     found = ours if ours is not None else anyone
     return None if found is None else min(found, MAX_CRAWL_DELAY_S)
 
