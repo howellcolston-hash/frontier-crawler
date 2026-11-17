@@ -116,7 +116,9 @@ up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as 
 Per-seed bounds (bound()). Under scope "source" a seed queues only URLs on its own registered domains (its urls' and its
 sites'): a link off them is kept in the links table, counted (links_out_of_scope) and never queued, so it starts no line;
 sitemap URLs and watched pages' links pass the same check, and entries queued before (an "open" run) stay queued and are not
-taken, as a site factor of 0 keeps them. "open" queues as before. In either scope a seed's allow and deny patterns
+taken, as a site factor of 0 keeps them. One exception: a link off the sites found on a page of the seed's sites is queued in
+that page's line when its path ends in one of DOCUMENT_EXTENSIONS (documents_off_site); it starts no line and its own links
+are fenced. "open" queues as before. In either scope a seed's allow and deny patterns
 (re.search) decide which URLs past its starting ones it queues; its allowance holds its entries once the pages its lines have
 stored, plus its pages in flight, reach it; and no seed takes more than run_share of max_fetches in a run. A held seed's
 entries stay queued, in every ranking mode.
@@ -206,6 +208,8 @@ SITEMAP_MAX_URLS = 500          # PROVISIONAL: new URLs queued from one site's s
 WATCH_SHARE = 0.2               # PROVISIONAL: most of a run's max_fetches that watched pages may take
 SEED_RUN_SHARE = 0.15           # PROVISIONAL: most of a run's max_fetches that one seed, all its lines together, may take
 SCOPES = ("source", "open")     # config/ranking.json "scope": queue only links to a seed's own sites, or any link
+# PROVISIONAL: a link off a seed's sites, found on one of its pages, is still queued under scope "source" when its path ends so
+DOCUMENT_EXTENSIONS = (".pdf", ".xls", ".xlsx", ".csv", ".doc", ".docx", ".ods", ".odt", ".json", ".xml", ".zip")
 # The bandit rule (config/ranking.json); see the module docstring.
 RANKING_MODES = ("fixed", "bandit", "shadow")
 ARM_WINDOW = 6.0                # PROVISIONAL: fetches an arm's estimate remembers (about as many as the yield's YIELD_ALPHA): each reward discounts the older ones by 1 - 1/ARM_WINDOW
@@ -292,6 +296,10 @@ class Seed:
 
     def admits(self, url: str) -> bool:
         return (not self.allow or any(p.search(url) for p in self.allow)) and not any(p.search(url) for p in self.deny)
+
+
+def is_document(url: str) -> bool:
+    return urlsplit(url).path.lower().endswith(DOCUMENT_EXTENSIONS)
 
 
 def _patterns(value: Any) -> Tuple[Tuple[re.Pattern, ...], int]:
@@ -500,6 +508,8 @@ class Frontier:
         self._groups_by_seed: Dict[str, List[_Group]] = {}
         self.links_out_of_scope = 0                  # links not queued for the fence, in this run
         self.links_off_pattern = 0                   # links not queued for a seed's allow or deny patterns
+        self.documents_off_site = 0                  # documents off a seed's sites queued from its pages, in this run
+        self._aside: Dict[str, Dict[str, Any]] = {}  # queued entries a take found outside the fence: kept queued, off the heaps
         self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
         self._new_heap: List[Tuple[float, str, int, _Group]] = []  # the same, for groups on registered domains never fetched
         self._version = 0
@@ -738,6 +748,9 @@ class Frontier:
         self._fences = {seed.id: seed.domains() for seed in seeds} if scope == "source" else {}
         self._run_cap = max(1, math.floor(run_share * max_fetches)) if run_share and max_fetches else None
         self._held = {seed.id for seed in seeds if self._at_limit(seed.id)}
+        aside, self._aside = self._aside, {}
+        for entry in aside.values():   # strays set aside under the last bounds are judged again under these
+            self._enqueue(entry)
         self._weights = None   # every heap is rebuilt for it by the next take()
 
     def stored(self, seed_id: str) -> int:
@@ -769,9 +782,27 @@ class Frontier:
         fence = self._fences.get(seed_id)
         return fence is not None and registered_domain(host) not in fence
 
-    def _site(self, seed_id: str, host: str) -> float:
-        """The site factor, or 0 for a site outside the seed's fence: its entries stay queued, as a factor of 0 keeps them."""
-        return 0.0 if self._fenced(seed_id, host) else self.factor(host)
+    def _site(self, seed_id: str, host: str, line_id: str = "") -> float:
+        """The site factor, or 0 for a site outside the seed's fence, unless its line starts inside the fence (it may hold
+        documents off the seed's sites): held entries stay queued, as a factor of 0 keeps them."""
+        if self._fenced(seed_id, host):
+            line = self._lines.get(line_id)
+            if line is None or self._fenced(line["seed_id"], urlsplit(line["root_url"]).netloc):
+                return 0.0
+        return self.factor(host)
+
+    def _stray(self, entry: Dict[str, Any]) -> bool:
+        """An entry off its seed's fence that is not a document from one of its pages: queued in an open run. Not taken."""
+        return self._fenced(entry["seed_id"], entry["host"]) and (bool(entry.get("crossing")) or not is_document(entry["url"]))
+
+    def _set_aside(self, entry: Dict[str, Any]) -> None:
+        """Undo the take of a stray: it stays queued (saved with the queue), out of its group for the rest of the run."""
+        self._unhold(self._in_flight.pop(entry["url"]))
+        self._flight_seed[entry["seed_id"]] -= 1
+        tag = self._tags.pop(entry["url"], None)
+        if tag is not None:
+            self.takes_by_kind[tag] -= 1
+        self._aside[entry["url"]] = entry
 
     def priority(self, entry: Dict[str, Any], weight: float, extra_host: int = 0, extra_line: int = 0) -> float:
         line = self._lines[entry["line_id"]]
@@ -871,12 +902,12 @@ class Frontier:
 
     def _add(
         self, url: str, seed_id: str, line_id: str, hops: int, base: float, now: dt.datetime,
-        parent: Optional[str] = None, anchor: str = "", crossing: bool = False,
+        parent: Optional[str] = None, anchor: str = "", crossing: bool = False, document: bool = False,
     ) -> bool:
         if not url or self._known(url):
             return False
         host = urlsplit(url).netloc
-        if self._fenced(seed_id, host):   # still in the links table, as every link of a stored page is
+        if self._fenced(seed_id, host) and not document:   # still in the links table, as every link of a stored page is
             self.links_out_of_scope += 1
             return False
         limits = self._limits.get(seed_id)
@@ -893,6 +924,7 @@ class Frontier:
         })
         self._queued_per_host[host] = self._queued_per_host.get(host, 0) + 1
         self.queue["entries_appended_cold"] += not self._groups[(line_id, host, seed_id)].hot
+        self.documents_off_site += document
         return True
 
     def _insert(self, entry: Dict[str, Any]) -> None:
@@ -1036,7 +1068,13 @@ class Frontier:
                 self._note_inbound(covering, own_line)
             if self._known(url):
                 continue
-            if covering == own_line:
+            # A record file a page of the seed's own sites links on another host (a CDN): queued in the page's line, so it
+            # starts no line; its own links are fenced, since its host is off the sites.
+            seed_id = entry["seed_id"]
+            document = self._fenced(seed_id, host) and not self._fenced(seed_id, entry["host"]) and is_document(url)
+            if document:
+                hops, line_id, crossing = entry["hops"] + 1, own_line, False
+            elif covering == own_line:
                 hops, line_id, crossing = entry["hops"] + 1, own_line, False
             elif covering is not None:
                 # The site already has a line. The link joins it, one step from its start.
@@ -1048,7 +1086,7 @@ class Frontier:
             if hops > MAX_HOPS and not crossing:
                 self.skipped["hop_limit"] += 1
                 continue
-            if self._add(url, self._lines[line_id]["seed_id"], line_id, hops, base, now, row["fetch_id"], anchor, crossing):
+            if self._add(url, self._lines[line_id]["seed_id"], line_id, hops, base, now, row["fetch_id"], anchor, crossing, document):
                 added += 1
                 if awaited is not None:
                     awaited[1].append(url)
@@ -1099,7 +1137,7 @@ class Frontier:
         # A line's record is its own pages. A crossing that brings content is the first fetch of the line its site
         # becomes; one that brings nothing counts toward no line, only its host.
         value = fetch_yield(row, answers)
-        if entry.get("crossing") and (value is None or value > 0):
+        if entry.get("crossing") and (value is None or value > 0) and not self._fenced(entry["seed_id"], entry["host"]):
             self._spawn(entry, now)
         fetch_id = row.get("fetch_id")
         if entry.get("crossing"):
@@ -1182,7 +1220,7 @@ class Frontier:
         key = (entry["line_id"], entry["host"], entry["seed_id"])
         group = self._groups.get(key)
         if group is None:
-            group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0) * self._site(key[2], key[1]))
+            group = self._groups[key] = _Group(*key, (self._weights or {}).get(key[2], 1.0) * self._site(key[2], key[1], key[0]))
             self._groups_by_line.setdefault(key[0], []).append(group)
             self._groups_by_seed.setdefault(key[2], []).append(group)
             self._groups_by_host.setdefault(key[1], []).append(group)
@@ -1215,6 +1253,8 @@ class Frontier:
                 self._push(group)
 
     def _dequeue(self, entry: Dict[str, Any]) -> None:
+        if self._aside.pop(entry["url"], None) is not None:
+            return
         group = self._groups[(entry["line_id"], entry["host"], entry["seed_id"])]
         if not group.hot:
             group.pending.remove(entry)  # type: ignore[union-attr]
@@ -1319,7 +1359,9 @@ class Frontier:
                     continue
                 best = {"line_id": line, "host": host, "base": first["base"][i], "hops": first["hops"][i], "crossing": first["crossing"][i]}
                 factor = self.factor(host)
-                weight = weights.get(seed, 0.0) * self._site(seed, host)
+                weight = weights.get(seed, 0.0) * self._site(seed, host, line)
+                if self._stray({"seed_id": seed, "host": host, "crossing": best["crossing"], "url": first["url"][i]}):
+                    weight = 0.0   # a group led by strays is not loaded: its takes would all be set aside
                 self._cold_held += count if factor == 0 else 0
                 if seed in weights:
                     self._cold_top[seed] = max(self._cold_top.get(seed, 0.0), round(self.priority(best, weight), 4))
@@ -1459,8 +1501,8 @@ class Frontier:
             self._weights = weights
             self._heap, self._new_heap = [], []
             for group in self._groups.values():
-                if group.seed in weights and group.weight != weights[group.seed] * self._site(group.seed, group.host):
-                    group.weight = weights[group.seed] * self._site(group.seed, group.host)
+                if group.seed in weights and group.weight != weights[group.seed] * self._site(group.seed, group.host, group.line):
+                    group.weight = weights[group.seed] * self._site(group.seed, group.host, group.line)
                     group.members.sort(key=group.key)
                 self._push(group)
         if self._mode != "fixed" and self._arm_heap is None:
@@ -1700,23 +1742,27 @@ class Frontier:
         if entry is not None:
             return entry
         self._refill()
-        if self._mode == "bandit":
-            entry = self._take_bandit()
-        else:
-            would = self._arm_top(self._arm_heap) if self._arm_heap is not None else None
-            would_entry = self._best(would, *self._extras(would))[1] if would is not None else None  # type: ignore[index]
-            entry = self._take_fixed()
-            if self._mode == "shadow" and entry is not None:
-                agreed = entry is would_entry
-                self._tag(entry, "agreed" if agreed else "differed")
-                self.shadow["takes"] += 1
-                self.shadow["agreed"] += agreed
-                self.shadow["estimate_fixed"] += self._arm(entry["line_id"], entry, entry["host"])[0]
-                if would is not None:
-                    self.shadow["estimate_bandit"] += self._arm(would.line, would_entry, would.host)[0]  # type: ignore[arg-type]
-                    self._draw(would)   # its draw is spent, as if it had been taken
-                self._draw(self._groups[(entry["line_id"], entry["host"], entry["seed_id"])])
-                self._refresh()
+        while True:
+            if self._mode == "bandit":
+                entry = self._take_bandit()
+            else:
+                would = self._arm_top(self._arm_heap) if self._arm_heap is not None else None
+                would_entry = self._best(would, *self._extras(would))[1] if would is not None else None  # type: ignore[index]
+                entry = self._take_fixed()
+                if self._mode == "shadow" and entry is not None:
+                    agreed = entry is would_entry
+                    self._tag(entry, "agreed" if agreed else "differed")
+                    self.shadow["takes"] += 1
+                    self.shadow["agreed"] += agreed
+                    self.shadow["estimate_fixed"] += self._arm(entry["line_id"], entry, entry["host"])[0]
+                    if would is not None:
+                        self.shadow["estimate_bandit"] += self._arm(would.line, would_entry, would.host)[0]  # type: ignore[arg-type]
+                        self._draw(would)   # its draw is spent, as if it had been taken
+                    self._draw(self._groups[(entry["line_id"], entry["host"], entry["seed_id"])])
+                    self._refresh()
+            if entry is None or not self._stray(entry):
+                break
+            self._set_aside(entry)
         if entry is not None:
             self.tried.add((entry["line_id"], entry["host"], entry["seed_id"]))
             self._taken_by_seed[entry["seed_id"]] += 1
@@ -1788,7 +1834,7 @@ class Frontier:
         if limit is not None and self._retry_flight >= limit:
             return None
         entry = next((e for e in self._retry.values() if e["seed_id"] in self._weights   # type: ignore[operator]
-                      and e["host"] not in self.cooled and self._site(e["seed_id"], e["host"]) > 0 and e["seed_id"] not in self._held
+                      and e["host"] not in self.cooled and self._site(e["seed_id"], e["host"], e["line_id"]) > 0 and not self._stray(e) and e["seed_id"] not in self._held
                       and self._flight_host.get(e["host"], 0) < MAX_IN_FLIGHT_PER_HOST), None)
         if entry is not None:
             del self._retry[entry["url"]]
@@ -1807,7 +1853,7 @@ class Frontier:
                 continue
             queued[seed] += 1
             if entry["host"] not in self.cooled:
-                top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed] * self._site(seed, entry["host"])), 4))
+                top[seed] = max(top.get(seed, 0.0), round(self.priority(entry, weights[seed] * self._site(seed, entry["host"], entry["line_id"])), 4))
         for seed in weights:   # rows on disk, at their best's priority when the hot set was chosen
             queued[seed] += self._disk_by_seed.get(seed, 0)
             if seed in self._cold_top:
@@ -2161,6 +2207,7 @@ async def crawl(
             # The per-seed bounds: links the fence or a seed's patterns kept out of the queue (a link on several pages
             # counts once a page), malformed patterns ignored, and seeds that have stored their allowance.
             "scope": scope, "links_out_of_scope": frontier.links_out_of_scope, "links_off_pattern": frontier.links_off_pattern,
+            "documents_off_site": frontier.documents_off_site,
             "seed_patterns_ignored": sum(seed.patterns_ignored for seed in seeds),
             "seeds_at_allowance": sorted(seed.id for seed in seeds if seed.allowance is not None and frontier.stored(seed.id) >= seed.allowance),
             "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread, **read,

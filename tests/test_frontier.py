@@ -1439,3 +1439,28 @@ def test_a_crawl_reports_the_bounds_and_fences_watched_page_links(tmp_path: Path
     links = {row["url"] for path in (tmp_path / "store" / "links").rglob("*.parquet") for row in pq.read_table(path).to_pylist()}
     assert {"https://example.net/a", "https://example.net/b"} <= links   # still in the links table
     assert stats["seeds_at_allowance"] == ["s"] and stats["links_off_pattern"] == 0 and stats["seed_patterns_ignored"] == 0
+
+
+def test_a_document_off_the_fence_found_on_a_seeds_page_is_queued_in_that_line_and_leads_nowhere() -> None:
+    links = '<a href="https://files.example.net/r/1.PDF">record</a> <a href="https://files.example.net/r/page">page</a>'
+    today, _ = _fenced_page(None)
+    opened, _ = _fenced_page("open")
+    for frontier in (today, opened):   # open: today's queueing, a crossing like any other
+        root = frontier.entry("https://www.example.com/x")
+        row = _page_row(root["url"], links)
+        frontier.add_links(root, row, None, NOW)
+    assert _queued(opened) == _queued(today) and today.entry("https://files.example.net/r/1.PDF")["crossing"]
+    frontier, seeds = _fenced_page("source")
+    page = frontier.entry("https://www.example.com/x")
+    frontier.add_links(page, _page_row(page["url"], links), None, NOW)
+    doc = frontier.entry("https://files.example.net/r/1.PDF")
+    assert (doc["line_id"], doc["hops"], doc["crossing"]) == ("s", 2, False) and frontier.documents_off_site == 1
+    assert not frontier._known("https://files.example.net/r/page") and frontier.links_out_of_scope == 2   # example.net/z, and this
+    taken = list(iter(lambda: frontier.take(seeds, NOW.date()), None))
+    assert doc in taken
+    stored = frontier.stored("s")
+    frontier.mark(doc, _page_row(doc["url"], '<a href="https://files.example.net/r/2.pdf">2</a> <a href="https://www.example.com/q">q</a>'), None, NOW)
+    assert frontier.line("s:files.example.net") is None and frontier.spawned == 0   # no new line
+    assert frontier.stored("s") == stored + 1 and frontier.line("s")["content"] == 2   # counts toward the seed like any page
+    frontier.add_links(doc, _page_row(doc["url"], '<a href="https://files.example.net/r/2.pdf">2</a> <a href="https://www.example.com/q">q</a>'), None, NOW)
+    assert not frontier._known("https://files.example.net/r/2.pdf") and frontier.documents_off_site == 1   # it leads nowhere
