@@ -276,6 +276,13 @@ def test_a_damaged_pdf_is_still_stored() -> None:
     assert result.raw_payload == b"%PDF-1.4 broken" and result.error_message.startswith("pdf not read")
 
 
+def test_the_etag_and_last_modified_headers_are_kept() -> None:
+    headers = {"content-type": "application/pdf", "ETag": '"abc"', "Last-Modified": "Mon, 09 Nov 2026 10:00:00 GMT"}
+    result = _fetch(lambda request: httpx.Response(200, content=b"%PDF-1.4 broken", headers=headers))
+    assert (result.etag, result.last_modified) == ('"abc"', "Mon, 09 Nov 2026 10:00:00 GMT")
+    assert _fetch(_html(f"<p>{WORDS}</p>")).etag is None
+
+
 def _sitemaps(files: Dict[str, bytes], origin: str = "https://a.test") -> Any:
     async def run() -> Any:
         served = lambda request: httpx.Response(200, content=files[str(request.url)]) if str(request.url) in files else httpx.Response(404)  # noqa: E731

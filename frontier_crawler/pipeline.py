@@ -1,8 +1,8 @@
 """Fetch and store, then judge.
 
 Fetching (Engine.fetch): fetch a target and write one row per attempt to the fetches table,
-with where it came from; new bytes go to the bodies table, once per content hash across runs, and
-a stored HTML page's links to the links table. Nothing here waits on a model: a document is
+with where it came from; new bytes go to the bodies table, once per content hash across runs (a PDF
+whose text was read in full keeps only its text by default: PDF_BODIES), and a stored HTML page's links to the links table. Nothing here waits on a model: a document is
 stored before anything judges it.
 Judging (Engine.judge when a Jev client is given, or later through Engine.judge_days): ask Jev
 the configured questions (judge/questions.py) about each new document and store every answer.
@@ -82,6 +82,9 @@ FORECAST_KEY = "judgeable_pages_last_crawl_run"
 _OCR_LIMIT_S = ocr.OCR_SECONDS + 300.0
 # Rows are uploaded at least this often, so a run that dies keeps what it had fetched.
 _UPLOAD_EVERY_S = 600.0
+# What is kept of a stored PDF. text_only: a PDF whose text was read in full keeps its text in fetches and writes no body;
+# a scan (under ocr.SCAN_MAX_WORDS words) a PDF cut short by the reader's time limit or one with no text on many of its pages keeps its bytes. keep: every PDF keeps them.
+PDF_BODIES = ("text_only", "keep")
 
 Observer = Callable[[Target, Dict[str, Any], Optional[JevResult]], None]
 
@@ -122,6 +125,11 @@ def judgeable(row: Dict[str, Any]) -> bool:
     )
 
 
+def text_only_pdf(row: Dict[str, Any]) -> bool:
+    """A PDF whose text was read in full: not a scan (the OCR command's test) not cut short by the reader's time limit and not partly a scan (the reader left no note)."""
+    return row.get("tier_used") == "PDF" and (row.get("word_count") or 0) >= ocr.SCAN_MAX_WORDS and row.get("tier_note") is None
+
+
 def _spread(seconds: List[float]) -> Dict[str, Any]:
     """n, mean, median, 90th percentile (nearest rank) and max of a list of durations."""
     s = sorted(seconds)
@@ -151,7 +159,11 @@ class Engine:
         concurrency: int = 4,
         now: Callable[[], dt.datetime] = utc_now,
         run_id: Optional[str] = None,
+        pdf_bodies: str = "text_only",
     ) -> None:
+        if pdf_bodies not in PDF_BODIES:
+            raise ValueError(f"pdf_bodies must be one of {PDF_BODIES}")
+        self._pdf_bodies = pdf_bodies
         self._store = store
         self._fetcher = fetcher
         self._workdir = Path(workdir)
@@ -200,6 +212,7 @@ class Engine:
             "stored_bytes": 0, "thin_html": 0, "stored_by_tier": {}, "bytes_by_tier": {}, "shard_bytes": {},
             "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
             "links_written": 0, "reader_crashes": 0, "reader_timeouts": 0,
+            "pdf_bodies": pdf_bodies, "pdf_text_only": 0, "pdf_text_only_bytes": 0,
         }
 
     async def start(self) -> None:
@@ -403,6 +416,8 @@ class Engine:
                 "http_status": scraped.http_status,
                 "tier_used": scraped.tier_used,
                 "content_type": scraped.content_type or None,
+                "etag": scraped.etag,
+                "last_modified": scraped.last_modified,
             }
         )
         if scraped.too_large_bytes is not None:
@@ -451,11 +466,16 @@ class Engine:
         return row, scraped, links
 
     def _keep_body(self, row: Dict[str, Any], body: bytes) -> None:
-        """Buffer the bytes for the bodies table, unless a body with their hash is stored already, in this run or before."""
+        """Buffer the bytes for the bodies table, unless a body with their hash is stored already, in this run or before,
+        or the row is a PDF kept as text only (PDF_BODIES)."""
         digest = row["sha256"]
         if digest in self._bodies_written or digest in self._hashes:
             self.stats["bodies_already_stored"] += 1
             self.stats["bodies_already_stored_bytes"] += len(body)
+            return
+        if self._pdf_bodies == "text_only" and text_only_pdf(row):
+            self.stats["pdf_text_only"] += 1
+            self.stats["pdf_text_only_bytes"] += len(body)
             return
         self._bodies_written.add(digest)
         self._writer("bodies", self._day).add({

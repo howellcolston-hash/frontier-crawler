@@ -123,3 +123,13 @@ def test_a_derived_run_paces_by_the_kept_crawl_delays_and_queues_followed_links(
     assert record["stats"]["clients"] == {"notices": {"status": "ok", "pages": 1, "followed": 1}}
     later = Frontier.load(store, tmp_path / "check")
     assert later._known("https://list.test/notice/1") and later.crawl_delay == {"list.test": 2.5}
+
+
+def test_pdf_bodies_defaults_to_text_only_and_a_wrong_value_stops_the_run(monkeypatch) -> None:
+    monkeypatch.delenv("CRAWLER_PDF_BODIES", raising=False)
+    assert cli.pdf_bodies() == "text_only"
+    monkeypatch.setenv("CRAWLER_PDF_BODIES", "keep")
+    assert cli.pdf_bodies() == "keep"
+    monkeypatch.setenv("CRAWLER_PDF_BODIES", "all")
+    with pytest.raises(SystemExit):
+        cli.pdf_bodies()

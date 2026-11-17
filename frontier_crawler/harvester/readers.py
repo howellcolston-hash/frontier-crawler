@@ -321,8 +321,14 @@ def newest_first(entries: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return sorted(entries, key=key)
 
 
+SCANNED_PAGE_CHARS = 20    # PROVISIONAL: a page with fewer characters of text counts as having none
+SCANNED_PAGE_SHARE = 0.2   # PROVISIONAL: above this share of such pages, the file is noted as partly a scan
+
+
 def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str], Optional[str]]:
-    """(text of every page, a note when `seconds` ran out first, the title in its metadata). Scanned pages have no text."""
+    """(text of every page, a note, the title in its metadata). Scanned pages have no text. The note says when `seconds`
+    ran out first, or when more than SCANNED_PAGE_SHARE of the pages gave no text: such a file is partly a scan, its
+    text is incomplete, and the pipeline keeps its bytes."""
     import pypdfium2
 
     pdf = pypdfium2.PdfDocument(body)
@@ -338,7 +344,9 @@ def pdf_text(body: bytes, seconds: float) -> Tuple[str, Optional[str], Optional[
             parts.append(textpage.get_text_bounded())
             textpage.close()
             page.close()
-        return "\n".join(parts), None, title
+        empty = sum(1 for part in parts if len(part.strip()) < SCANNED_PAGE_CHARS)
+        note = f"no text on {empty} of {len(parts)} pages" if empty > SCANNED_PAGE_SHARE * len(parts) else None
+        return "\n".join(parts), note, title
     finally:
         pdf.close()
 

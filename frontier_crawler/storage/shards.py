@@ -3,7 +3,8 @@
 Six tables, each partitioned by the UTC day on which the fetching run started:
     fetches/           one row per fetch attempt, with where it came from, the content hash, the text, the title and join keys
                        (no title column before engine 0.4.0, no join_keys before 0.5.0: read columns by name)
-    bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of)
+    bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of); from engine
+                       0.7.0 a PDF whose text was read in full has no body by default (pipeline.PDF_BODIES)
     links/             one row per distinct link on a stored HTML page, in page order
     ocr_text/          one row per scanned PDF read with Tesseract
     judgement_calls/   one row per Jev call about a fetched document
@@ -26,7 +27,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.6.0"  # 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.7.0"  # 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -47,8 +48,11 @@ FETCH_SCHEMA = pa.schema(
         ("http_status", pa.int32()),
         ("tier_used", pa.string()),
         ("content_type", pa.string()),
-        # stored: new bytes kept. unchanged: same bytes as the last fetch of this URL.
-        # duplicate: same bytes as another URL in this run. error_page: a non-200 response with
+        # The response's ETag and Last-Modified headers, as served by a plain tier. Absent from shards before engine 0.7.0.
+        ("etag", pa.string()),
+        ("last_modified", pa.string()),
+        # stored: new content kept, its bytes in bodies (except a PDF kept as text only: pipeline.PDF_BODIES).
+        # unchanged: same bytes as the last fetch of this URL. duplicate: same bytes as another URL in this run. error_page: a non-200 response with
         # little text, bytes not kept. too_large: over the size cap, not downloaded (size_bytes
         # is the size the server declared, or how far the download got). error: nothing was served.
         ("outcome", pa.string()),

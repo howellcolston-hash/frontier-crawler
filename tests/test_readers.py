@@ -255,3 +255,27 @@ def test_a_sitemap_lists_its_pages_in_other_languages_and_a_robots_bom_hides_not
               b"<xhtml:link rel='alternate' hreflang='fr' href='https://a.test/fr/'/><xhtml:link rel='alternate' hreflang='en' href='https://a.test/en/'/></url></urlset>")
     assert read_sitemap(urlset) == ("urlset", [("https://a.test/en/", ""), ("https://a.test/fr/", "")])
     assert robots_sitemaps("﻿Sitemap: https://a.test/s.xml\n".encode()) == ["https://a.test/s.xml"]
+
+
+def test_pdf_with_many_textless_pages_is_noted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typed cover sheet on a scan passes the word count; the note is what keeps such a file's bytes."""
+    import sys, types
+    from frontier_crawler.harvester import readers
+
+    class Page:
+        def __init__(self, text): self.text = text
+        def get_textpage(self): return self
+        def get_text_bounded(self): return self.text
+        def close(self): pass
+
+    class Doc:
+        def __init__(self, body): self.pages = [Page(t) for t in body.decode().split("|")]
+        def get_metadata_dict(self): return {}
+        def __len__(self): return len(self.pages)
+        def __getitem__(self, i): return self.pages[i]
+        def close(self): pass
+
+    monkeypatch.setitem(sys.modules, "pypdfium2", types.SimpleNamespace(PdfDocument=Doc))
+    cover = "Ministry of Mines register of licences granted in the year"
+    assert readers.pdf_text(f"{cover}||||".encode(), 60)[1] == "no text on 4 of 5 pages"
+    assert readers.pdf_text("|".join([cover] * 9 + [""]).encode(), 60)[1] is None   # one blank page in ten is not a scan

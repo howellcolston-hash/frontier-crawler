@@ -12,6 +12,7 @@ Environment:
                                  Without both, the folder CRAWLER_DATA_DIR (default ./data) is used instead.
     JEV_API_KEY                  Jev key. Without it documents are stored and left pending.
     CRAWLER_JEV_MONTHLY_USD      safety ceiling on Jev spend per month in USD (default 10).
+    CRAWLER_PDF_BODIES           text_only (default): a PDF whose text was read in full is stored without its bytes; keep: with them.
     CRAWLER_VERBOSE              set to log fetch failures and other detail. Off by default: see below.
 
 Configuration is read from the store: config/seeds.jsonl, config/questions.json (optional),
@@ -45,7 +46,7 @@ from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _gu
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
-from frontier_crawler.pipeline import Engine
+from frontier_crawler.pipeline import PDF_BODIES, Engine
 from frontier_crawler.storage.shards import bodies_of
 from frontier_crawler.storage.store import HubStore, LocalStore, Store
 
@@ -59,6 +60,13 @@ def open_store() -> Store:
         return HubStore(repo, token)
     print("notice: HF_TOKEN or CRAWLER_HF_REPO is not set; using the local data folder", file=sys.stderr)
     return LocalStore(Path(os.environ.get("CRAWLER_DATA_DIR", "data")))
+
+
+def pdf_bodies() -> str:
+    value = os.environ.get("CRAWLER_PDF_BODIES", "") or "text_only"
+    if value not in PDF_BODIES:
+        raise SystemExit(f"CRAWLER_PDF_BODIES must be one of {PDF_BODIES}")
+    return value
 
 
 def open_jev(http: httpx.AsyncClient) -> Optional[JevClient]:
@@ -170,7 +178,8 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         ranking, scope, ranking_ignored = _ranking(store, Path(workdir))
         throttle = HostThrottle(args.min_interval)
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=throttle) as cascade:
-            engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency)
+            engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency,
+                            pdf_bodies=pdf_bodies())
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
                                 sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle,
                                 scope=scope, run_share=SEED_RUN_SHARE)
@@ -243,7 +252,7 @@ async def _derived(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             # The crawl's Crawl-delays apply here too; the queue is loaded only for a client that follows links.
             fetcher = derived_module.DerivedFetcher(http, HostThrottle(args.min_interval, intervals=crawl_delays(store, Path(workdir))))
             frontier = Frontier.load(store, Path(workdir)) if any(spec.follow for spec in specs) else None
-            engine = Engine(store, fetcher, workdir=Path(workdir), concurrency=1)
+            engine = Engine(store, fetcher, workdir=Path(workdir), concurrency=1, pdf_bodies=pdf_bodies())
             await engine.start()
             try:
                 results = await derived_module.run_derived(engine, specs, fetcher, frontier)
@@ -263,8 +272,8 @@ def _body(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="crawler-body-") as workdir:
         ((_, body),) = bodies_of(open_store(), Path(workdir), [{"sha256": sha256}])
     if body is None:
-        # Bodies stored before the bodies table are inline in their fetch rows.
-        raise SystemExit("no stored body has that hash in the bodies table")
+        # Bodies stored before the bodies table are inline in their fetch rows; a PDF kept as text only has none.
+        raise SystemExit("no stored body has that hash in the bodies table (from engine 0.7.0 a PDF whose text was read is kept as text only)")
     if args.out:
         Path(args.out).write_bytes(body)
     else:
