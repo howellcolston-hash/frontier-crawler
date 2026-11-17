@@ -24,6 +24,7 @@ from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 from frontier_crawler.harvester.cascade import ScrapeResult
 import pyarrow.parquet as pq
+import pytest
 
 NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
 TEXT = "The port authority published the berth schedule and the tariff for bulk cargo. " * 12
@@ -1303,3 +1304,138 @@ def test_a_host_that_serves_nothing_three_times_in_a_row_is_left_alone_for_the_r
     assert frontier.select(5, seeds, NOW.date()) == []
     queued, top = frontier.by_seed(seeds, NOW.date())
     assert queued == {"s": 2} and top == {}                           # a.test entries queued, none takeable now
+
+
+# ------------------------------------------------------------ per-seed bounds: scope fence, patterns, allowance, run share
+
+FENCED = '<a href="/x">x</a> <a href="https://docs.example.com/d">d</a> <a href="https://www.example.org/y">y</a> <a href="https://example.net/z">z</a>'
+
+
+def _fenced_page(scope: Optional[str], **kwargs: Any) -> tuple:
+    """A seed on example.com with example.org among its sites, whose first page links to both, and to example.net."""
+    frontier = Frontier()
+    seeds = [_seed("s", "https://www.example.com/", sites=("www.example.org",), **kwargs)]
+    if scope is not None:
+        frontier.bound(seeds, scope)
+    frontier.add_seeds(seeds, NOW)
+    root = frontier.take(seeds, NOW.date())
+    row = _page_row(root["url"], FENCED)
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    return frontier, seeds
+
+
+def _queued(frontier: Frontier) -> Dict[str, tuple]:
+    return {e["url"]: (e["line_id"], e["hops"], e["crossing"], e["base"]) for e in frontier._entries.values() if e["status"] == "queued"}
+
+
+def test_scope_source_queues_only_a_seeds_own_sites_and_open_queues_as_before() -> None:
+    today, _ = _fenced_page(None)
+    opened, _ = _fenced_page("open")
+    assert _queued(opened) == _queued(today) and opened.links_out_of_scope == 0   # open: today's queueing, entry for entry
+    assert "https://example.net/z" in _queued(today)
+    fenced, seeds = _fenced_page("source")
+    assert set(_queued(fenced)) == {"https://www.example.com/x", "https://docs.example.com/d", "https://www.example.org/y"}
+    assert fenced.links_out_of_scope == 1 and not fenced._known("https://example.net/z")   # not queued, not even seen
+    assert fenced.entry("https://www.example.org/y")["crossing"]   # a site among its own still becomes a line when it pays
+    # Entries queued before the fence (an open run) stay queued and are not taken; open takes them again.
+    opened.bound(seeds, "source")
+    taken = [entry["url"] for entry in iter(lambda: opened.take(seeds, NOW.date()), None)]
+    assert "https://example.net/z" not in taken and opened.entry("https://example.net/z")["status"] == "queued"
+    opened.bound(seeds, "open")
+    assert opened.take(seeds, NOW.date())["url"] == "https://example.net/z"
+
+
+def test_the_fence_holds_sitemaps_too() -> None:
+    frontier, seeds = _fenced_page("open")
+    net = frontier.take(seeds, NOW.date())
+    while net["url"] != "https://example.net/z":
+        frontier.mark(net, _content(), None, NOW)
+        net = frontier.take(seeds, NOW.date())
+    frontier.mark(net, _content(), None, NOW)   # example.net becomes a line of seed s
+    frontier.steer({"example.net": 2.0})
+    assert "example.net" in frontier.sitemap_sites(seeds, NOW.date(), NOW)
+    frontier.bound(seeds, "source")
+    assert "example.net" not in frontier.sitemap_sites(seeds, NOW.date(), NOW)
+    assert frontier.add_sitemap("example.net", [("https://example.net/m", "")], NOW) == 0 and frontier.links_out_of_scope == 1
+    assert frontier.add_sitemap("www.example.com", [("https://www.example.com/m", "")], NOW) == 1
+
+
+def test_seed_patterns_admit_what_matches_an_allow_and_no_deny_and_bad_ones_are_counted(tmp_path: Path) -> None:
+    path = tmp_path / "seeds.jsonl"
+    path.write_text(json.dumps({"id": "s", "entity": "s", "urls": ["https://www.example.com/"], "allow": ["/(x|d)$", "("],
+                                "deny": ["docs\\.", 7], "sites": ["example.org"], "allowance": 10}) + "\n")
+    (seed,) = load_seeds(path)
+    assert seed.patterns_ignored == 2 and seed.allowance == 10 and seed.domains() == {"example.com", "example.org"}
+    frontier = Frontier()
+    frontier.bound([seed], "open")
+    frontier.add_seeds([seed], NOW)   # its own starting URL matches no allow pattern and is queued all the same
+    root = frontier.take([seed], NOW.date())
+    assert root["url"] == "https://www.example.com/"
+    row = _page_row(root["url"], FENCED)
+    frontier.mark(root, row, None, NOW)
+    frontier.add_links(root, row, None, NOW)
+    assert set(_queued(frontier)) == {"https://www.example.com/x"} and frontier.links_off_pattern == 3
+    for bad in ({"allowance": -1}, {"allowance": "ten"}, {"allowance": True}, {"sites": "example.org"}):
+        path.write_text(json.dumps({"id": "s", "entity": "s", "urls": ["https://www.example.com/"], **bad}) + "\n")
+        with pytest.raises(ValueError):
+            load_seeds(path)
+
+
+def test_a_seed_at_its_allowance_is_held_counting_pages_in_flight_and_the_count_survives_between_runs() -> None:
+    lines = [{"line_id": "s", "seed_id": "s", "parent_line": None, "root_url": "https://www.example.com/", "created_at": NOW,
+              "fetches": 2, "content": 1, "yield": 1.0, "relevance": 1.0, "inbound": 0, "generation": 0},
+             {"line_id": "s:example.org", "seed_id": "s", "parent_line": "s", "root_url": "https://example.org/", "created_at": NOW,
+              "fetches": 1, "content": 1, "yield": 1.0, "relevance": 1.0, "inbound": 0, "generation": 1}]
+    seeds = [_seed("s", "https://www.example.com/", allowance=4), _seed("t", "https://www.example.net/")]
+    frontier = Frontier(lines=lines)
+    frontier.bound(seeds)
+    frontier.add_seeds(seeds, NOW)
+    for i in range(5):
+        frontier._add(f"https://www.example.com/{i}", "s", "s", 1, 1.0, NOW)
+    assert frontier.stored("s") == 2   # both its lines
+    out = list(iter(lambda: frontier.take(seeds, NOW.date()), None))
+    assert Counter(e["seed_id"] for e in out) == {"s": 2, "t": 1}   # 2 stored + 2 out: held
+    a, b = (e for e in out if e["seed_id"] == "s")
+    frontier.mark(next(e for e in out if e["seed_id"] == "t"), _content(), None, NOW)
+    frontier.mark(a, DEAD, None, NOW)   # stored nothing: room again
+    c = frontier.take(seeds, NOW.date())
+    assert c["seed_id"] == "s"
+    frontier.mark(b, _content(), None, NOW)
+    frontier.mark(c, _content(), None, NOW)
+    assert frontier.stored("s") == 4 and frontier.take(seeds, NOW.date()) is None and frontier.count("queued") == 3
+    later = Frontier(lines=[frontier.line("s"), frontier.line("s:example.org")])   # the lines table is what a run saves
+    later.bound(seeds)
+    assert later.stored("s") == 4 and "s" in later._held
+
+
+@pytest.mark.parametrize("mode", ["fixed", "bandit", "shadow"])
+def test_no_seed_takes_more_than_its_share_of_a_run(mode: str) -> None:
+    frontier = Frontier()
+    seeds = [_seed("big", "https://www.example.com/", weight=5.0), _seed("small", "https://www.example.org/")]
+    frontier.rank(mode)
+    frontier.bound(seeds, "source", max_fetches=20, run_share=frontier_module.SEED_RUN_SHARE)   # floor(20 x 0.15) = 3
+    frontier.add_seeds(seeds, NOW)
+    for i in range(10):
+        frontier._add(f"https://www.example.com/{i}", "big", "big", 1, 1.0, NOW)
+        frontier._add(f"https://www.example.org/{i}", "small", "small", 1, 1.0, NOW)
+    taken = []
+    while (entry := frontier.take(seeds, NOW.date())) is not None:
+        taken.append(entry["seed_id"])
+        frontier.mark(entry, _content(), None, NOW)
+    assert Counter(taken) == {"big": 3, "small": 3} and frontier.count("queued") == 16   # the rest stay queued
+
+
+def test_a_crawl_reports_the_bounds_and_fences_watched_page_links(tmp_path: Path) -> None:
+    site = FakeSite({"https://www.example.com/": '<a href="https://example.net/a">a</a> <a href="/p">p</a>',
+                     "https://www.example.com/notices": '<a href="https://example.net/b">b</a>', "https://www.example.com/p": "",
+                     "https://example.net/a": "", "https://example.net/b": ""})
+    store = LocalStore(tmp_path / "store")
+    seeds = [_seed("s", "https://www.example.com/", allowance=2)]
+    watch = [{"id": "notices", "url": "https://www.example.com/notices", "every_hours": 1.0}]
+    engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
+    stats = asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / "r1", max_fetches=10, now=lambda: NOW, watch=watch, scope="source"))
+    assert not any("example.net" in url for url in site.fetched) and stats["links_out_of_scope"] == 2 and stats["scope"] == "source"
+    links = {row["url"] for path in (tmp_path / "store" / "links").rglob("*.parquet") for row in pq.read_table(path).to_pylist()}
+    assert {"https://example.net/a", "https://example.net/b"} <= links   # still in the links table
+    assert stats["seeds_at_allowance"] == ["s"] and stats["links_off_pattern"] == 0 and stats["seed_patterns_ignored"] == 0
