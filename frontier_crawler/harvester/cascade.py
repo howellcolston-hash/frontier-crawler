@@ -18,7 +18,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 import certifi
@@ -101,6 +101,8 @@ class ScrapeResult:
     cool_host: bool = False  # the server asked for a pause too long to wait out (courtesy.sit_out): leave its host for the run
     api_responses: int = 0  # browser tier: JSON replies to the page's own background requests (a backend a derived client could call)
     shadow: bool = False  # browser tier: raw_payload includes the page's open shadow roots, which inner_text misses
+    etag: Optional[str] = None  # the response's ETag and Last-Modified headers, as served (plain tiers only)
+    last_modified: Optional[str] = None
 
 
 @contextlib.contextmanager
@@ -363,12 +365,11 @@ class HarvesterCascade:
             async with self._http_client().stream("GET", url, timeout=timeout) as response:
                 answered = time.monotonic() - started
                 status = response.status_code
-                content_type = response.headers.get("content-type", "")
                 final_url = str(response.url)
                 body, size = await read_capped(response)
         if self._throttle is not None:
             self._throttle.record(url, answered, status)
-        return await self._read(url, status, content_type, final_url, body, size, response.headers.get("retry-after"), "DOM_TRAFILATURA")
+        return await self._read(url, status, final_url, body, size, response.headers, "DOM_TRAFILATURA")
 
     async def _impersonated(self, url: str, limits: Tuple[float, float], waited: Dict[str, float]) -> Optional[Tuple[ScrapeResult, bool]]:
         """The GET again, through the throttle, with a browser's TLS and HTTP/2 fingerprint (curl_cffi) and our own headers;
@@ -391,7 +392,7 @@ class HarvesterCascade:
         if self._throttle is not None:
             self._throttle.record(url, answered, status)
         self.counts["impersonate_served"] += status not in _BROWSER_RETRY_STATUS
-        return await self._read(url, status, headers.get("content-type", ""), final_url, body, len(body), headers.get("retry-after"), "HTTP_IMPERSONATE")
+        return await self._read(url, status, final_url, body, len(body), headers, "HTTP_IMPERSONATE")
 
     async def _curl_get(self, url: str, limits: Tuple[float, float]) -> Tuple[int, Dict[str, str], str, bytes]:
         """(status, headers with lower-case names, final URL, body). Tests replace this."""
@@ -406,10 +407,11 @@ class HarvesterCascade:
         reply = await self._curl.get(url, timeout=(limits[1], limits[0]))
         return reply.status_code, {k.lower(): v for k, v in reply.headers.items()}, str(reply.url), reply.content
 
-    async def _read(self, url: str, status: int, content_type: str, final_url: str, body: Optional[bytes], size: int,
-                    retry_after_header: Optional[str], html_tier: str) -> Tuple[ScrapeResult, bool]:
-        """Read what a plain tier was served. Returns (the result, whether the browser tier should try)."""
-        pause = sit_out(self._throttle, url, status, retry_after_header)
+    async def _read(self, url: str, status: int, final_url: str, body: Optional[bytes], size: int,
+                    headers: Mapping[str, str], html_tier: str) -> Tuple[ScrapeResult, bool]:
+        """Read what a plain tier was served (headers: httpx's, or a dict with lower-case names). Returns (the result, whether the browser tier should try)."""
+        content_type = headers.get("content-type", "")
+        pause = sit_out(self._throttle, url, status, headers.get("retry-after"))
         if body is None or size > MAX_BYTES:
             # Not cut short and kept: half a PDF or archive is unreadable.
             result = _failed(final_url, html_tier, "too large", status)
@@ -419,7 +421,7 @@ class HarvesterCascade:
 
         def served(text: Optional[str], tier: str, note: Optional[str] = None, links: Optional[Links] = None, title: Optional[str] = None) -> ScrapeResult:
             return ScrapeResult(final_url, status, body, text or None, word_count(text or ""), tier, note, content_type, links=links, title=title,
-                                cool_host=bool(pause))
+                                cool_host=bool(pause), etag=headers.get("etag"), last_modified=headers.get("last-modified"))
 
         def undecoded(encoding: Optional[str]) -> Optional[str]:
             """Count a page read in a legacy encoding; the note when no encoding fit."""

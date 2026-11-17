@@ -662,6 +662,39 @@ def test_scanned_pdfs_are_read_once_and_then_judged(tmp_path: Path, monkeypatch:
     assert later("j2", "judge_days")["judged"] == 0
 
 
+def test_a_pdf_with_text_is_kept_as_text_only_and_a_scan_or_a_cut_short_pdf_keeps_its_bytes(tmp_path: Path) -> None:
+    pdf = lambda url, raw, text, note=None: ScrapeResult(url, 200, raw, text, len((text or "").split()), "PDF", note,  # noqa: E731
+                                                         "application/pdf", etag='"v1"', last_modified="Mon, 09 Nov 2026 10:00:00 GMT")
+    pages = {"https://a.test/text.pdf": pdf("https://a.test/text.pdf", b"%PDF text", DOC),
+             "https://a.test/scan.pdf": pdf("https://a.test/scan.pdf", b"%PDF scan", None),
+             "https://a.test/cut.pdf": pdf("https://a.test/cut.pdf", b"%PDF cut", DOC, "text read for the first 3 of 90 pages"),
+             "https://a.test/x": _page("https://a.test/x")}
+    stats = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r1").run([_job(url) for url in pages]))
+    rows = {row["url_final"]: row for row in _rows(tmp_path / "store", "fetches")}
+    bodies = {row["sha256"] for row in _rows(tmp_path / "store", "bodies")}
+    text = rows["https://a.test/text.pdf"]
+    assert text["outcome"] == "stored" and text["text"] == DOC and text["size_bytes"] == 9 and text["join_keys"]
+    assert (text["etag"], text["last_modified"]) == ('"v1"', "Mon, 09 Nov 2026 10:00:00 GMT")
+    assert text["sha256"] not in bodies
+    assert {rows[url]["sha256"] for url in ("https://a.test/scan.pdf", "https://a.test/cut.pdf", "https://a.test/x")} == bodies
+    assert (stats["pdf_bodies"], stats["pdf_text_only"], stats["pdf_text_only_bytes"], stats["bodies_written"]) == ("text_only", 1, 9, 3)
+    assert stats["stored"] == 4 and stats["stored_bytes"] == stats["bodies_written_bytes"] + 9
+    # Fetched again, the URL is unchanged by its hash in url_hashes, with no body behind it.
+    again = asyncio.run(_engine(tmp_path, FakeCascade(pages), "r2").run([_job("https://a.test/text.pdf")]))
+    assert again["unchanged"] == 1 and again["pdf_text_only"] == 0
+
+
+def test_pdf_bodies_keep_restores_the_bytes_and_a_body_stored_before_counts_as_stored(tmp_path: Path) -> None:
+    texty = ScrapeResult("https://a.test/text.pdf", 200, b"%PDF text", DOC, len(DOC.split()), "PDF", None, "application/pdf")
+    stats = asyncio.run(_engine(tmp_path, FakeCascade({texty.url: texty}), "r1", pdf_bodies="keep").run([_job(texty.url)]))
+    assert stats["bodies_written"] == 1 and stats["pdf_text_only"] == 0 and stats["pdf_bodies"] == "keep"
+    moved = dataclasses.replace(texty, url="https://a.test/moved.pdf")
+    stats = asyncio.run(_engine(tmp_path, FakeCascade({moved.url: moved}), "r2").run([_job(moved.url)]))
+    assert stats["bodies_already_stored"] == 1 and stats["pdf_text_only"] == 0
+    with pytest.raises(ValueError):
+        Engine(LocalStore(tmp_path / "store"), workdir=tmp_path / "w", pdf_bodies="none")
+
+
 def test_scans_are_read_from_inline_bodies_and_from_bodies_stored_on_an_earlier_day(tmp_path: Path, monkeypatch: Any) -> None:
     from frontier_crawler import ocr
     from frontier_crawler import pipeline
