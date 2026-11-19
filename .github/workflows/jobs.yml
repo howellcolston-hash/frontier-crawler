@@ -15,7 +15,7 @@ on:
     inputs:
       job:
         type: choice
-        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local]
+        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph]   # graph: by hand only
         default: collection
       command:
         description: "the job's command (empty: its default)"
