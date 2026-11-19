@@ -3,6 +3,7 @@ import datetime as dt
 import ssl
 
 import httpx
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -31,7 +32,7 @@ def test_issuers_are_followed_and_partial_chain_trust_stays_off(monkeypatch) -> 
     leaf = _cert("ports.test", "Mid CA", leaf_key, mid_key, aia="http://ca.example.com/mid.der", ca=False)
     monkeypatch.setattr(cascade.ssl, "get_server_certificate", lambda addr, timeout: leaf.public_bytes(serialization.Encoding.PEM).decode())
     fetched = []
-    monkeypatch.setattr(cascade.httpx, "get", lambda url, **kw: fetched.append(url) or httpx.Response(200, content=mid.public_bytes(serialization.Encoding.DER)))
+    monkeypatch.setattr(cascade, "_issuer_bytes", lambda url: fetched.append(url) or mid.public_bytes(serialization.Encoding.DER))
     context = cascade.context_with_issuers("ports.test")
     assert fetched == ["http://ca.example.com/mid.der"]
     assert not context.verify_flags & getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
@@ -42,9 +43,20 @@ def test_nothing_is_downloaded_past_a_trusted_root(monkeypatch, tmp_path) -> Non
     key = ec.generate_private_key(ec.SECP256R1())
     leaf = _cert("ports.test", "Mid CA", key, key, aia="http://ca.example.com/root.p7c", ca=False)
     monkeypatch.setattr(cascade.ssl, "get_server_certificate", lambda addr, timeout: leaf.public_bytes(serialization.Encoding.PEM).decode())
-    monkeypatch.setattr(cascade.httpx, "get", lambda url, **kw: (_ for _ in ()).throw(AssertionError(url)))
+    monkeypatch.setattr(cascade, "_issuer_bytes", lambda url: (_ for _ in ()).throw(AssertionError(url)))
     monkeypatch.setattr(cascade.certifi, "where", lambda: _bundle_with(leaf.issuer, key, tmp_path))
     assert cascade.context_with_issuers("ports.test") is None
+
+
+def test_an_issuer_link_never_redirects_to_a_private_address_or_reads_a_huge_file() -> None:
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/big":
+            return httpx.Response(200, content=b"x" * (cascade.MAX_ISSUER_BYTES + 1))
+        return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+
+    with pytest.raises(cascade.BlockedAddress):
+        cascade._issuer_bytes("http://ca.example.com/mid.der", httpx.MockTransport(server))
+    assert cascade._issuer_bytes("http://ca.example.com/big", httpx.MockTransport(server)) is None
 
 
 def _bundle_with(name, key, folder):

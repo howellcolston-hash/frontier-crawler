@@ -15,7 +15,7 @@ from frontier_crawler.frontier import ARM_PRIOR, MAX_IN_FLIGHT_PER_HOST, Frontie
 from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage.store import LocalStore
 from test_frontier import (
-    DEAD, NOW, FakeSite, _check_counts, _churn, _content, _random_frontier, _seed, reference_bests, reference_take,
+    DEAD, NOW, FakeSite, _check_counts, _churn, _content, _random_frontier, _seed, reference_bests, reference_take, release,
 )
 from frontier_crawler.frontier import NEW_DOMAIN_SHARE, RETEST_SHARE
 
@@ -230,7 +230,7 @@ def test_a_crawl_reads_the_ranking_mode_and_records_its_figures(tmp_path: Path) 
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW,
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW, scope="open", run_share=None,
                               ranking=("bandit", 0.5)))
     ranking = stats["ranking"]
     assert stats["total"] == 7 and ranking["mode"] == "bandit" and ranking["temperature"] == 0.5
@@ -267,7 +267,7 @@ def test_shadow_takes_what_scoring_every_entry_would_and_bandit_only_what_may_be
             elif out and roll < 0.8:
                 frontier.mark(out.pop(rng.randrange(len(out))), rng.choice([_content(), DEAD, {"outcome": "error"}]), None, NOW)
             elif out and roll < 0.9:
-                frontier.release(out.pop(rng.randrange(len(out))))
+                release(frontier, out.pop(rng.randrange(len(out))))
             else:
                 _churn(frontier, seeds, rng, later if case % 4 > 1 else None)
             assert all(n <= MAX_IN_FLIGHT_PER_HOST for n in frontier._flight_host.values())

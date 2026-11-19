@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 import httpx
 
+from frontier_crawler.harvester import courtesy
 from frontier_crawler.judge.questions import Question
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
@@ -130,12 +131,15 @@ class JevClient:
         if not isinstance(answers, dict):
             raise JevRejected("reply has no answers object")
         parsed: Dict[str, Answer] = {}
-        for question in questions:
-            if question.key not in answers:
-                raise JevRejected(f"reply is missing {question.key}")
-            parsed[question.id] = _parse_answer(question, answers[question.key])
-        usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
-        return JevResult(parsed, str(body.get("model") or ""), int(usage.get("input_tokens") or 0))
+        try:
+            for question in questions:
+                if question.key not in answers:
+                    raise JevRejected(f"reply is missing {question.key}")
+                parsed[question.id] = _parse_answer(question, answers[question.key])
+            usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+            return JevResult(parsed, str(body.get("model") or ""), int(usage.get("input_tokens") or 0))
+        except (TypeError, ValueError, AttributeError) as exc:   # a number that is not one, probabilities that are not an object
+            raise JevRejected(f"malformed reply: {type(exc).__name__}") from exc
 
     async def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         # The key goes in the header only. Error text below never includes the request.
@@ -159,9 +163,9 @@ class JevClient:
                     return body
                 if status == 429 or status >= 500:
                     last = f"HTTP {status}"
-                    retry_after = response.headers.get("retry-after", "")
-                    if retry_after.isdigit():
-                        wait = min(float(retry_after), 60.0)
+                    retry_after = courtesy.retry_after(response.headers.get("retry-after"))
+                    if retry_after is not None:
+                        wait = min(retry_after, 60.0)
                 else:
                     raise JevRejected(f"HTTP {status}", status)
             if attempt < self._retries:

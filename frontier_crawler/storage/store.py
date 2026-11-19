@@ -1,7 +1,7 @@
 """Where engine files live. Two stores with one interface: a local directory, and a Hugging Face dataset repo.
 
 Input contract:
-    store.put_many([(local_path, remote_path), ...], message)   upload or copy, all or nothing per call
+    store.put_many([(local_path, remote_path), ...], message)   upload or copy, all or nothing per call (a Hub commit is tried 3 times)
     store.get(remote_path, local_path) -> bool                  False when the remote file does not exist
     store.list(prefix) -> list of remote paths under that folder
 Remote paths are POSIX, relative, and never start with a slash.
@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Protocol, Sequence, Tuple
 
+COMMIT_TRIES = 3          # PROVISIONAL: tries of one Hugging Face commit
+COMMIT_BACKOFF_S = 5.0    # PROVISIONAL: wait before the second try; doubled before the third
 
 
 def _check(remote: str) -> str:
@@ -29,8 +32,6 @@ class Store(Protocol):
     def get(self, remote: str, local: Path) -> bool: ...
 
     def list(self, prefix: str) -> List[str]: ...
-
-    def describe(self) -> str: ...
 
 
 class LocalStore:
@@ -66,9 +67,6 @@ class LocalStore:
             if path.is_file() and not path.name.startswith(".")
         )
 
-    def describe(self) -> str:
-        return f"local:{self._root}"
-
 
 class HubStore:
     """A Hugging Face dataset repo. The token comes from the caller, never from a file or a URL."""
@@ -91,12 +89,20 @@ class HubStore:
         operations = [
             CommitOperationAdd(path_in_repo=_check(remote), path_or_fileobj=str(local)) for local, remote in files
         ]
-        self._api.create_commit(
-            repo_id=self._repo_id,
-            repo_type="dataset",
-            operations=operations,
-            commit_message=message or "engine: add files",
-        )
+        for attempt in range(COMMIT_TRIES):
+            try:
+                self._api.create_commit(
+                    repo_id=self._repo_id,
+                    repo_type="dataset",
+                    operations=operations,
+                    commit_message=message or "engine: add files",
+                )
+                return
+            except Exception:
+                # The final commit carries the run's state: one transient Hub error must not lose it.
+                if attempt == COMMIT_TRIES - 1:
+                    raise
+                time.sleep(COMMIT_BACKOFF_S * 2 ** attempt)
 
     def get(self, remote: str, local: Path) -> bool:
         from huggingface_hub.errors import EntryNotFoundError
@@ -133,6 +139,3 @@ class HubStore:
             return []
         # Folders have no size attribute. Only files are returned.
         return sorted(entry.path for entry in entries if getattr(entry, "size", None) is not None)
-
-    def describe(self) -> str:
-        return f"huggingface:{self._repo_id}"

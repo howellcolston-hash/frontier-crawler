@@ -42,6 +42,7 @@ jobs:
     if: ${{ inputs.job == 'collect-daily' || github.event.schedule == '17 10 * * *' }}
     strategy:
       fail-fast: false
+      max-parallel: 1   # one collector at a time: each pushes the data branch, and the concurrency group does not serialize jobs within a run
       matrix:
         i: [0, 1, 2, 3, 4, 5]
     runs-on: ubuntu-latest

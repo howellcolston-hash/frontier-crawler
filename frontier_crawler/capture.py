@@ -18,21 +18,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit
 
-from frontier_crawler.harvester.cascade import CREDENTIAL_HEADERS, USER_AGENT, check_public
+from frontier_crawler.harvester.cascade import CREDENTIAL_HEADERS, USER_AGENT, check_public, is_tracker
 
 MAX_ENTRIES = 80
 SAMPLE_CHARS = 3000
-# Requests that report on the visitor, not data for the page.
-_NOISE = (
-    "google-analytics", "googletagmanager", "doubleclick", "segment.", "sentry", "datadog", "intercom", "hotjar",
-    "clarity.ms", "newrelic", "matomo", "piwik", "facebook.com/tr", "/collect", "/beacon", "/telemetry",
-)
+# Requests that report on the visitor, not data for the page: a tracker host (cascade.TRACKER_DOMAINS), or one of these
+# in the URL (self-hosted analytics and reporting paths).
+_NOISE = ("matomo", "piwik", "facebook.com/tr", "/collect", "/beacon", "/telemetry")
 _KEPT_HEADERS = ("accept", "content-type", "origin", "referer")
 
 
 def is_noise(url: str) -> bool:
     lowered = url.lower()
-    return any(marker in lowered for marker in _NOISE)
+    return is_tracker(urlsplit(lowered).hostname or "") or any(marker in lowered for marker in _NOISE)
 
 
 def is_first_party(url: str, page_url: str) -> bool:

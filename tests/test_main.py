@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,21 @@ def test_a_run_prints_counts_only_and_records_the_rest_in_the_store(tmp_path: Pa
     assert json.loads(printed.out) == {"status": "failed", "stopped_by": "max_minutes", "stored": 3}
     (record,) = [json.loads(p.read_text()) for p in (tmp_path / "runs").glob("*-crawl.json")]
     assert record["status"] == "failed" and "secret.test" in record["notes"][0] and record["stats"]["stored"] == 3
+
+
+def test_a_library_warning_naming_a_host_stays_out_of_the_log(tmp_path: Path) -> None:
+    script = f"""
+import warnings
+from frontier_crawler import __main__ as cli
+from frontier_crawler.storage.store import LocalStore
+cli.open_store = lambda: LocalStore({str(tmp_path)!r})
+async def job(args, ctx):
+    warnings.warn("retrying https://secret.test/")
+cli._judge = job
+cli.main(["judge"])
+"""
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=Path(__file__).parent.parent, timeout=60)
+    assert done.returncode == 0 and "secret.test" not in done.stdout + done.stderr
 
 
 def test_a_run_prints_why_judging_stopped_as_numbers(tmp_path: Path, monkeypatch, capsys) -> None:

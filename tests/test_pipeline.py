@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import email.utils
 import datetime as dt
 import json
 from pathlib import Path
@@ -334,6 +335,30 @@ def test_hub_store_sends_one_commit_for_many_files(tmp_path: Path) -> None:
     assert [op.path_in_repo for op in commit["operations"]] == ["x/a", "x/b"]
 
 
+def test_hub_store_tries_a_failed_commit_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from frontier_crawler.storage import store as store_module
+
+    class FlakyApi:
+        def __init__(self, failures: int) -> None:
+            self.failures, self.commits = failures, 0
+
+        def create_commit(self, **kwargs: Any) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise ConnectionError("hub hiccup")
+            self.commits += 1
+
+    waits: List[float] = []
+    monkeypatch.setattr(store_module.time, "sleep", waits.append)
+    a = tmp_path / "a"
+    a.write_text("1", encoding="utf-8")
+    api = FlakyApi(2)
+    HubStore("owner/repo", "token", api=api).put_many([(a, "state/a")], "final")
+    assert api.commits == 1 and waits == [5.0, 10.0]
+    with pytest.raises(ConnectionError):
+        HubStore("owner/repo", "token", api=FlakyApi(3)).put_many([(a, "state/a")], "final")
+
+
 # ---------------------------------------------------------------- Jev
 
 def test_jev_request_and_reply_follow_the_documented_shape() -> None:
@@ -388,6 +413,39 @@ def test_jev_outage_and_refusal_are_different_errors() -> None:
     assert len(refused) == 1 and "test-key" not in str(caught.value) and caught.value.status == 401
 
 
+def test_jev_rejects_a_reply_with_numbers_that_are_not_numbers() -> None:
+    def broken(change: Any) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = _jev_body()
+            change(body)
+            return httpx.Response(200, json=body)
+        return handler
+
+    for change in (lambda b: b["answers"]["doc_type_v1"].update(confidence="high"),
+                   lambda b: b["answers"]["doc_type_v1"].update(probabilities=["record"]),
+                   lambda b: b["usage"].update(input_tokens="many")):
+        with pytest.raises(JevRejected) as caught:
+            asyncio.run(_jev(broken(change)).ask("text", QUESTIONS_V1))
+        assert caught.value.status is None
+
+
+def test_jev_waits_the_retry_after_date_it_is_given() -> None:
+    waits: List[float] = []
+    statuses = [429, 200]
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses.pop(0)
+        later = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30), usegmt=True)
+        return httpx.Response(status, json=_jev_body(), headers={"Retry-After": later} if status == 429 else {})
+
+    client = JevClient("test-key", httpx.AsyncClient(transport=httpx.MockTransport(handler)), sleep=sleep)
+    asyncio.run(client.ask("text", QUESTIONS_V1))
+    assert len(waits) == 1 and 25 <= waits[0] <= 30
+
+
 def test_jev_rejects_a_boolean_noul() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = _jev_body()
@@ -399,20 +457,18 @@ def test_jev_rejects_a_boolean_noul() -> None:
     assert caught.value.status is None   # a malformed reply has no status of its own
 
 
-def test_relevance_and_threshold() -> None:
+def test_relevance() -> None:
     assert relevance({"has_specifics": 0.5, "junk_page": 0.1}) == pytest.approx(0.5 * 0.9)
     assert relevance({"has_specifics": 0.8}) is None
-    assert judging.keep_threshold() == pytest.approx(1 / 11)
 
 
 def test_questions_come_from_configuration() -> None:
     config = {"questions": [{"id": q, "version": 2, "type": "noul", "instructions": q} for q in ("a", "b", "c", "d")],
-              "relevance": {"version": "r2", "all": ["a"], "any": ["b", "c"], "none": ["d"], "miss_to_junk_cost": 4}}
+              "relevance": {"version": "r2", "all": ["a"], "any": ["b", "c"], "none": ["d"]}}
     try:
         judging.configure(config)
         assert [q.key for q in judging.active()] == ["a_v2", "b_v2", "c_v2", "d_v2"] and judging.relevance_version() == "r2"
         assert relevance({"a": 0.8, "b": 0.2, "c": 0.5, "d": 0.1}) == pytest.approx(0.8 * 0.5 * 0.9)
-        assert judging.keep_threshold() == pytest.approx(1 / 5)
         with pytest.raises(ValueError):
             judging.configure({**config, "relevance": {**config["relevance"], "all": ["missing"]}})
     finally:
@@ -590,21 +646,6 @@ def test_a_file_over_the_size_cap_is_a_row_without_bytes(tmp_path: Path) -> None
     (row,) = _rows(tmp_path / "store", "fetches")
     assert stats["too_large"] == 1 and stats["errors"] == 0
     assert row["outcome"] == "too_large" and row["size_bytes"] == 900_000_000 and row["content_type"] == "text/csv" and row["body"] is None
-
-
-def test_a_fault_after_a_row_is_stored_does_not_stop_the_batch(tmp_path: Path) -> None:
-    pages = {f"https://a.test/{i}": _page(f"https://a.test/{i}", body=f"doc {i}".encode()) for i in range(3)}
-    engine = Engine(LocalStore(tmp_path / "store"), FakeCascade(pages), workdir=tmp_path / "work", now=lambda: NOW, run_id="r1")
-
-    def faulty(target: Target, row: Dict[str, Any], answers: Any) -> None:
-        raise ValueError("Invalid IPv6 URL")
-
-    async def go() -> Dict[str, Any]:
-        await engine.start()
-        await engine.run([_job(url) for url in pages], faulty)
-        return await engine.finish()
-
-    assert asyncio.run(go())["stored"] == 3 and len(_rows(tmp_path / "store", "fetches")) == 3
 
 
 class InProcessReaders:

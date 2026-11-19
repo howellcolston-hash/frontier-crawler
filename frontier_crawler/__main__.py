@@ -40,13 +40,13 @@ import httpx
 
 from frontier_crawler import capture as capture_module
 from frontier_crawler import derived as derived_module
-from frontier_crawler.frontier import RANKING_MODES, SCOPES, SEED_RUN_SHARE, Frontier, crawl, crawl_delays, load_seeds
+from frontier_crawler.frontier import RANKING_MODES, SCOPES, Frontier, crawl, crawl_delays, load_seeds
 from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _guard_request
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
-from frontier_crawler.pipeline import PDF_BODIES, Engine
+from frontier_crawler.pipeline import PDF_BODIES, Engine, utc_now
 from frontier_crawler.storage.shards import bodies_of
 from frontier_crawler.storage.store import HubStore, LocalStore, Store
 
@@ -160,10 +160,6 @@ def _specs(store: Store, workdir: Path) -> List[derived_module.Spec]:
     return derived_module.load_specs(workdir / "config" / "clients")
 
 
-def _report(ctx: Dict[str, Any], stats: Dict[str, Any]) -> None:
-    ctx["stats"] = {k: v for k, v in stats.items() if k != "shards"}
-
-
 async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
     store = ctx["store"]
     monthly = float(os.environ.get("CRAWLER_JEV_MONTHLY_USD", DEFAULT_MONTHLY_USD))
@@ -182,10 +178,10 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
                             pdf_bodies=pdf_bodies())
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
                                 sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle,
-                                scope=scope, run_share=SEED_RUN_SHARE)
+                                scope=scope)
     stats["steer_file_ignored"], stats["ranking_file_ignored"] = steer_ignored, ranking_ignored
     stats["watch_file_ignored"], stats["watch_entries_ignored"] = watch_file_ignored, watch_entries_ignored
-    _report(ctx, stats)
+    ctx["stats"] = {k: v for k, v in stats.items() if k != "shards"}
     if stats["errors"] or stats["seeds_with_nothing"]:
         ctx["status"] = "partial"
     if stats["total"] and stats["errors"] == stats["total"]:
@@ -193,7 +189,7 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
 
 
 async def _judge(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
-    end = dt.date.fromisoformat(args.end) if args.end else dt.datetime.now(dt.timezone.utc).date()
+    end = dt.date.fromisoformat(args.end) if args.end else utc_now().date()
     start = dt.date.fromisoformat(args.start) if args.start else end - dt.timedelta(days=6)
     store = ctx["store"]
     monthly = float(os.environ.get("CRAWLER_JEV_MONTHLY_USD", DEFAULT_MONTHLY_USD))
@@ -212,7 +208,7 @@ async def _judge(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
                 await (engine.ocr_days(days, args.max_minutes) if args.command == "ocr" else engine.judge_days(days))
             finally:
                 stats = await engine.finish()
-    _report(ctx, stats)
+    ctx["stats"] = {k: v for k, v in stats.items() if k != "shards"}
     ctx["notes"].append(f"covered fetch days {start} to {end}; earlier days need --start")
     if stats["jev_stopped"]:
         ctx["status"] = "partial"
@@ -226,7 +222,7 @@ async def _capture(args: argparse.Namespace) -> None:
     """A local tool: writes the capture under --out and prints the requests it saw. Not for a public log."""
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    path = out / f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}.json"
     result = await capture_module.capture(args.url, clicks=args.click or [], screenshot=path.with_suffix(".png"))
     path.write_text(json.dumps(result, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     data = [e for e in result["entries"] if e["first_party"] and not e["noise"] and e["json_shape"] is not None]
@@ -257,9 +253,10 @@ async def _derived(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             try:
                 results = await derived_module.run_derived(engine, specs, fetcher, frontier)
             finally:
+                fetcher.close()
                 stats = await engine.finish(frontier.save(Path(workdir)) if frontier is not None else ())
     broken = {name: result["status"] for name, result in results.items() if result["status"] != "ok"}
-    _report(ctx, {**stats, "clients": results, "broken_clients": broken})
+    ctx["stats"] = {**{k: v for k, v in stats.items() if k != "shards"}, "clients": results, "broken_clients": broken}
     if broken:
         ctx["status"] = "partial"  # each one needs deriving again
 
@@ -282,7 +279,7 @@ def _body(args: argparse.Namespace) -> None:
 
 def _run(args: argparse.Namespace, params: Dict[str, Any], job: Any) -> None:
     """Run one command, then write what happened to the store as runs/<run id>.json and print counts only."""
-    started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    started = utc_now().replace(microsecond=0)
     ctx: Dict[str, Any] = {"store": open_store(), "status": "ok", "notes": [], "stats": {}}
     error: Optional[BaseException] = None
     try:
@@ -293,7 +290,7 @@ def _run(args: argparse.Namespace, params: Dict[str, Any], job: Any) -> None:
     stats = ctx["stats"]
     record = {
         "command": args.command, "status": ctx["status"], "started": started.isoformat(),
-        "finished": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+        "finished": utc_now().replace(microsecond=0).isoformat(),
         "params": params, "notes": ctx["notes"], "stats": stats,
         "runner": f"github:{os.environ['GITHUB_RUN_ID']}" if os.environ.get("GITHUB_RUN_ID") else "local",
     }
@@ -345,6 +342,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Log lines name the pages they are about, so they are off unless asked for.
     logging.basicConfig(level=logging.INFO if os.environ.get("CRAWLER_VERBOSE") else logging.CRITICAL, format="%(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.captureWarnings(True)   # a library warning can name a host; through logging it is off like the rest
     if args.command == "capture":
         asyncio.run(_capture(args))
     elif args.command == "body":
