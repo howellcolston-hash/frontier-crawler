@@ -1,0 +1,73 @@
+# Runs jobs from a private repository on this repository's runners, by schedule or by hand. Each run checks the
+# private repository out and runs one of its own scripts there. The log shows step results only: every command's
+# output goes to a file on the runner that is neither printed nor uploaded. Nothing here runs for pull requests.
+name: jobs
+run-name: "jobs ${{ inputs.job || 'scheduled' }}"
+on:
+  schedule:
+    - cron: "23 4 * * *"    # engine-sync
+    - cron: "51 4 * * *"    # collection
+    - cron: "17 10 * * *"   # collect-daily, then demand
+    - cron: "47 11 * * *"   # scout
+    - cron: "41 13 * * *"   # raw-checks
+    - cron: "23 16 * * *"   # engine-sync
+  workflow_dispatch:
+    inputs:
+      job:
+        type: choice
+        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local]
+        default: collection
+      command:
+        description: "the job's command (empty: its default)"
+        default: ""
+      dry_run:
+        type: boolean
+        default: true
+      source:
+        default: ""
+      maps:
+        default: ""
+      max:
+        default: "10"
+permissions:
+  contents: read
+concurrency:
+  group: jobs   # one run at a time: runs write the same private branch
+  cancel-in-progress: false
+  queue: max
+env:
+  JOB: ${{ inputs.job || (github.event.schedule == '51 4 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || 'engine-sync' }}
+jobs:
+  collect:
+    if: ${{ inputs.job == 'collect-daily' || github.event.schedule == '17 10 * * *' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        i: [0, 1, 2, 3, 4, 5]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps: &steps
+      - name: Check out
+        env:
+          TOKEN: ${{ secrets.HORIZON_DATA_TOKEN }}
+        run: |
+          url="https://x-access-token:${TOKEN}@github.com/howellcolston-hash/horizon-data.git"
+          git clone -q --depth 1 "$url" hd >/dev/null 2>&1
+          git clone -q --depth 1 --branch data "$url" hd/data >/dev/null 2>&1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          INDEX: ${{ matrix.i }}
+        working-directory: hd
+        run: bash scripts/bridge.sh "$JOB" $INDEX >"$RUNNER_TEMP/out.log" 2>&1
+
+  run:
+    needs: collect
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps: *steps
