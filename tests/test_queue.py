@@ -21,7 +21,7 @@ from frontier_crawler.pipeline import Engine
 from frontier_crawler.storage import queue as queue_module
 from frontier_crawler.storage.state import UrlState
 from frontier_crawler.storage.store import LocalStore
-from test_frontier import DEAD, NOW, FakeSite, _churn, _content, _page_row, _random_frontier, _seed, reference_bests, reference_take
+from test_frontier import DEAD, NOW, FakeSite, _churn, _content, _page_row, _random_frontier, _seed, reference_bests, reference_take, release
 
 
 def _reload(frontier: Frontier, tmp_path: Path, name: str) -> Frontier:
@@ -239,7 +239,7 @@ def test_a_run_that_dies_before_its_final_commit_leaves_the_state_before_it(tmp_
 
     def go(run: str, fetches: int) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=fetches, now=lambda: NOW))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=fetches, now=lambda: NOW, scope="open", run_share=None))
 
     go("r1", 5)
     before = Frontier.load(store, tmp_path / "check1")
@@ -312,7 +312,7 @@ def test_within_the_hot_set_take_hands_out_what_scoring_every_entry_in_memory_wo
             elif out and roll < 0.8:
                 frontier.mark(out.pop(rng.randrange(len(out))), rng.choice([_content(), DEAD, {"outcome": "error"}]), None, NOW)
             elif out and roll < 0.9:
-                frontier.release(out.pop(rng.randrange(len(out))))
+                release(frontier, out.pop(rng.randrange(len(out))))
             else:
                 _churn(frontier, seeds, rng)
             assert all(n <= MAX_IN_FLIGHT_PER_HOST for n in frontier._flight_host.values())

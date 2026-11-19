@@ -10,7 +10,7 @@ from typing import Any, List, Optional
 import httpx
 import pyarrow.parquet as pq
 
-from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, ScrapeResult
+from frontier_crawler.harvester.cascade import ROBOTS_NAME, HarvesterCascade, ScrapeResult
 from frontier_crawler.harvester.courtesy import MAX_CRAWL_DELAY_S, crawl_delay, retry_after, sit_out
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.storage.store import LocalStore
@@ -19,11 +19,14 @@ from tests.test_crawl_stream import Site, _crawl, _frontier
 
 def test_crawl_delay_is_ours_else_everyones_and_capped() -> None:
     robots = b"User-agent: *\nCrawl-delay: 5\n\nUser-agent: other\nUser-agent: frontier-crawler\nDisallow: /x\nCrawl-delay: 12 # ours\n"
-    assert crawl_delay(robots, USER_AGENT) == 12.0
-    assert crawl_delay(robots, "SomeoneElse/1.0") == 5.0
-    assert crawl_delay(b"User-agent: *\nCrawl-delay: 900\n", USER_AGENT) == MAX_CRAWL_DELAY_S
-    assert crawl_delay(b"User-agent: *\nCrawl-delay: soon\nDisallow: /\n", USER_AGENT) is None
-    assert crawl_delay(b"Sitemap: https://a.test/s.xml\n", USER_AGENT) is None
+    assert ROBOTS_NAME == "frontier-crawler" and crawl_delay(robots, ROBOTS_NAME) == 12.0
+    assert crawl_delay(robots, "SomeoneElse") == 5.0
+    # Groups for words that are in our User-Agent but are not our name do not count as ours.
+    for other in ("mozilla", "compatible", "crawler", "github"):
+        assert crawl_delay(f"User-agent: *\nCrawl-delay: 5\n\nUser-agent: {other}\nCrawl-delay: 1\n".encode(), ROBOTS_NAME) == 5.0
+    assert crawl_delay(b"User-agent: *\nCrawl-delay: 900\n", ROBOTS_NAME) == MAX_CRAWL_DELAY_S
+    assert crawl_delay(b"User-agent: *\nCrawl-delay: soon\nDisallow: /\n", ROBOTS_NAME) is None
+    assert crawl_delay(b"Sitemap: https://a.test/s.xml\n", ROBOTS_NAME) is None
 
 
 def test_retry_after_reads_seconds_or_a_date() -> None:
@@ -118,10 +121,10 @@ def test_a_crawl_keeps_crawl_delays_for_later_runs_and_cools_a_host_that_asks(tm
 
 
 def test_request_rate_counts_as_a_gap_and_the_longer_one_wins() -> None:
-    assert crawl_delay(b"User-agent: *\nRequest-rate: 1/10s\n", USER_AGENT) == 10.0
-    assert crawl_delay(b"User-agent: *\nRequest-rate: 6/1m 0900-1700\nCrawl-delay: 4\n", USER_AGENT) == 10.0
-    assert crawl_delay(b"User-agent: *\nRequest-rate: 0/5s\nRequest-rate: soon\n", USER_AGENT) is None
-    assert crawl_delay("﻿User-agent: *\nCrawl-delay: 3\n".encode(), USER_AGENT) == 3.0   # a byte-order mark hides nothing
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 1/10s\n", ROBOTS_NAME) == 10.0
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 6/1m 0900-1700\nCrawl-delay: 4\n", ROBOTS_NAME) == 10.0
+    assert crawl_delay(b"User-agent: *\nRequest-rate: 0/5s\nRequest-rate: soon\n", ROBOTS_NAME) is None
+    assert crawl_delay("﻿User-agent: *\nCrawl-delay: 3\n".encode(), ROBOTS_NAME) == 3.0   # a byte-order mark hides nothing
 
 
 def test_the_throttle_learns_a_slower_gap_from_slow_or_refused_replies_and_never_a_faster_one() -> None:

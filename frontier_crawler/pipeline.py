@@ -16,7 +16,7 @@ Input contract:
     engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
     await engine.start()
     row = await engine.fetch(target)         # fetched, buffered and counted (row["links"]: see fetch); or, a batch at a time:
-    answers = await engine.judge(row)        #   await engine.run(targets, observer), which does both
+    answers = await engine.judge(row)        #   await engine.run(targets), which does both
     await engine.flush()                     # uploads full or old buffers; call it now and then
     stats = await engine.finish(extra_files) # final upload: tables, state and extra files in one commit
 The fetcher is any object with `async fetch(url) -> ScrapeResult` (and the limits, timeout= and connect=, when fetch is given them).
@@ -45,7 +45,7 @@ from frontier_crawler.harvester.readers import ReaderPool
 from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
-from frontier_crawler.judge.questions import Question, relevance
+from frontier_crawler.judge.questions import relevance
 from frontier_crawler import ocr
 from frontier_crawler.joinkeys import join_keys
 from frontier_crawler.storage.shards import (
@@ -85,9 +85,6 @@ _UPLOAD_EVERY_S = 600.0
 # What is kept of a stored PDF. text_only: a PDF whose text was read in full keeps its text in fetches and writes no body;
 # a scan (under ocr.SCAN_MAX_WORDS words) a PDF cut short by the reader's time limit or one with no text on many of its pages keeps its bytes. keep: every PDF keeps them.
 PDF_BODIES = ("text_only", "keep")
-
-Observer = Callable[[Target, Dict[str, Any], Optional[JevResult]], None]
-
 
 class Fetcher(Protocol):
     async def fetch(self, url: str) -> ScrapeResult: ...
@@ -154,8 +151,6 @@ class Engine:
         workdir: Path,
         jev: Optional[JevClient] = None,
         monthly_usd: float = 0.0,
-        questions: Optional[Sequence[Question]] = None,
-        max_excerpt_words: int = DEFAULT_MAX_WORDS,
         concurrency: int = 4,
         now: Callable[[], dt.datetime] = utc_now,
         run_id: Optional[str] = None,
@@ -168,8 +163,6 @@ class Engine:
         self._fetcher = fetcher
         self._workdir = Path(workdir)
         self._jev = jev
-        self._questions = questions or judging.active()
-        self._max_words = max_excerpt_words
         self.concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._now = now
@@ -319,20 +312,13 @@ class Engine:
 
     # ------------------------------------------------------------ fetching
 
-    async def run(self, targets: Sequence[Target], observer: Optional[Observer] = None) -> None:
-        """Fetch a batch, judging each page in its fetch slot. observer(target, row, answers) is called once per fetch row, after judging."""
+    async def run(self, targets: Sequence[Target]) -> None:
+        """Fetch a batch, judging each page in its fetch slot."""
 
         async def one(target: Target) -> None:
             async with self._semaphore:
                 row = await self.fetch(target)
-                answers = await self.judge(row)
-                if observer is not None:
-                    try:
-                        with timed(self._slot, "observe"):
-                            observer(target, row, answers)
-                    except Exception:
-                        # The row is stored. A fault in what follows it must not stop the batch.
-                        logger.exception("observer failed for %s", target.url)
+                await self.judge(row)
                 await self.flush()
 
         await asyncio.gather(*(one(target) for target in targets))
@@ -507,7 +493,7 @@ class Engine:
         if self._jev is None or self.stats["jev_stopped"] or month["input_tokens"] >= self._ceiling_tokens:
             self.stats["pending"] += 1
             return None
-        excerpt, method, words = build_excerpt(text, self._max_words)
+        excerpt, method, words = build_excerpt(text, DEFAULT_MAX_WORDS)
         call: Dict[str, Any] = {
             "call_id": str(uuid.uuid4()), "fetch_id": fetch_id, "sha256": sha256, "run_id": self.run_id,
             "asked_at": self._now(), "reason": reason, "excerpt_method": method, "excerpt_words": words,
@@ -517,7 +503,7 @@ class Engine:
         self._jev_calls += 1
         try:
             with timed(self._jev_spent, "seconds"):
-                result = await self._jev.ask(excerpt, self._questions)
+                result = await self._jev.ask(excerpt, judging.active())
         except (JevUnavailable, JevRejected) as exc:
             refused = isinstance(exc, JevRejected)
             calls.add({**call, "status": "rejected" if refused else "unavailable", "error": str(exc)})

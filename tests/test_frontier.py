@@ -30,6 +30,23 @@ NOW = dt.datetime(2026, 11, 9, 20, 0, tzinfo=dt.timezone.utc)
 TEXT = "The port authority published the berth schedule and the tariff for bulk cargo. " * 12
 
 
+def release(frontier: Frontier, entry: Dict[str, Any]) -> None:
+    """Put an entry from take() back unfetched, so a test can take again and see how the ranking moved. The crawl never
+    puts one back."""
+    host, line = flight = frontier._in_flight.pop(entry["url"])
+    frontier._unhold(flight)
+    frontier._flight_seed[entry["seed_id"]] -= 1
+    frontier._tags.pop(entry["url"], None)
+    if entry["status"] == "retry":
+        frontier._retry_flight -= 1
+        frontier._retry[entry["url"]] = entry
+    else:
+        frontier._taken_by_seed[entry["seed_id"]] -= 1
+        frontier._enqueue(entry)
+    frontier._check(entry["seed_id"])
+    frontier._push_all(frontier._groups_by_host.get(host, []) + frontier._groups_by_line.get(line, []))
+
+
 def _seed(sid: str, url: str, **kwargs: Any) -> Seed:
     return Seed(id=sid, entity=sid, urls=(url,), **kwargs)
 
@@ -151,7 +168,7 @@ def test_a_site_factor_of_zero_is_never_taken_and_comes_back_when_raised() -> No
         frontier._takes = turn
         taken = frontier.take(seeds, today)
         assert taken is not None and taken["url"] == "https://example.org/"
-        frontier.release(taken)
+        release(frontier, taken)
     assert frontier.take_retry(seeds, today) is None and frontier.spawned == 0
     assert frontier.count("queued") == queued   # nothing left the queue
     frontier.steer({"example.com": 2.0})
@@ -315,7 +332,7 @@ def test_a_lift_into_a_sunk_line_ranks_it_up_for_the_next_take() -> None:
         frontier.mark(frontier.entry(f"https://b.test/{i}"), _content(), None, NOW)   # b has nothing left queued
     held = frontier.take(seeds, NOW.date())
     assert held["host"] == "c.test"
-    frontier.release(held)
+    release(frontier, held)
     b = frontier.entry("https://b.test/")
     frontier.add_links(b, _page_row(b["url"], '<a href="https://a.test/0">x</a>'), None, NOW)
     assert frontier.line("a")["yield"] > 0.105 and frontier.take(seeds, NOW.date())["host"] == "a.test"
@@ -430,7 +447,7 @@ def test_crawl_follows_links_and_keeps_its_queue(tmp_path: Path) -> None:
 
     def go(run: str, max_fetches: int) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW, scope="open", run_share=None))
 
     first = go("r1", 2)
     assert first["total"] == 2 and first["links_added"] == 3 and first["queued"] == 3   # the broken link is skipped, not fatal
@@ -479,7 +496,7 @@ def test_a_thin_starting_page_is_reported_and_tried_again_and_a_redirect_to_anot
 
     def go(run: str) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW, scope="open", run_share=None))
 
     first = go("r1")
     assert first["seed_url_problems"] == {"https://down.test/": "thin page: 3 words"} and first["seeds_with_nothing"] == ["down"]
@@ -496,7 +513,7 @@ def test_a_new_seed_on_a_page_fetched_under_another_line_reads_it_as_new_once(tm
 
     def go(run: str, seeds: List[Seed]) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW, scope="open", run_share=None))
 
     seeds = [_seed("a", "https://a.test/")]
     assert go("r1", seeds)["seed_urls_reread"] == 0 and sorted(site.fetched) == ["https://a.test/", "https://a.test/deep", "https://a.test/p"]
@@ -542,7 +559,7 @@ def test_a_crawl_reads_due_sitemaps_once_a_week_and_a_failure_does_not_stop_it(t
 
     def go(run: str, when: dt.datetime, steer: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
-        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: when, sitemaps=sitemaps, steer=steer))
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: when, scope="open", run_share=None, sitemaps=sitemaps, steer=steer))
 
     first = go("r1", NOW, steer={"example.com": 0.0})   # a site steered to 0 is not read
     assert sorted(read) == ["https://a.test", "https://down.test"] and "https://a.test/from-map" in site.fetched
@@ -566,7 +583,7 @@ def test_watched_pages_are_read_when_due_and_a_changed_one_queues_its_new_links(
         when = NOW + dt.timedelta(hours=hours)
         engine = Engine(store, site, workdir=tmp_path / run, now=lambda: when, run_id=run)
         site.fetched.clear()
-        return asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / run, max_fetches=10, now=lambda: when, watch=watch))
+        return asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / run, max_fetches=10, now=lambda: when, scope="open", run_share=None, watch=watch))
 
     def counts(stats: Dict[str, Any]) -> tuple:
         return tuple(stats[f"watch_{key}"] for key in ("entries", "due", "fetched", "changed", "unchanged", "failed", "links_queued"))
@@ -595,7 +612,7 @@ def test_watched_pages_take_at_most_a_fifth_of_the_fetch_cap_oldest_due_first(tm
     (tmp_path / "store" / "state" / "watch.json").write_text(json.dumps(last))
     watch = [{"id": f"w{i}", "url": f"https://a.test/w{i}", "every_hours": 1.0} for i in range(5)]
     engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=14, now=lambda: NOW, watch=watch))
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=14, now=lambda: NOW, scope="open", run_share=None, watch=watch))
     assert (stats["watch_due"], stats["watch_fetched"], stats["total"]) == (5, 2, 3)        # floor(14 x 0.2) = 2, and the seed
     assert site.fetched[:2] == ["https://a.test/w0", "https://a.test/w4"]
 
@@ -608,7 +625,7 @@ def test_without_a_watch_file_no_watch_state_is_read_or_written(tmp_path: Path) 
 
     store = Watching(tmp_path / "store")
     engine = Engine(store, FakeSite({"https://a.test/": ""}), workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=5, now=lambda: NOW))
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "r1", max_fetches=5, now=lambda: NOW, scope="open", run_share=None))
     assert stats["total"] == 1 and stats["watch_entries"] == stats["watch_fetched"] == 0 and not (tmp_path / "store" / "state" / "watch.json").exists()
 
 
@@ -621,7 +638,7 @@ def test_a_crawl_counts_fetches_by_generation_and_by_page_of_their_host(tmp_path
     })
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW))
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW, scope="open", run_share=None))
     # A find counts at the generation it is priced at, its finder's + 1: a.test/ at 0, b.test/ and b.test/x at 1, c.test/ at 2.
     assert stats["fetches_by_generation"] == {"0": 1, "1": 2, "2": 1, "3": 0, "4-7": 0, "8+": 0}
     assert stats["fetches_by_host_page"] == {"1": 3, "2-5": 1, "6-20": 0, "21+": 0}   # b.test/x is its host's second page
@@ -636,7 +653,7 @@ def test_a_crawl_honours_site_factors_and_counts_them(tmp_path: Path) -> None:
     })
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW,
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=10, now=lambda: NOW, scope="open", run_share=None,
                               steer={"a.test": 0.5, "b.test": 2.0, "c.test": 0.0, "d.test": 1.0}))
     assert "https://c.test/" not in site.fetched and stats["lines_spawned"] == 1   # b.test only
     assert (stats["sites_steered"], stats["fetches_steered_down"], stats["fetches_steered_up"], stats["queued_held_by_steer"]) == (3, 2, 1, 1)
@@ -653,7 +670,7 @@ def test_the_queue_is_uploaded_once_per_run(tmp_path: Path) -> None:
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
     store = CountingStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW, scope="open", run_share=None))
     assert stats["total"] == 7 and store.queue_uploads == 1
 
 
@@ -661,7 +678,7 @@ def test_a_crawl_records_where_its_time_went(tmp_path: Path) -> None:
     site = FakeSite({"https://a.test/": "".join(f'<a href="/p{i}">p</a>' for i in range(6)), **{f"https://a.test/p{i}": "" for i in range(6)}})
     store = LocalStore(tmp_path / "store")
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW))
+    stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=7, now=lambda: NOW, scope="open", run_share=None))
     seconds = stats["seconds"]
     assert set(seconds) == {"load_state", "sitemaps", "take", "fetching", "judge_wait", "final_save", "total"}
     assert all(value >= 0 for value in seconds.values()) and seconds["total"] >= seconds["fetching"]
@@ -676,7 +693,7 @@ def test_crawl_stops_taking_urls_after_max_minutes(tmp_path: Path) -> None:
     engine = Engine(store, site, workdir=tmp_path / "w", now=lambda: NOW, run_id="r1")
     ticks = iter(range(0, 10_000, 60))   # each clock reading is one minute later than the last
     stats = asyncio.run(crawl(store, engine, [_seed("a", "https://a.test/")], workdir=tmp_path / "w", max_fetches=100,
-                              max_minutes=2, now=lambda: NOW, clock=lambda: float(next(ticks))))
+                              max_minutes=2, now=lambda: NOW, scope="open", run_share=None, clock=lambda: float(next(ticks))))
     assert stats["stopped_by"] == "max_minutes" and stats["total"] == 1 and stats["queued"] == 8
 
 
@@ -1131,7 +1148,7 @@ def test_take_hands_out_what_scoring_every_entry_would() -> None:
             elif out and roll < 0.8:
                 frontier.mark(out.pop(rng.randrange(len(out))), rng.choice([_content(), DEAD, {"outcome": "error"}]), None, NOW)
             elif out and roll < 0.9:
-                frontier.release(out.pop(rng.randrange(len(out))))
+                release(frontier, out.pop(rng.randrange(len(out))))
             else:
                 _churn(frontier, seeds, rng, later if case % 2 else None)
         _check_counts(frontier)
@@ -1149,7 +1166,7 @@ def test_take_holds_entries_in_flight_until_mark_or_release() -> None:
     third = frontier.take(seeds, NOW.date())
     assert third["host"] == "b.test"                            # a.test has MAX_IN_FLIGHT_PER_HOST out
     assert frontier.take(seeds, NOW.date()) is None             # everything else is a.test, which is full
-    frontier.release(second)
+    release(frontier, second)
     assert frontier.take(seeds, NOW.date()) is second           # put back, it is the best again
     frontier.mark(first, _content(), None, NOW)
     assert frontier.take(seeds, NOW.date())["host"] == "a.test" and frontier.count("queued") == 4   # out, not yet fetched
@@ -1166,7 +1183,7 @@ def test_a_line_whose_yield_rises_is_ranked_up_for_the_next_take() -> None:
     frontier.line("b")["yield"] = 0.32
     held = frontier.take(seeds, NOW.date())
     assert held["host"] == "b.test"
-    frontier.release(held)
+    release(frontier, held)
     frontier.mark(frontier.entry("https://a.test/0"), _content(), None, NOW)   # a's yield rises to 0.405
     assert frontier.take(seeds, NOW.date())["host"] == "a.test"
 
@@ -1232,7 +1249,7 @@ def test_a_judgement_after_its_links_were_fetched_is_harmless() -> None:
     frontier.judged(row["fetch_id"], _Answers(0.9))  # type: ignore[arg-type]
     assert x["base"] == 0.3 and x["status"] == "fetched"          # already fetched: left as it was
     assert y["base"] != 0.3                                       # in flight: the new score goes back with it
-    frontier.release(y)
+    release(frontier, y)
     assert frontier.take(seeds, NOW.date()) is y and frontier.count("queued") == 1
     frontier.judged(row["fetch_id"], _Answers(0.1))  # type: ignore[arg-type]   # a second answer for it is ignored
     assert y["base"] != link_base(_Answers(0.1))  # type: ignore[arg-type]
@@ -1259,7 +1276,7 @@ def test_a_timed_out_page_is_retried_once_through_its_own_lane(tmp_path: Path) -
     # At most MAX_RETRY_IN_FLIGHT at once while there is other work; with none left, the rest too.
     assert [e["status"] for e in retries] == ["retry", "retry", "queued"]
     assert frontier.take(seeds, NOW.date())["url"] == first[2]["url"]
-    frontier.release(frontier.entry(first[2]["url"]))
+    release(frontier, frontier.entry(first[2]["url"]))
     frontier.mark(retries[2], _content(), None, NOW)
     frontier.mark(retries[0], _timed_out(), None, NOW)                  # a second timeout fails it
     frontier.mark(retries[1], _content(), None, NOW)                    # this one recovered
@@ -1270,7 +1287,7 @@ def test_a_timed_out_page_is_retried_once_through_its_own_lane(tmp_path: Path) -
     assert again.count("retry") == 1 and again.expire_retries(NOW + dt.timedelta(days=1)) == 0
     left = again.take(seeds, NOW.date())
     assert left["status"] == "retry" and left["url"] == first[2]["url"]
-    again.release(left)
+    release(again, left)
     assert again.take(seeds, NOW.date()) is left
 
 
@@ -1434,7 +1451,7 @@ def test_a_crawl_reports_the_bounds_and_fences_watched_page_links(tmp_path: Path
     seeds = [_seed("s", "https://www.example.com/", allowance=2)]
     watch = [{"id": "notices", "url": "https://www.example.com/notices", "every_hours": 1.0}]
     engine = Engine(store, site, workdir=tmp_path / "r1", now=lambda: NOW, run_id="r1")
-    stats = asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / "r1", max_fetches=10, now=lambda: NOW, watch=watch, scope="source"))
+    stats = asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / "r1", max_fetches=10, now=lambda: NOW, watch=watch, scope="source", run_share=None))
     assert not any("example.net" in url for url in site.fetched) and stats["links_out_of_scope"] == 2 and stats["scope"] == "source"
     links = {row["url"] for path in (tmp_path / "store" / "links").rglob("*.parquet") for row in pq.read_table(path).to_pylist()}
     assert {"https://example.net/a", "https://example.net/b"} <= links   # still in the links table

@@ -130,6 +130,33 @@ def test_a_client_stores_each_page_until_one_is_empty(tmp_path: Path) -> None:
     assert first["body"] is None and json.loads(body)["data"]["items"][0]["vessel"] == "MV A"
 
 
+def test_a_json_reply_is_read_in_the_charset_it_declares(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        items = [{"vessel": "Порт Восточный", "eta": "2026-11-12"}] if request.url.params["page"] == "1" else []
+        return httpx.Response(200, content=json.dumps({"data": {"items": items}}, ensure_ascii=False).encode("cp1251"),
+                              headers={"content-type": "application/json; charset=windows-1251"})
+
+    stats = _run(tmp_path, _spec(tmp_path), handler)
+    assert "Порт Восточный" in _fetch_rows(tmp_path)[0]["text"] and stats["decoded_non_utf8"] == 1
+
+
+def test_a_list_page_whose_reader_fails_is_stored_without_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class CrashingReaders:   # every reader process dies, as on a page that crashes its parser
+        def __init__(self, counts: Dict[str, Any]) -> None:
+            pass
+
+        async def run(self, limit: float, fn: Any, *args: Any) -> Any:
+            raise derived.ReaderFailed("reader crashed")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(derived, "ReaderPool", CrashingReaders)
+    stats = _run(tmp_path, _spec(tmp_path, **{**LIST, "paginate": {"in": "form", "field": "page", "start": 1, "step": 1, "max_pages": 2}}), _list_site())
+    rows = _fetch_rows(tmp_path)
+    assert stats["clients"]["notices"]["status"] == "ok" and rows[0]["outcome"] == "stored" and rows[0]["text"] is None
+
+
 def test_a_second_run_keeps_no_second_copy_of_unchanged_pages(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     _run(tmp_path, spec, _site(pages=2), "r1")
@@ -204,6 +231,7 @@ def test_check_calls_two_pages_and_suggests_a_fingerprint_without_storing(tmp_pa
 def test_capture_helpers_sort_data_requests_from_noise() -> None:
     assert is_noise("https://www.google-analytics.com/g/collect?v=2") and is_noise("https://port.test/collect?e=view")
     assert not is_noise("https://port.test/api/vessels?page=1")
+    assert is_noise("https://o1.ingest.sentry.io/api/5/envelope/") and is_noise("https://stats.port.test/matomo.php?idsite=1")
     assert is_first_party("https://api.port.test/v1/x", "https://www.port.test/vessels")
     assert not is_first_party("https://cdn.other.test/x", "https://www.port.test/vessels")
     headers = kept_headers({"Cookie": "session=secret", "Authorization": "Bearer secret", "X-Requested-With": "XMLHttpRequest",

@@ -38,8 +38,9 @@ import httpx
 
 from frontier_crawler.harvester.cascade import CREDENTIAL_HEADERS, USER_AGENT, ScrapeResult, Target, check_public, read_capped, word_count
 from frontier_crawler.harvester.courtesy import sit_out
-from frontier_crawler.harvester.readers import decode, extract_links, read_html
+from frontier_crawler.harvester.readers import HTML_SECONDS, ReaderFailed, ReaderPool, decode, extract_links, read_html
 from frontier_crawler.harvester.throttle import HostThrottle
+from frontier_crawler.pipeline import utc_now
 
 FOLLOW_LINKS_PER_PAGE = 5_000   # PROVISIONAL: links read from one list page for follow (the crawl's own cap is lower)
 SAT_OUT = "the host asked for a pause"
@@ -208,6 +209,11 @@ class DerivedFetcher:
         self.last: Dict[str, Tuple[int, bytes, str]] = {}  # key -> (status, body, why there was no reply, or SAT_OUT)
         self.links: Dict[str, List[str]] = {}  # key -> the links on an html reply, for a spec that follows them
         self.cooled: set = set()               # hosts left alone for the rest of the run
+        self.counts: Dict[str, int] = {"decoded_non_utf8": 0}   # the engine's run summary reads these, as the cascade's
+        self._readers = ReaderPool(self.counts)  # replies are read in worker processes, as the crawl's are
+
+    def close(self) -> None:
+        self._readers.close()
 
     def prepare(self, spec: Spec, page: int) -> str:
         method, url, headers, body, key = page_request(spec, page)
@@ -252,19 +258,28 @@ class DerivedFetcher:
         if spec.reply == "html":
             final = str(response.url)
             try:
-                text, _, links, title = read_html(content, content_type, final)
-            except Exception:  # a page no reader can read is still stored
+                text, _, links, title = await self._readers.run(HTML_SECONDS, read_html, content, content_type, final)
+            except Exception:  # a page no reader can read, or one that crashed or hung its reader, is still stored
                 text, links, title = None, None, None
             if spec.follow:
-                self.links[key] = [link for link, _ in extract_links(content, final, FOLLOW_LINKS_PER_PAGE)[0] if re.search(spec.follow, link)]
+                try:
+                    found = (await self._readers.run(HTML_SECONDS, extract_links, content, final, FOLLOW_LINKS_PER_PAGE))[0]
+                except Exception:
+                    found = []
+                self.links[key] = [link for link, _ in found if re.search(spec.follow, link)]
             return ScrapeResult(key, response.status_code, content, text, word_count(text or ""), "API", None, content_type, links=links, title=title)
-        text = content.decode("utf-8", errors="replace")
+        try:
+            text, encoding = await self._readers.run(HTML_SECONDS, decode, content, content_type)
+        except ReaderFailed:   # the reader crashed or hung: read as before charsets were honoured
+            text, encoding = content.decode("utf-8", errors="replace"), None
+        if encoding not in (None, "utf-8"):
+            self.counts["decoded_non_utf8"] += 1
         return ScrapeResult(key, response.status_code, content, text, len(text.split()), "API", None, content_type)
 
 
 async def run_derived(
     engine: Any, specs: List[Spec], fetcher: DerivedFetcher, frontier: Any = None,
-    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+    now: Callable[[], dt.datetime] = utc_now,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch every page of every spec through the engine. Returns {spec id: {status, pages, records (json) or followed
     (html with follow), stopped?}}. frontier: the crawl's Frontier, which a spec's followed links join; None to queue none."""
@@ -340,4 +355,5 @@ async def check(spec: Spec, client: httpx.AsyncClient) -> Dict[str, Any]:
         else:
             entry["differs_from_first_page"] = bool(records) and records != first
         report[f"page_{page + 1}"] = entry
+    fetcher.close()
     return report

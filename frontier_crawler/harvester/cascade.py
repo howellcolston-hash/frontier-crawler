@@ -30,6 +30,7 @@ from frontier_crawler.harvester.readers import Links, ReaderFailed, ReaderPool, 
 from frontier_crawler.harvester.throttle import HostThrottle
 
 USER_AGENT = "Mozilla/5.0 (compatible; frontier-crawler/1.0; +https://github.com/howellcolston-hash/frontier-crawler)"
+ROBOTS_NAME = USER_AGENT.split("; ")[1].split("/")[0]   # our product token, the name a robots.txt group uses for us
 # Sent by both plain tiers, as a browser sends them: some firewalls refuse a request without them. The User-Agent stays our own.
 REQUEST_HEADERS = {
     "User-Agent": USER_AGENT,
@@ -65,6 +66,7 @@ BROWSER_HUNG_SECONDS = 120.0
 TIMEOUT_SECONDS = 30.0  # PROVISIONAL: HTTP read and browser page-load timeout, unless a call asks for another
 CONNECT_SECONDS = 10.0  # PROVISIONAL: a host that will not accept a connection this fast is dead or dropping us
 NETWORK_IDLE_SECONDS = 6.0  # PROVISIONAL: after the page has loaded, how long the browser waits for its requests to settle
+MAX_ISSUER_BYTES = 100_000  # PROVISIONAL: a CA certificate is a few kB; a larger CA-issuers file is not read
 MAX_SITEMAP_FILES = 10  # PROVISIONAL: sitemap files fetched per site per read, those robots.txt names and those their indexes list together
 
 
@@ -180,6 +182,20 @@ def _ca_issuers_url(cert) -> Optional[str]:
     return None
 
 
+def _issuer_bytes(url: str, transport: Optional[httpx.BaseTransport] = None) -> Optional[bytes]:
+    """A CA-issuers file, with every redirect hop checked by check_public; None when it is over MAX_ISSUER_BYTES."""
+    hooks = {"request": [lambda request: check_public(str(request.url))]}
+    with httpx.Client(transport=transport, timeout=10, follow_redirects=True, max_redirects=MAX_REDIRECTS,
+                      headers={"User-Agent": USER_AGENT}, event_hooks=hooks) as client:
+        with client.stream("GET", url) as response:
+            body = b""
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > MAX_ISSUER_BYTES:
+                    return None
+            return body
+
+
 def context_with_issuers(host: str, port: int = 443) -> Optional[ssl.SSLContext]:
     """Complete a server's certificate chain the way browsers do, by following the
     "CA issuers" links in its certificates, and return a context that still verifies fully.
@@ -202,8 +218,9 @@ def context_with_issuers(host: str, port: int = 443) -> Optional[ssl.SSLContext]
         # Stop once a trusted root issued this one. Root links are often .p7c bundles (Sectigo), which this doesn't read.
         if not url or cert.issuer == cert.subject or cert.issuer in roots:
             break
-        check_public(url)
-        body = httpx.get(url, timeout=10, follow_redirects=True, headers={"User-Agent": USER_AGENT}).content
+        body = _issuer_bytes(url)
+        if body is None:
+            break
         try:
             cert = x509.load_der_x509_certificate(body)
         except ValueError:
@@ -474,7 +491,7 @@ class HarvesterCascade:
             status, body = await self.get(origin + "/robots.txt")
             files = readers.robots_sitemaps(body) if status == 200 else []
             if self._throttle is not None and status < 500:   # a 4xx means no robots.txt, so no delay; a 5xx says nothing
-                delay = crawl_delay(body, USER_AGENT) if status == 200 else None
+                delay = crawl_delay(body, ROBOTS_NAME) if status == 200 else None
                 host = urlsplit(origin).netloc.lower()
                 if delay:
                     self._throttle.intervals[host] = delay

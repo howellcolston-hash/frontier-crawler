@@ -3,9 +3,8 @@
 Rules for questions:
   * Each asks about one observable property of the text. Jev knows nothing about the project,
     so "is this relevant?" is not asked. Relevance is computed here from the answers.
-  * Wording is neutral. How lenient the engine is lives in miss_to_junk_cost, one number.
   * A reworded question gets a new version. Answers from different versions are never mixed.
-Every answer is stored as a probability, so the formula and the threshold below can be
+Every answer is stored as a probability, so the formula below can be
 changed later and applied to old documents without asking Jev again.
 
 The questions are configuration, not code: `configure` takes them as a JSON object (the store's
@@ -60,8 +59,7 @@ EXAMPLE: Dict[str, Any] = {
          "criteria": {"record": "An official or first-hand record", "news_or_commentary": "News reporting, analysis or opinion", "other": "None of the above"}},
     ],
     # relevance = product of `all` x the largest of `any` x product of (1 - each of `none`).
-    # A missed relevant document is taken to be miss_to_junk_cost times worse than a stored junk one.
-    "relevance": {"version": "relevance_v1", "all": [], "any": ["has_specifics"], "none": ["junk_page"], "miss_to_junk_cost": 10},
+    "relevance": {"version": "relevance_v1", "all": [], "any": ["has_specifics"], "none": ["junk_page"]},
 }
 
 _questions: Sequence[Question] = ()
@@ -76,8 +74,8 @@ def configure(config: Mapping[str, Any]) -> None:
     rule = dict(config["relevance"])
     nouls = {q.id for q in questions if q.type == "noul"}
     unknown = [name for part in ("all", "any", "none") for name in rule.get(part, []) if name not in nouls]
-    if unknown or len({q.id for q in questions}) != len(questions) or float(rule["miss_to_junk_cost"]) <= 0:
-        raise ValueError(f"questions config: duplicate ids, a bad cost, or relevance names that are not noul questions: {unknown}")
+    if unknown or len({q.id for q in questions}) != len(questions):
+        raise ValueError(f"questions config: duplicate ids, or relevance names that are not noul questions: {unknown}")
     sample = config.get("jev_sample")
     if sample is not None and not (isinstance(sample, (int, float)) and not isinstance(sample, bool) and 0 <= sample <= 1):
         raise ValueError("questions config: jev_sample must be a number from 0 to 1")
@@ -95,11 +93,6 @@ def jev_sample() -> Optional[float]:
 
 def relevance_version() -> str:
     return _rule["version"]
-
-
-def keep_threshold() -> float:
-    """PROVISIONAL. A document is worth keeping when its relevance is at least this."""
-    return 1.0 / (1.0 + float(_rule["miss_to_junk_cost"]))
 
 
 def relevance(nouls: Mapping[str, float]) -> Optional[float]:

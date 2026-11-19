@@ -2,7 +2,7 @@
 when a server says it is overloaded.
 
 Input contract:
-    seconds = crawl_delay(robots_body, USER_AGENT)          # None when robots.txt sets none for us or for *
+    seconds = crawl_delay(robots_body, ROBOTS_NAME)         # None when robots.txt sets none for us or for *
     cool = sit_out(throttle, url, status, retry_after)       # after each reply; see sit_out
 """
 
@@ -29,8 +29,8 @@ def _rate_seconds(value: str) -> Optional[float]:
     return int(found.group(2)) * _UNIT_SECONDS[found.group(3) or "s"] / int(found.group(1))
 
 
-def crawl_delay(robots: bytes, user_agent: str) -> Optional[float]:
-    """The gap the robots.txt group naming us (a User-agent value found in user_agent) asks for, else the * group's:
+def crawl_delay(robots: bytes, product: str) -> Optional[float]:
+    """The gap the robots.txt group naming us (a User-agent value equal to our product token) asks for, else the * group's:
     the longer of its Crawl-delay and its Request-rate, capped at MAX_CRAWL_DELAY_S. Only the pace is read: rules are
     not applied."""
     ours: Optional[float] = None
@@ -60,7 +60,7 @@ def crawl_delay(robots: bytes, user_agent: str) -> Optional[float]:
             for agent in agents:
                 if agent == "*":
                     anyone = max(anyone or 0.0, seconds)
-                elif agent and agent in user_agent.lower():
+                elif agent.split("/")[0] == product.lower():   # never a substring: "mozilla" or "compatible" is not us
                     ours = max(ours or 0.0, seconds)
     found = ours if ours is not None else anyone
     return None if found is None else min(found, MAX_CRAWL_DELAY_S)

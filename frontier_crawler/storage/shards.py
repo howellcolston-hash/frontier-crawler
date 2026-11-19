@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.7.0"  # 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.8.0"  # 0.8.0: a derived client's JSON text read in its declared charset, a malformed Jev reply recorded as rejected; 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -185,7 +185,6 @@ class ShardWriter:
         self._rows: List[Dict[str, Any]] = []
         self._bytes = 0
         self._part = 0
-        self.written: List[str] = []
 
     def add(self, row: Dict[str, Any]) -> None:
         unknown = set(row) - set(self._schema.names)

@@ -129,7 +129,7 @@ and so does waiting longer than RETRY_MAX_AGE for the retry.
 Input contract:
     frontier = Frontier.load(store, workdir); frontier.rank(mode, temperature)   # optional: fixed
     frontier.bound(seeds, scope, max_fetches, run_share)   # optional: no bounds; then frontier.add_seeds(seeds, now)
-    picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today); frontier.release(entry)
+    picks = frontier.select(n, seeds, today)            # or one at a time: entry = frontier.take(seeds, today)
     frontier.mark(entry, fetch_row, answers, now); frontier.add_links(entry, fetch_row, answers, now)
     # or in two phases, so nothing waits on Jev: frontier.expect_judgement(fetch_id, line_id), mark and add_links with
     # answers None, then frontier.judged(fetch_id, answers or None) when the judgement arrives
@@ -172,6 +172,7 @@ from frontier_crawler.harvester.readers import newest_first, normalise
 from frontier_crawler.harvester.throttle import HostThrottle
 from frontier_crawler.judge.jev import JevResult
 from frontier_crawler.judge.questions import relevance
+from frontier_crawler.pipeline import utc_now
 from frontier_crawler.storage.queue import QueueFiles, group_key, kept as kept_whole, starting as is_start
 from frontier_crawler.storage.state import load_watch_times, save_watch_times, url_key
 from frontier_crawler.storage.store import Store
@@ -1729,7 +1730,7 @@ class Frontier:
 
     def take(self, seeds: Sequence[Seed], today: dt.date) -> Optional[Dict[str, Any]]:
         """The next entry to fetch, or None, ranked as select() ranks its main pass. It counts as in flight for its host
-        and line until mark() or release() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
+        and line until mark() is called for it, and a host has at most MAX_IN_FLIGHT_PER_HOST in flight.
         Every 1/NEW_DOMAIN_SHARE-th call takes from registered domains never fetched while there are any. Every 1/RETEST_SHARE-th call
         is a re-test: the best entry of a group drawn uniformly from the groups with queued entries, under the same
         per-host limits; it falls back to the ranked take after RETEST_DRAWS blocked draws. Before any of that, a page
@@ -1883,21 +1884,6 @@ class Frontier:
         if flight[1]:
             self._flight_line[flight[1]] -= 1
 
-    def release(self, entry: Dict[str, Any]) -> None:
-        """Return an entry from take() that was not fetched to the queue (or to the retry lane)."""
-        host, line = flight = self._in_flight.pop(entry["url"])
-        self._unhold(flight)
-        self._flight_seed[entry["seed_id"]] -= 1
-        self._tags.pop(entry["url"], None)
-        if entry["status"] == "retry":
-            self._retry_flight -= 1
-            self._retry[entry["url"]] = entry
-        else:
-            self._taken_by_seed[entry["seed_id"]] -= 1
-            self._enqueue(entry)
-        self._check(entry["seed_id"])
-        self._push_all(self._groups_by_host.get(host, []) + self._groups_by_line.get(line, []))
-
 
 async def crawl(
     store: Store,
@@ -1907,15 +1893,15 @@ async def crawl(
     workdir: Path,
     max_fetches: int,
     max_minutes: Optional[float] = None,
-    now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+    now: Callable[[], dt.datetime] = utc_now,
     clock: Callable[[], float] = time.monotonic,
     steer: Optional[Dict[str, float]] = None,
     sitemaps: Optional[Callable[[str], Awaitable[Tuple[List[Tuple[str, str]], int, int]]]] = None,
     watch: Sequence[Dict[str, Any]] = (),
     ranking: Tuple[str, float] = ("fixed", 1.0),
     throttle: Optional[HostThrottle] = None,
-    scope: str = "open",
-    run_share: Optional[float] = None,
+    scope: str = "source",
+    run_share: Optional[float] = SEED_RUN_SHARE,
 ) -> Dict[str, Any]:
     """Fetch in a rolling stream until max_fetches new pages are taken and no retry waits, max_minutes has passed,
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
@@ -2037,6 +2023,11 @@ async def crawl(
             except Exception:
                 logger.exception("a judgement was not applied to the queue")
 
+    def spawn_judge(row: Dict[str, Any], tally: Dict[str, Any]) -> None:
+        task = asyncio.create_task(judge({**row, "links": None}, tally))  # the links are not needed to judge
+        judging.add(task)
+        task.add_done_callback(judging.discard)
+
     async def fetch_one(entry: Dict[str, Any]) -> None:
         retry = entry["status"] == "retry"
         fetch_id = None
@@ -2053,9 +2044,7 @@ async def crawl(
                 counts["retries"] += 1
                 counts["retry_recovered"] += row["outcome"] in ("stored", "unchanged", "duplicate")
             if fetch_id is not None:
-                task = asyncio.create_task(judge({**row, "links": None}, kind(entry["url"])))  # the links are not needed to judge
-                judging.add(task)
-                task.add_done_callback(judging.discard)
+                spawn_judge(row, kind(entry["url"]))
         except Exception:
             logger.exception("a fetch slot failed; its page is marked failed")
             with contextlib.suppress(Exception):  # the worker must outlive any one page
@@ -2086,9 +2075,7 @@ async def crawl(
                 watched["watch_links_queued"] += queued
                 links_added += queued
             if engine.sampled(row):
-                task = asyncio.create_task(judge({**row, "links": None}, watch_tally))
-                judging.add(task)
-                task.add_done_callback(judging.discard)
+                spawn_judge(row, watch_tally)
         except Exception:
             logger.exception("a watched page failed")
             watched["watch_failed"] += 1

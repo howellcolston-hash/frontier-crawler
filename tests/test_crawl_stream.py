@@ -86,7 +86,7 @@ def _crawl(tmp_path: Path, site: Any, run: str = "r1", store: Any = None, max_fe
 
     async def go() -> Dict[str, Any]:
         # A crawl that waited on its slowest page would hang here; fail instead.
-        return await asyncio.wait_for(crawl(store, engine, SEEDS, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW, **kwargs), 20)
+        return await asyncio.wait_for(crawl(store, engine, SEEDS, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW, **{"scope": "open", "run_share": None, **kwargs}), 20)
 
     return asyncio.run(go())
 
@@ -166,7 +166,7 @@ def test_a_worker_survives_a_fault_in_fetching_in_recording_and_in_judging(tmp_p
         return await fetch_row(target, limits)
 
     engine._fetch_row = faulty  # type: ignore[method-assign]
-    stats = asyncio.run(crawl(store, engine, SEEDS, workdir=tmp_path / "r1", max_fetches=100, now=lambda: NOW))
+    stats = asyncio.run(crawl(store, engine, SEEDS, workdir=tmp_path / "r1", max_fetches=100, now=lambda: NOW, scope="open", run_share=None))
     assert stats["total"] == 6 and stats["judged"] == 4 and stats["queued"] == 0   # every page but the broken fetch, once
     frontier = _frontier(tmp_path)
     # The broken fetch failed; the root and the other five, their bookkeeping or judging broken or not, were fetched.
