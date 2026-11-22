@@ -73,7 +73,7 @@ jobs:
           INDEX: ${{ matrix.i }}
           OUTCOME: ${{ steps.run.outcome }}
         working-directory: hd
-        run: bash scripts/bridge_log.sh "$RUNNER_TEMP/out.log" >/dev/null 2>&1 || true
+        run: bash scripts/bridge_log.sh "$RUNNER_TEMP/out.log" 2>/dev/null || true   # prints only the HTTP status
 
   run:
     needs: collect
