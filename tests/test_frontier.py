@@ -598,10 +598,34 @@ def test_watched_pages_are_read_when_due_and_a_changed_one_queues_its_new_links(
     assert counts(go("r2", 6)) == (2, 1, 1, 0, 0, 1, 0)             # read 6 hours ago: not due; the dead one is due hourly
     assert counts(go("r3", 12)) == (2, 2, 2, 0, 1, 1, 0)            # due, and served the same bytes
     site.pages["https://a.test/notices"] = '<a href="/n/1">1</a> <a href="/n/2">2</a>'
-    fourth = go("r4", 24)
+    assert counts(go("r4", 24)) == (2, 1, 1, 0, 0, 1, 0)            # unchanged once: its interval grew past 12 hours
+    fourth = go("r5", 31)
     assert counts(fourth) == (2, 2, 2, 1, 0, 1, 1) and "https://a.test/n/2" in site.fetched and "https://a.test/n/1" not in site.fetched
+    assert fourth["watch_with_history"] == 1 and sum(fourth["watch_intervals"].values()) == 2
+    when = (NOW + dt.timedelta(hours=31)).isoformat()
     times = json.loads((tmp_path / "store" / "state" / "watch.json").read_text())
-    assert times == dict.fromkeys(("https://a.test/gone", "https://a.test/notices"), (NOW + dt.timedelta(hours=24)).isoformat())
+    assert times == {"https://a.test/gone": {"last": when, "seen": None, "reads": 0, "changes": 0, "hours": 0.0},     # failures teach nothing
+                     "https://a.test/notices": {"last": when, "seen": when, "reads": 2, "changes": 1, "hours": 31.0}}
+
+
+def test_a_watched_pages_interval_follows_its_estimated_change_rate() -> None:
+    from frontier_crawler.frontier import WATCH_MAX_HOURS, WATCH_MIN_HOURS, revisit_hours
+    assert revisit_hours(48.0, 0, 0, 0.0)[0] == pytest.approx(48.0)                     # no history: the nominated interval
+    assert revisit_hours(1.0, 0, 0, 0.0)[0] == WATCH_MIN_HOURS                          # clamped
+    steady = [revisit_hours(48.0, n, 0, 48.0 * n)[0] for n in (1, 3, 10, 40)]           # never changed: read ever less often
+    assert 48 < steady[0] < steady[1] < steady[2] < steady[3] == WATCH_MAX_HOURS
+    busy = [revisit_hours(48.0, n, n, 48.0 * n)[0] for n in (1, 3, 10, 40)]             # changed at every read: ever more often
+    assert 48 > busy[0] > busy[1] > busy[2] > WATCH_MIN_HOURS and math.isfinite(busy[3])
+    half, rate = revisit_hours(48.0, 50, 25, 48.0 * 50)                                 # changed at half the reads: near 48 hours
+    assert 40 < half < 56 and rate == pytest.approx(math.log(2) / half)
+
+
+def test_watch_state_of_the_older_shape_is_read_as_served_and_seen_with_no_history(tmp_path: Path) -> None:
+    from frontier_crawler.storage.state import load_watch_times
+    store = LocalStore(tmp_path / "store")
+    (tmp_path / "store" / "state").mkdir(parents=True)
+    (tmp_path / "store" / "state" / "watch.json").write_text(json.dumps({"https://a.test/w": NOW.isoformat()}))
+    assert load_watch_times(store, tmp_path / "w") == {"https://a.test/w": {"last": NOW, "seen": NOW, "reads": 0, "changes": 0, "hours": 0.0}}
 
 
 def test_watched_pages_take_at_most_a_fifth_of_the_fetch_cap_oldest_due_first(tmp_path: Path) -> None:

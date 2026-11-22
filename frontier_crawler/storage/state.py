@@ -179,19 +179,30 @@ def save_spend(spend: Dict[str, Any], workdir: Path) -> Tuple[Path, str]:
     return local, JEV_SPEND_PATH
 
 
-def load_watch_times(store: Store, workdir: Path) -> Dict[str, dt.datetime]:
-    """{watched url: when it was last served}. A missing or unreadable file is no history: every page is due."""
+def load_watch_times(store: Store, workdir: Path) -> Dict[str, Dict[str, Any]]:
+    """{watched url: {"last": when it was last served, "seen": when it last showed changed or unchanged (None if never),
+    "reads", "changes", "hours": re-reads seen as changed or unchanged since the one before, how many changed, and the hours
+    between each and the one before, summed}}. A missing or unreadable file is no history: every page is due. The file
+    before 2026-11-22 held {url: last served}; such an entry is read as served and seen then, with no re-reads."""
     local = Path(workdir) / "state-in" / "watch.json"
     try:
         if not store.get(WATCH_PATH, local):
             return {}
-        return {str(url): dt.datetime.fromisoformat(when) for url, when in json.loads(local.read_text(encoding="utf-8")).items()}
+        out: Dict[str, Dict[str, Any]] = {}
+        for url, item in json.loads(local.read_text(encoding="utf-8")).items():
+            item = {"last": item, "seen": item} if isinstance(item, str) else item
+            seen = dt.datetime.fromisoformat(item["seen"]) if item.get("seen") else None
+            out[str(url)] = {"last": dt.datetime.fromisoformat(item["last"]), "seen": seen, "reads": int(item.get("reads", 0)),
+                             "changes": int(item.get("changes", 0)), "hours": float(item.get("hours", 0.0))}
+        return out
     except Exception:
         return {}
 
 
-def save_watch_times(times: Dict[str, dt.datetime], workdir: Path) -> Tuple[Path, str]:
+def save_watch_times(times: Dict[str, Dict[str, Any]], workdir: Path) -> Tuple[Path, str]:
     local = Path(workdir) / "state-out" / "watch.json"
     local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_text(json.dumps({url: when.isoformat() for url, when in sorted(times.items())}, indent=1) + "\n", encoding="utf-8")
+    data = {url: {**item, "last": item["last"].isoformat(), "seen": item["seen"] and item["seen"].isoformat(),
+                  "hours": round(item["hours"], 4)} for url, item in sorted(times.items())}
+    local.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     return local, WATCH_PATH

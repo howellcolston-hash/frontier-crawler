@@ -111,7 +111,9 @@ breaker cools one after COOL_AFTER fetches in a row that served nothing.
 Derived clients' list pages may name detail pages to follow (derived.py); add_followed queues them as ordinary links.
 
 Watched pages (crawl's watch, from config/watch.json) are fetched before any ranked take when due, outside the queue,
-up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as links of its site's line.
+up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as links of its site's line. A page is due
+revisit_hours() after it was last served: an interval that follows its own change rate, estimated from its re-reads that
+showed changed or unchanged, with its nominated every_hours as the prior.
 
 Per-seed bounds (bound()). Under scope "source" a seed queues only URLs on its own registered domains (its urls' and its
 sites'): a link off them is kept in the links table, counted (links_out_of_scope) and never queued, so it starts no line;
@@ -207,10 +209,35 @@ THIN_WORDS = 20                 # PROVISIONAL: an HTML page served with fewer wo
 SITEMAP_EVERY = dt.timedelta(days=7)   # PROVISIONAL: how often one site's robots.txt and sitemaps are read
 SITEMAP_MAX_URLS = 500          # PROVISIONAL: new URLs queued from one site's sitemaps per read
 WATCH_SHARE = 0.2               # PROVISIONAL: most of a run's max_fetches that watched pages may take
+WATCH_TARGET = 0.5              # PROVISIONAL: a watched page is re-read when the chance it changed since its last read reaches this
+WATCH_PRIOR_READS = 2.0         # PROVISIONAL: weight of a watched page's nominated every_hours, in re-reads
+WATCH_MIN_HOURS = 6.0           # PROVISIONAL: shortest interval between re-reads of a watched page
+WATCH_MAX_HOURS = 720.0         # PROVISIONAL: longest
 SEED_RUN_SHARE = 0.15           # PROVISIONAL: most of a run's max_fetches that one seed, all its lines together, may take
 SCOPES = ("source", "open")     # config/ranking.json "scope": queue only links to a seed's own sites, or any link
 # PROVISIONAL: a link off a seed's sites, found on one of its pages, is still queued under scope "source" when its path ends so
 DOCUMENT_EXTENSIONS = (".pdf", ".xls", ".xlsx", ".csv", ".doc", ".docx", ".ods", ".odt", ".json", ".xml", ".zip")
+
+
+def revisit_hours(every_hours: float, reads: int, changes: int, hours: float) -> Tuple[float, float]:
+    """(hours from a watched page's last read to its next, its estimated changes per hour). Changes are taken as a Poisson
+    process seen only as changed or not at each read; the rate is Cho and Garcia-Molina's bias-reduced estimator
+    r = -ln((n - X + 0.5) / (n + 0.5)) / I over n re-reads, X of them changed, I their mean gap, which stays finite when every
+    re-read changed. The nominated every_hours enters as WATCH_PRIOR_READS re-reads at that gap, changed in the share that
+    makes the estimate with no history come out at every_hours. The next read is when 1 - exp(-r t) reaches WATCH_TARGET,
+    clamped to WATCH_MIN_HOURS..WATCH_MAX_HOURS.
+    shortcut: one mean gap for unequal gaps, not the likelihood over each; upgrade if gaps come to differ by far more than 2x."""
+    n = WATCH_PRIOR_READS + reads
+    x = WATCH_TARGET * (WATCH_PRIOR_READS + 0.5) + changes
+    gap = (WATCH_PRIOR_READS * every_hours + hours) / n
+    rate = -math.log((n - x + 0.5) / (n + 0.5)) / gap
+    interval = -math.log(1 - WATCH_TARGET) / rate if rate > 0 else math.inf
+    return min(max(interval, WATCH_MIN_HOURS), WATCH_MAX_HOURS), rate
+
+
+# Watched pages per interval between re-reads, in hours: (label, upper bound), for the run record.
+WATCH_BUCKETS = (("<12", 12), ("12-24", 24), ("24-72", 72), ("72-168", 168), ("168-336", 336), ("336+", math.inf))
+
 # The bandit rule (config/ranking.json); see the module docstring.
 RANKING_MODES = ("fixed", "bandit", "shadow")
 ARM_WINDOW = 6.0                # PROVISIONAL: fetches an arm's estimate remembers (about as many as the yield's YIELD_ALPHA): each reward discounts the older ones by 1 - 1/ARM_WINDOW
@@ -1907,11 +1934,12 @@ async def crawl(
     or nothing is left to take. steer: the site factors, per registered domain (see the module docstring).
     sitemaps: HarvesterCascade.sitemap_entries, or None to read none. Before the first take, each site sitemap_sites()
     finds due has its sitemaps read and add_sitemap() queues what they list; a failure is counted and the crawl goes on.
-    watch: watched pages, {"id", "url", "every_hours"} each. Those never served or last served every_hours ago or more
+    watch: watched pages, {"id", "url", "every_hours"} each. Those never served or last served revisit_hours() ago or more
     are fetched before any ranked take, oldest due first, up to WATCH_SHARE of max_fetches. Each is a fetch row with
     line_id "watch:<id>"; the links of a changed one are queued as links of the line covering its host. When each was
-    last served is kept in state/watch.json. ranking: (mode, temperature) for Frontier.rank(). throttle: the cascade's; the
-    Crawl-delays kept in state/hosts.parquet become its intervals at the start, and its intervals are kept at the end.
+    last served, and its re-reads that showed changed or unchanged, are kept in state/watch.json. ranking: (mode,
+    temperature) for Frontier.rank(). throttle: the cascade's; the Crawl-delays kept in state/hosts.parquet become its
+    intervals at the start, and its intervals are kept at the end.
     scope and run_share: Frontier.bound() (the command line passes config/ranking.json's scope and SEED_RUN_SHARE).
 
     engine.concurrency workers each take the best URL, fetch it, record it and take the next, so a slow page holds
@@ -1947,10 +1975,14 @@ async def crawl(
     watch_times = load_watch_times(store, workdir) if watch else {}
     never = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
+    def revisit(w: Dict[str, Any]) -> Tuple[float, float]:
+        k = watch_times.get(w["url"]) or {}
+        return revisit_hours(w["every_hours"], k.get("reads", 0), k.get("changes", 0), k.get("hours", 0.0))
+
     def due_at(w: Dict[str, Any]) -> dt.datetime:
         last = watch_times.get(w["url"])
         try:
-            return never if last is None else last + dt.timedelta(hours=w["every_hours"])
+            return never if last is None else last["last"] + dt.timedelta(hours=revisit(w)[0])
         except OverflowError:   # an interval past the calendar: never due again
             return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
 
@@ -2065,7 +2097,14 @@ async def crawl(
             content = row["outcome"] in ("stored", "duplicate") and not row["block_marker"]
             watched["watch_changed" if content else "watch_unchanged" if row["outcome"] == "unchanged" else "watch_failed"] += 1
             if row["outcome"] != "error":
-                watch_times[w["url"]] = now()
+                k = watch_times.setdefault(w["url"], {"seen": None, "reads": 0, "changes": 0, "hours": 0.0})
+                k["last"] = now()
+                if content or row["outcome"] == "unchanged":   # what the change rate is estimated from
+                    if k["seen"] is not None and now() > k["seen"]:
+                        k["reads"] += 1
+                        k["changes"] += content
+                        k["hours"] += (now() - k["seen"]).total_seconds() / 3600
+                    k["seen"] = now()
             if line is not None:
                 # As if it were a page of its site's line, at its start: new links on it are queued, known ones are not.
                 as_entry = {"url": w["url"], "host": host, "seed_id": seed_id, "line_id": line["line_id"], "crossing": False, "hops": 0,
@@ -2079,6 +2118,19 @@ async def crawl(
         except Exception:
             logger.exception("a watched page failed")
             watched["watch_failed"] += 1
+
+    def watch_report() -> Dict[str, Any]:
+        """Counts for the run record: watched pages per interval bucket, how many have re-reads to estimate from, how many
+        are read more or less often than nominated, and their estimated changes per day (10th, 50th, 90th percentile)."""
+        plans = [(w, *revisit(w)) for w in watch]
+        rates = sorted(rate * 24 for w, _, rate in plans if (watch_times.get(w["url"]) or {}).get("reads"))
+        lows = (0,) + tuple(hi for _, hi in WATCH_BUCKETS[:-1])
+        return {"watch_intervals": {label: sum(lo <= hours < hi for _, hours, _ in plans) for (label, hi), lo in zip(WATCH_BUCKETS, lows)},
+                "watch_with_history": len(rates),
+                "watch_sooner": sum(hours < w["every_hours"] for w, hours, _ in plans),
+                "watch_later": sum(hours > w["every_hours"] for w, hours, _ in plans),
+                "watch_changes_per_day": {f"p{q}": round(rates[min(len(rates) - 1, len(rates) * q // 100)], 4) for q in (10, 50, 90)}
+                if rates else None}
 
     async def worker() -> None:
         nonlocal stopped_by
@@ -2201,7 +2253,7 @@ async def crawl(
             "seed_patterns_ignored": sum(seed.patterns_ignored for seed in seeds),
             "seeds_at_allowance": sorted(seed.id for seed in seeds if seed.allowance is not None and frontier.stored(seed.id) >= seed.allowance),
             "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread, **read,
-            "watch_entries": len(watch), "watch_due": len(due), **watched,
+            "watch_entries": len(watch), "watch_due": len(due), **watched, **watch_report(),
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
             "workers": engine.concurrency, "peak_in_flight": counts["peak_in_flight"], "jev_abandoned": abandoned,
