@@ -113,7 +113,7 @@ Derived clients' list pages may name detail pages to follow (derived.py); add_fo
 Watched pages (crawl's watch, from config/watch.json) are fetched before any ranked take when due, outside the queue,
 up to WATCH_SHARE of the run's fetches; a changed one's new links are queued as links of its site's line. A page is due
 revisit_hours() after it was last served: an interval that follows its own change rate, estimated from its re-reads that
-showed changed or unchanged, with its nominated every_hours as the prior.
+showed changed (new links queued) or unchanged, with its nominated every_hours as the prior.
 
 Per-seed bounds (bound()). Under scope "source" a seed queues only URLs on its own registered domains (its urls' and its
 sites'): a link off them is kept in the links table, counted (links_out_of_scope) and never queued, so it starts no line;
@@ -2096,15 +2096,7 @@ async def crawl(
             watched["watch_fetched"] += 1
             content = row["outcome"] in ("stored", "duplicate") and not row["block_marker"]
             watched["watch_changed" if content else "watch_unchanged" if row["outcome"] == "unchanged" else "watch_failed"] += 1
-            if row["outcome"] != "error":
-                k = watch_times.setdefault(w["url"], {"seen": None, "reads": 0, "changes": 0, "hours": 0.0})
-                k["last"] = now()
-                if content or row["outcome"] == "unchanged":   # what the change rate is estimated from
-                    if k["seen"] is not None and now() > k["seen"]:
-                        k["reads"] += 1
-                        k["changes"] += content
-                        k["hours"] += (now() - k["seen"]).total_seconds() / 3600
-                    k["seen"] = now()
+            queued = None
             if line is not None:
                 # As if it were a page of its site's line, at its start: new links on it are queued, known ones are not.
                 as_entry = {"url": w["url"], "host": host, "seed_id": seed_id, "line_id": line["line_id"], "crossing": False, "hops": 0,
@@ -2113,6 +2105,16 @@ async def crawl(
                 queued = frontier.add_links(as_entry, row, None, now())
                 watched["watch_links_queued"] += queued
                 links_added += queued
+            if row["outcome"] != "error":
+                k = watch_times.setdefault(w["url"], {"seen": None, "reads": 0, "changes": 0, "hours": 0.0})
+                k["last"] = now()
+                if content or row["outcome"] == "unchanged":   # what the change rate is estimated from
+                    if k["seen"] is not None and now() > k["seen"]:
+                        k["reads"] += 1
+                        # a change is new links (rotating tokens and dates change the bytes of most pages); no line: new bytes
+                        k["changes"] += content and (queued is None or queued > 0)
+                        k["hours"] += (now() - k["seen"]).total_seconds() / 3600
+                    k["seen"] = now()
             if engine.sampled(row):
                 spawn_judge(row, watch_tally)
         except Exception:
