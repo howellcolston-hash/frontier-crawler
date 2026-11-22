@@ -32,7 +32,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: jobs   # one run at a time: runs write the same private branch
+  # one run at a time: runs write the same private branch. Model jobs (graph; distil bakeoff, drift, export, textfix, score,
+  # evaluate) write only their own files, so they queue in a lane of their own and long ones do not hold the daily chain
+  group: ${{ (inputs.job == 'graph' || (inputs.job == 'module' && (startsWith(inputs.command, 'distil bakeoff') || startsWith(inputs.command, 'distil drift')
+    || startsWith(inputs.command, 'distil export') || startsWith(inputs.command, 'distil textfix') || startsWith(inputs.command, 'distil score')
+    || startsWith(inputs.command, 'distil evaluate')))) && 'jobs-models' || 'jobs' }}
   cancel-in-progress: false
   queue: max
 env:
