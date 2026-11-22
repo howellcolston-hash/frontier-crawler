@@ -5,8 +5,8 @@ name: jobs
 run-name: "jobs ${{ inputs.job || 'scheduled' }}"
 on:
   schedule:
-    - cron: "23 4 * * *"    # engine-sync
-    - cron: "51 4 * * *"    # collection
+    - cron: "23 19 * * *"   # engine-sync with the digest, and collection: the morning pair, set the evening before
+    - cron: "51 19 * * *"   # because GitHub starts these scheduled runs hours late
     - cron: "17 10 * * *"   # collect-daily, then demand
     - cron: "47 11 * * *"   # scout
     - cron: "41 13 * * *"   # raw-checks
@@ -15,7 +15,7 @@ on:
     inputs:
       job:
         type: choice
-        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph]   # graph: by hand only
+        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph, module]   # graph, module: by hand only
         default: collection
       command:
         description: "the job's command (empty: its default)"
@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: false
   queue: max
 env:
-  JOB: ${{ inputs.job || (github.event.schedule == '51 4 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || 'engine-sync' }}
+  JOB: ${{ inputs.job || (github.event.schedule == '51 19 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || 'engine-sync' }}
 jobs:
   collect:
     if: ${{ inputs.job == 'collect-daily' || github.event.schedule == '17 10 * * *' }}
@@ -59,12 +59,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: Run
+        id: run
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
           INDEX: ${{ matrix.i }}
         working-directory: hd
         run: bash scripts/bridge.sh "$JOB" $INDEX >"$RUNNER_TEMP/out.log" 2>&1
+      - name: Keep the log privately
+        if: always()
+        env:
+          TOKEN: ${{ secrets.HORIZON_DATA_TOKEN }}
+          INDEX: ${{ matrix.i }}
+          OUTCOME: ${{ steps.run.outcome }}
+        working-directory: hd
+        run: bash scripts/bridge_log.sh "$RUNNER_TEMP/out.log" 2>/dev/null || true   # prints only the HTTP status
 
   run:
     needs: collect
