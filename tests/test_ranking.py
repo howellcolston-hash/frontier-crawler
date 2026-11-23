@@ -147,7 +147,7 @@ def test_the_bandit_rule_keeps_the_safeguards() -> None:
     for _ in range(3):
         frontier.mark(frontier.take(seeds, NOW.date()), {"outcome": "error"}, None, NOW)
     assert frontier.cooled == {"a.test"} and frontier.take(seeds, NOW.date()) is None   # three errors in a row: left alone
-    assert frontier.count("queued") == 2 + 7 + 1 and len(frontier._in_flight) == 0   # a.test keeps its other two; b and off all theirs
+    assert frontier.count("queued") == 2 + 7 and len(frontier._in_flight) == 0   # a.test keeps its other two; b all its; off, inactive, queued none
 
 
 def test_temperature_scales_how_far_a_draw_strays_from_the_estimate() -> None:
