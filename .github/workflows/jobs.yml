@@ -11,11 +11,12 @@ on:
     - cron: "47 11 * * *"   # scout
     - cron: "41 13 * * *"   # raw-checks
     - cron: "23 16 * * *"   # engine-sync
+    - cron: "37 3 * * *"    # long
   workflow_dispatch:
     inputs:
       job:
         type: choice
-        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph, module]   # graph, module: by hand only
+        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph, module, long]   # graph, module: by hand only; long: by hand or its own schedule
         default: collection
       command:
         description: "the job's command (empty: its default)"
@@ -29,18 +30,22 @@ on:
         default: ""
       max:
         default: "10"
+      budget:
+        description: "long: seconds (empty: its default)"
+        default: ""
 permissions:
   contents: read
 concurrency:
   # one run at a time: runs write the same private branch. Model jobs (graph; distil bakeoff, drift, export, textfix, score,
   # evaluate) write only their own files, so they queue in a lane of their own and long ones do not hold the daily chain
-  group: ${{ (inputs.job == 'graph' || (inputs.job == 'module' && (startsWith(inputs.command, 'distil bakeoff') || startsWith(inputs.command, 'distil drift')
+  # long writes only its own files too and has a lane of its own
+  group: ${{ ((inputs.job == 'long' || github.event.schedule == '37 3 * * *') && 'jobs-long') || (inputs.job == 'graph' || (inputs.job == 'module' && (startsWith(inputs.command, 'distil bakeoff') || startsWith(inputs.command, 'distil drift')
     || startsWith(inputs.command, 'distil export') || startsWith(inputs.command, 'distil textfix') || startsWith(inputs.command, 'distil score')
     || startsWith(inputs.command, 'distil evaluate')))) && 'jobs-models' || 'jobs' }}
   cancel-in-progress: false
   queue: max
 env:
-  JOB: ${{ inputs.job || (github.event.schedule == '51 19 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || 'engine-sync' }}
+  JOB: ${{ inputs.job || (github.event.schedule == '51 19 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || (github.event.schedule == '37 3 * * *' && 'long') || 'engine-sync' }}
 jobs:
   collect:
     if: ${{ inputs.job == 'collect-daily' || github.event.schedule == '17 10 * * *' }}
