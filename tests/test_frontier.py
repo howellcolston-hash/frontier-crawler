@@ -1505,3 +1505,40 @@ def test_a_document_off_the_fence_found_on_a_seeds_page_is_queued_in_that_line_a
     assert frontier.stored("s") == stored + 1 and frontier.line("s")["content"] == 2   # counts toward the seed like any page
     frontier.add_links(doc, _page_row(doc["url"], '<a href="https://files.example.net/r/2.pdf">2</a> <a href="https://www.example.com/q">q</a>'), None, NOW)
     assert not frontier._known("https://files.example.net/r/2.pdf") and frontier.documents_off_site == 1   # it leads nowhere
+
+
+def test_a_retired_seed_does_not_keep_a_starting_url_an_active_seed_lists(tmp_path: Path) -> None:
+    site = FakeSite({"https://a.test/": '<a href="/p">p</a>', "https://a.test/p": ""})
+    store = LocalStore(tmp_path / "store")
+
+    def go(run: str, seeds: List[Seed]) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=10, now=lambda: NOW, scope="source", run_share=None))
+
+    assert go("r1", [_seed("old", "https://a.test/")])["stored_by_seed"] == {"old": 2}
+    # The old seed is retired and a new one lists its starting URL: the new seed fetches it as its own start.
+    second = go("r2", [_seed("old", "https://a.test/", until=NOW.date() - dt.timedelta(days=1)), _seed("new", "https://a.test/")])
+    assert site.fetched[2:] == ["https://a.test/"] and second["stored_by_seed"] == {"old": 0, "new": 1}
+    assert second["seed_urls_reread"] == 1 and second["seeds_with_nothing"] == []
+    assert second["links_known"] == 1   # /p was fetched under the old seed
+
+
+def test_a_line_whose_seed_is_inactive_captures_no_links_or_sitemap_urls() -> None:
+    frontier = Frontier()
+    old = Seed(id="old", entity="old", urls=("https://www.example.com/", "https://x.example.com/"))
+    frontier.add_seeds([old], NOW)   # the old seed's lines cover www.example.com and x.example.com
+    seeds = [dataclasses.replace(old, until=NOW.date() - dt.timedelta(days=1)), _seed("new", "https://www.example.com/n")]
+    frontier.add_seeds(seeds, NOW)
+    start = frontier.take(seeds, NOW.date())
+    assert start["url"] == "https://www.example.com/n"
+    row = _page_row(start["url"], '<a href="/fresh">fresh</a> <a href="https://x.example.com/q">q</a> <a href="/">root</a>')
+    frontier.mark(start, row, None, NOW)
+    assert frontier.add_links(start, row, None, NOW) == 2 and frontier.links_known == 1   # the root is known
+    shape = lambda url: (lambda e: (e["seed_id"], e["line_id"], e["hops"], e["crossing"]))(frontier.entry(url))
+    assert shape("https://www.example.com/fresh") == ("new", "new", 1, False)
+    assert shape("https://x.example.com/q") == ("new", "new", 1, True)   # a site of its own, not the old seed's line
+    assert frontier.add_sitemap("www.example.com", [("https://x.example.com/sm", ""), ("https://www.example.com/sm", "")], NOW) == 2
+    assert shape("https://x.example.com/sm")[:2] == shape("https://www.example.com/sm")[:2] == ("new", "new")
+    q = frontier.entry("https://x.example.com/q")
+    frontier.mark(q, _content(q["url"]), None, NOW)   # its site pays: a line of the new seed, not the old seed's
+    assert q["line_id"] == "new:x.example.com" and frontier.line("new:x.example.com")["seed_id"] == "new"

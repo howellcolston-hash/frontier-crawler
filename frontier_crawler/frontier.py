@@ -6,6 +6,9 @@ site that another line reached and found content on. Lines multiply as the crawl
 new sites, each with its own counters, and each one ends when it stops paying. A seed's starting
 URL is fetched as its start even if another line queued or fetched it before: once, read as new
 (not unchanged) so its links start the seed's line; then as any starting URL (seed_urls_reread).
+An inactive seed (past its until, or weight 0) owns nothing: an active seed listing one of its starting URLs takes it over,
+and a host its lines cover counts as covered by no line, so an active seed's links and sitemap URLs there start or join
+the active seed's own lines instead of waiting, never taken, under the inactive one.
 
 Branching. A link to a site that no line covers (a crossing) is queued under the line that found
 it. If fetching it yields content, that site becomes a new line and the parent line carries on.
@@ -509,6 +512,7 @@ class Frontier:
                 n = min(max(float(line.get("fetches") or 0), ARM_PRIOR), ARM_WINDOW)
                 line.update(arm_alpha=line["yield"] * n, arm_beta=(1.0 - line["yield"]) * n, arm_at=line.get("created_at"))
         self._host_line: Dict[str, str] = {}
+        self._active: Optional[set] = None   # the seeds active in this run, set by add_seeds(); None: every seed
         self._queued_per_host: Dict[str, int] = {}
         # The queue, ranked by group: see select(). The heaps are built by the first select() or take(), which bring the seed weights.
         self._groups: Dict[Tuple[str, str, str], _Group] = {}
@@ -536,6 +540,7 @@ class Frontier:
         self._groups_by_seed: Dict[str, List[_Group]] = {}
         self.links_out_of_scope = 0                  # links not queued for the fence, in this run
         self.links_off_pattern = 0                   # links not queued for a seed's allow or deny patterns
+        self.links_known = 0                         # links on stored pages not queued because the queue knew them
         self.documents_off_site = 0                  # documents off a seed's sites queued from its pages, in this run
         self._aside: Dict[str, Dict[str, Any]] = {}  # queued entries a take found outside the fence: kept queued, off the heaps
         self._heap: List[Tuple[float, str, int, _Group]] = []  # (-score, url, version, group) of each group's best entry
@@ -904,10 +909,16 @@ class Frontier:
             self.lifts += 1
             self.lines_lifted.add(line_id)
 
+    def _cover(self, host: str) -> Optional[str]:
+        """The line covering host, unless its seed is inactive: then none, so an active seed's pages can start or join one."""
+        line_id = self._host_line.get(host)
+        line = self._lines.get(line_id or "")
+        return None if line is not None and self._active is not None and line["seed_id"] not in self._active else line_id
+
     def _spawn(self, entry: Dict[str, Any], now: dt.datetime) -> None:
         """A crossing link yielded content: its site becomes a line, and the queued links to that site move into it."""
         host = entry["host"]
-        line_id = self._host_line.get(host)
+        line_id = self._cover(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
             self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now, entry["base"])
@@ -974,10 +985,13 @@ class Frontier:
         """Queue the seeds' starting URLs not yet fetched as theirs, and again those whose own fetch served nothing. One the
         queue knows from another line (queued there, or fetched however long ago) becomes the seed's start all the same and
         is fetched once for it, read as new (Target.fresh) so its links start the seed's line. An active seed's starting
-        group is loaded from disk first, so its starting URLs are ranked in this run and found there."""
+        group is loaded from disk first, so its starting URLs are ranked in this run and found there. An inactive seed owns
+        nothing: neither its starting URLs nor, through its lines, any host (_cover)."""
+        seeds = [seed for seed in seeds if seed.active(now.date())]
+        self._active = {seed.id for seed in seeds}
         heated: set = set()
         if self._loc:
-            starts = {(seed.id, urlsplit(url).netloc, seed.id) for seed in seeds if seed.active(now.date()) for url in seed.urls}
+            starts = {(seed.id, urlsplit(url).netloc, seed.id) for seed in seeds for url in seed.urls}
             heated = {key for key in starts if self.factor(key[1]) > 0}
             cold = [self._group(dict(zip(("line_id", "host", "seed_id"), key))) for key in sorted(heated)]
             cold = [group for group in cold if not group.hot]
@@ -1007,7 +1021,8 @@ class Frontier:
                 host = urlsplit(url).netloc
                 if known is None and not self._known(url):
                     if self._add(url, seed.id, seed.id, 0, 1.0, now):
-                        self._host_line.setdefault(host, seed.id)
+                        if self._cover(host) is None:
+                            self._host_line[host] = seed.id
                         added += 1
                     continue
                 # Known from another line, or only as a key in the seen set. An inactive or held seed's group is not loaded,
@@ -1028,7 +1043,8 @@ class Frontier:
                 })
                 self._inserted -= 1   # known already
                 self._queued_per_host[host] = self._queued_per_host.get(host, 0) + 1
-                self._host_line.setdefault(host, seed.id)
+                if self._cover(host) is None:
+                    self._host_line[host] = seed.id
                 self.seed_urls_reread += 1
         return added
 
@@ -1039,8 +1055,8 @@ class Frontier:
         for url in (url for seed in seeds if seed.active(today) for url in seed.urls):
             parts = urlsplit(url)
             sites.setdefault(parts.netloc, f"{parts.scheme}://{parts.netloc}")
-        for host, line_id in self._host_line.items():
-            if self.factor(host) > 1 and not self._fenced(self._lines.get(line_id, {}).get("seed_id", ""), host):
+        for host, line_id in ((host, self._cover(host)) for host in self._host_line):
+            if line_id and self.factor(host) > 1 and not self._fenced(self._lines.get(line_id, {}).get("seed_id", ""), host):
                 sites.setdefault(host, f"https://{host}")   # shortcut: https assumed; an http-only site fails and is counted
         return {host: origin for host, origin in sorted(sites.items()) if self.factor(host) > 0
                 and (host not in self.sitemap_read or now - self.sitemap_read[host] >= SITEMAP_EVERY)}
@@ -1055,7 +1071,7 @@ class Frontier:
             if added >= SITEMAP_MAX_URLS:
                 break
             url_host = urlsplit(url).netloc
-            line_id = self._host_line.get(url_host) or self._host_line.get(host)
+            line_id = self._cover(url_host) or self._cover(host)
             if line_id is not None and registered_domain(url_host) == domain:
                 added += self._add(url, self._lines[line_id]["seed_id"], line_id, 1, DEFAULT_LINK_BASE, now)
         return added
@@ -1066,7 +1082,7 @@ class Frontier:
         to join is not queued."""
         added = 0
         for url in urls:
-            line_id = seed_id if seed_id in self._lines else self._host_line.get(urlsplit(url).netloc)
+            line_id = seed_id if seed_id in self._lines else self._cover(urlsplit(url).netloc)
             if line_id is not None:
                 added += self._add(url, self._lines[line_id]["seed_id"], line_id, 1, DEFAULT_LINK_BASE, now)
         return added
@@ -1090,11 +1106,12 @@ class Frontier:
                 self.skipped["unparseable_link"] += 1
         for url, anchor in links:
             host = urlsplit(url).netloc
-            covering = self._host_line.get(host)
+            covering = self._cover(host)
             # A link into another line's site, queued, fetched or new: the host map knows its line either way.
             if covering is not None and covering != own_line:
                 self._note_inbound(covering, own_line)
             if self._known(url):
+                self.links_known += 1
                 continue
             # A record file a page of the seed's own sites links on another host (a CDN): queued in the page's line, so it
             # starts no line; its own links are fenced, since its host is off the sites.
@@ -1320,7 +1337,7 @@ class Frontier:
                 row[name] = sys.intern(row[name])
             row["seq"] = self._seq
             self._seq += 1
-            line = self._lines.get(self._host_line.get(row["host"], ""))
+            line = self._lines.get(self._cover(row["host"]) or "")
             if row.get("crossing") and line and line.get("parent_line") and line["created_at"] >= (row["discovered_at"] or line["created_at"]):
                 row.update(line_id=line["line_id"], crossing=False, hops=1)   # its site became a line since: moved as _spawn moves
             self._entries[row["url"]] = row
@@ -2089,7 +2106,7 @@ async def crawl(
         nonlocal links_added
         try:
             host = urlsplit(w["url"]).netloc
-            line = frontier.line(frontier._host_line.get(host) or "")
+            line = frontier.line(frontier._cover(host) or "")
             seed_id = line["seed_id"] if line else ""
             entity = by_id[seed_id].entity if seed_id in by_id else ""
             row = await engine.fetch(Target(w["url"], entity, seed_id, f"watch:{w['id']}"))
@@ -2251,7 +2268,7 @@ async def crawl(
             # The per-seed bounds: links the fence or a seed's patterns kept out of the queue (a link on several pages
             # counts once a page), malformed patterns ignored, and seeds that have stored their allowance.
             "scope": scope, "links_out_of_scope": frontier.links_out_of_scope, "links_off_pattern": frontier.links_off_pattern,
-            "documents_off_site": frontier.documents_off_site,
+            "documents_off_site": frontier.documents_off_site, "links_known": frontier.links_known,
             "seed_patterns_ignored": sum(seed.patterns_ignored for seed in seeds),
             "seeds_at_allowance": sorted(seed.id for seed in seeds if seed.allowance is not None and frontier.stored(seed.id) >= seed.allowance),
             "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread, **read,
@@ -2283,8 +2300,8 @@ async def crawl(
             # A seed here has been fetched, in this run or an earlier one, and has never stored
             # anything: a dead or blocked starting URL.
             "seeds_with_nothing": sorted(
-                seed.id for seed in seeds
-                if (frontier.line(seed.id) or {}).get("fetches", 0) > 0 and frontier.line(seed.id)["content"] == 0
+                seed.id for seed in seeds if seed.active(now().date())
+                and (frontier.line(seed.id) or {}).get("fetches", 0) > 0 and frontier.line(seed.id)["content"] == 0
             ),
         }
     )
