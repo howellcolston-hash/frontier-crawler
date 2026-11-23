@@ -921,9 +921,10 @@ class Frontier:
         line_id = self._cover(host)
         if line_id is None:
             line_id = f"{entry['seed_id']}:{host}"
-            self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now, entry["base"])
+            if line_id not in self._lines:   # the seed's own line there, kept while another seed covered the site: reused
+                self._new_line(line_id, entry["seed_id"], self._lines[entry["line_id"]], entry["url"], now, entry["base"])
+                self.spawned += 1
             self._host_line[host] = line_id
-            self.spawned += 1
         self._move(entry, line_id, 0)
         for other in self._crossing.pop(host, ()):
             if other is not entry:
@@ -1007,6 +1008,8 @@ class Frontier:
                 known = self._entries.get(url)
                 # A seed's own start, or one of another seed that still lists the URL (so two seeds never take it in turns).
                 if known is not None and is_start(known) and known["seed_id"] in owners[url]:
+                    if self._cover(known["host"]) is None:   # its host was an inactive seed's: claimed, so its links are its own
+                        self._host_line[known["host"]] = known["seed_id"]
                     # A starting URL whose own fetch served nothing (or a thin page) is tried again each run, whatever the rest of
                     # its seed found: the failure may have been temporary, and the run summary then shows the reason.
                     # One fetched before the record existed (null) is tried once more, to find out.

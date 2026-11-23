@@ -1542,3 +1542,36 @@ def test_a_line_whose_seed_is_inactive_captures_no_links_or_sitemap_urls() -> No
     q = frontier.entry("https://x.example.com/q")
     frontier.mark(q, _content(q["url"]), None, NOW)   # its site pays: a line of the new seed, not the old seed's
     assert q["line_id"] == "new:x.example.com" and frontier.line("new:x.example.com")["seed_id"] == "new"
+
+
+def test_a_seed_back_from_a_pause_crosses_into_its_old_line_again_and_keeps_its_count() -> None:
+    frontier = Frontier()
+    s, t = _seed("s", "https://www.example.com/"), _seed("t", "https://www.example.net/")
+    off = NOW.date() - dt.timedelta(days=1)
+
+    def cross(seeds: List[Seed], seed: Seed, url: str) -> None:
+        frontier.add_seeds(seeds, NOW)
+        page = frontier.entry(seed.urls[0])
+        row = _page_row(page["url"], f'<a href="{url}">h</a>')
+        frontier.add_links(page, row, None, NOW)
+        frontier.mark(frontier.entry(url), _content(url), None, NOW)   # the crossing pays
+
+    cross([s], s, "https://h.example.org/a")
+    cross([dataclasses.replace(s, until=off), t], t, "https://h.example.org/b")   # s paused: t gets a line of its own there
+    assert frontier.line("t:h.example.org")["seed_id"] == "t"
+    cross([s, dataclasses.replace(t, until=off)], s, "https://h.example.org/c")   # s back, t paused: s's line, not a new one
+    assert frontier.line("s:h.example.org")["content"] == 2 and frontier.spawned == 2
+    assert frontier.stored("s") == sum(line["content"] for line in frontier._lines.values() if line["seed_id"] == "s")
+
+
+def test_an_active_seed_claims_its_own_starts_host_from_an_inactive_seeds_line() -> None:
+    frontier = Frontier()
+    old, s = _seed("old", "https://www.example.com/"), _seed("s", "https://www.example.com/s")
+    frontier.add_seeds([old, s], NOW)   # old's line covers the host first
+    for url in ("https://www.example.com/", "https://www.example.com/s"):
+        frontier.mark(frontier.entry(url), _page_row(url, ""), None, NOW)
+    frontier.add_seeds([dataclasses.replace(old, until=NOW.date() - dt.timedelta(days=1)), s], NOW)   # s's start is its own
+    page = frontier.entry("https://www.example.com/s")
+    frontier.add_links(page, _page_row(page["url"], '<a href="/x">x</a>'), None, NOW)
+    x = frontier.entry("https://www.example.com/x")
+    assert (x["seed_id"], x["line_id"], x["hops"], x["crossing"]) == ("s", "s", 1, False)   # its own site, not a crossing
