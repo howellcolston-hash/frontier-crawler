@@ -1,22 +1,16 @@
-# Runs jobs from a private repository on this repository's runners, by schedule or by hand. Each run checks the
+# Runs jobs from a private repository on this repository's runners, when the clock (clock.yml) or a person or session dispatches them. Each run checks the
 # private repository out and runs one of its own scripts there. The log shows step results only: every command's
 # output goes to a file on the runner that is neither printed nor uploaded. Nothing here runs for pull requests.
 name: jobs
-run-name: "jobs ${{ inputs.job || 'scheduled' }}"
+# the title is public: it names the command only for the clock's three, never free text (a module's arguments)
+run-name: "jobs ${{ inputs.job }} ${{ (inputs.command == 'daily' || inputs.command == 'digest' || inputs.command == 'sync') && inputs.command || '' }}"
 on:
-  schedule:
-    - cron: "23 19 * * *"   # engine-sync with the digest, and collection: the morning pair, set the evening before
-    - cron: "51 19 * * *"   # because GitHub starts these scheduled runs hours late
-    - cron: "17 10 * * *"   # collect-daily, then demand
-    - cron: "47 11 * * *"   # scout
-    - cron: "41 13 * * *"   # raw-checks
-    - cron: "23 16 * * *"   # engine-sync
-    - cron: "37 3 * * *"    # long
+  # the daily runs are started by the clock (clock.yml, tools/clock.py), which dispatches them on time
   workflow_dispatch:
     inputs:
       job:
         type: choice
-        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph, module, long]   # graph, module: by hand only; long: by hand or its own schedule
+        options: [collection, engine-sync, scout, demand, collect-daily, raw-checks, local, graph, module, long]   # graph, module: by hand only
         default: collection
       command:
         description: "the job's command (empty: its default)"
@@ -39,16 +33,16 @@ concurrency:
   # one run at a time: runs write the same private branch. Model jobs (graph; distil bakeoff, drift, export, textfix, score,
   # evaluate) write only their own files, so they queue in a lane of their own and long ones do not hold the daily chain
   # long writes only its own files too and has a lane of its own
-  group: ${{ ((inputs.job == 'long' || github.event.schedule == '37 3 * * *') && 'jobs-long') || (inputs.job == 'graph' || (inputs.job == 'module' && (startsWith(inputs.command, 'distil bakeoff') || startsWith(inputs.command, 'distil drift')
+  group: ${{ (inputs.job == 'long' && 'jobs-long') || (inputs.job == 'graph' || (inputs.job == 'module' && (startsWith(inputs.command, 'distil bakeoff') || startsWith(inputs.command, 'distil drift')
     || startsWith(inputs.command, 'distil export') || startsWith(inputs.command, 'distil textfix') || startsWith(inputs.command, 'distil score')
     || startsWith(inputs.command, 'distil evaluate')))) && 'jobs-models' || 'jobs' }}
   cancel-in-progress: false
   queue: max
 env:
-  JOB: ${{ inputs.job || (github.event.schedule == '51 19 * * *' && 'collection') || (github.event.schedule == '17 10 * * *' && 'collect-daily') || (github.event.schedule == '47 11 * * *' && 'scout') || (github.event.schedule == '41 13 * * *' && 'raw-checks') || (github.event.schedule == '37 3 * * *' && 'long') || 'engine-sync' }}
+  JOB: ${{ inputs.job }}
 jobs:
   collect:
-    if: ${{ inputs.job == 'collect-daily' || github.event.schedule == '17 10 * * *' }}
+    if: ${{ inputs.job == 'collect-daily' }}
     strategy:
       fail-fast: false
       max-parallel: 1   # one collector at a time: each pushes the data branch, and the concurrency group does not serialize jobs within a run
