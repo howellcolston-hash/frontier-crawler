@@ -1,0 +1,25 @@
+# Starts the daily runs of crawl.yml and jobs.yml on time (tools/clock.py): GitHub starts scheduled runs here hours
+# late and drops some, dispatched runs start at once. One clock runs at a time; each dispatches the next before its
+# job limit. The schedule below only restarts a clock that stopped; a restart queues behind a running clock.
+name: clock
+on:
+  schedule:
+    - cron: "11 */2 * * *"
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+concurrency:
+  group: clock
+  cancel-in-progress: false
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python tools/clock.py
+        env:
+          GH_TOKEN: ${{ github.token }}

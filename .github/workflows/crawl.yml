@@ -2,11 +2,9 @@
 # for 85 minutes, scanned PDFs read once a day, the derived clients once a day, or any of them by hand. Nothing here runs for pull
 # requests. The log carries counts only.
 name: crawl
+run-name: "crawl ${{ inputs.command || 'crawl' }}"
 on:
-  schedule:
-    - cron: "17 0,6,12,18 * * *"
-    - cron: "47 3 * * *"   # ocr, between two crawls
-    - cron: "47 9 * * *"   # derived, between two crawls
+  # started by the clock (clock.yml, tools/clock.py): crawls at 00:17, 06:17, 12:17 and 18:17 UTC, ocr 03:47, derived 09:47
   workflow_dispatch:
     inputs:
       command:
@@ -31,7 +29,7 @@ jobs:
       JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
       CRAWLER_JEV_MONTHLY_USD: "20"   # PROVISIONAL: monthly ceiling for the judge, accrued through the month
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
-      COMMAND: ${{ inputs.command || (github.event.schedule == '47 3 * * *' && 'ocr') || (github.event.schedule == '47 9 * * *' && 'derived') || 'crawl' }}
+      COMMAND: ${{ inputs.command || 'crawl' }}
       MAX_MINUTES: ${{ inputs.max_minutes || '85' }}
     steps:
       - uses: actions/checkout@v4
