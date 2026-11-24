@@ -1,6 +1,6 @@
 """Parquet shards: the engine's tables. One file holds many rows, so file counts stay low.
 
-Six tables, each partitioned by the UTC day on which the fetching run started:
+Seven tables, each partitioned by the UTC day on which the fetching run started:
     fetches/           one row per fetch attempt, with where it came from, the content hash, the text, the title and join keys
                        (no title column before engine 0.4.0, no join_keys before 0.5.0: read columns by name)
     bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of); from engine
@@ -9,6 +9,8 @@ Six tables, each partitioned by the UTC day on which the fetching run started:
     ocr_text/          one row per scanned PDF read with Tesseract
     judgement_calls/   one row per Jev call about a fetched document
     judgements/        one row per answer in that call
+    encoder_scores/    one row per document the judge encoder scored (judge/encoder.py): those Jev did not judge, and an
+                       audit slice of those it did (from engine 0.10.0)
 A judgement is filed in the same day folder as its document's fetch row, not under the day it
 was asked, so "which documents of day D are still unjudged" needs only day D's folders.
 
@@ -27,7 +29,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.9.0"  # 0.9.0: an inactive seed owns no starting URL and no host, so an active seed fetches and follows them; 0.8.0: a derived client's JSON text read in its declared charset, a malformed Jev reply recorded as rejected; 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.10.0"  # 0.10.0: the judge encoder scores what Jev does not read; a retired seed's queued entries join the active seed covering their host; 0.9.0: an inactive seed owns no starting URL and no host, so an active seed fetches and follows them; 0.8.0: a derived client's JSON text read in its declared charset, a malformed Jev reply recorded as rejected; 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -138,6 +140,24 @@ OCR_SCHEMA = pa.schema(
         ("word_count", pa.int32()),
         # As in fetches, from the text read here. Absent from shards before engine 0.5.0.
         ("join_keys", pa.string()),
+    ]
+)
+
+# One row per document the judge encoder scored, filed like a judgement under its document's fetch day.
+ENCODER_SCHEMA = pa.schema(
+    [
+        ("fetch_id", pa.string()),
+        ("sha256", pa.string()),
+        ("run_id", pa.string()),
+        ("scored_at", _TS),
+        ("model", pa.string()),          # encoder-<the model's stamp>
+        ("excerpt_words", pa.int32()),
+        # JSON: {question id: probability} for yes/no questions, {question id: {"value", "probabilities"}} for the choice.
+        ("answers", pa.string()),
+        ("relevance", pa.float64()),
+        ("relevance_version", pa.string()),
+        # Jev's relevance when Jev judged the document too (the audit slice), else null.
+        ("jev_relevance", pa.float64()),
     ]
 )
 

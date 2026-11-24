@@ -11,3 +11,5 @@ pillow>=10  # page images for reading scanned PDFs
 huggingface_hub>=0.30
 playwright>=1.45
 pytest>=8
+onnxruntime>=1.20  # the judge encoder (frontier_crawler/judge/encoder.py), on the CPU; brings numpy (~15 MB wheel)
+tokenizers>=0.20  # the encoder's tokenizer.json, without transformers or torch
