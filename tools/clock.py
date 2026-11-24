@@ -84,7 +84,15 @@ def main() -> int:
     left = (end - dt.datetime.now(dt.timezone.utc)).total_seconds()
     if left > 0:
         time.sleep(left)
-    dispatch("clock.yml", {})  # the next clock; it waits in the clock group until this run ends
+    for attempt in range(5):  # the chain's one link: without it no clock runs until the schedule restarts one
+        try:
+            dispatch("clock.yml", {})  # the next clock; it waits in the clock group until this run ends
+            break
+        except subprocess.CalledProcessError:
+            time.sleep(60)
+    else:
+        print("next clock: dispatch failed")
+        return 1
     print("next clock dispatched")
     return 1 if fails else 0
 

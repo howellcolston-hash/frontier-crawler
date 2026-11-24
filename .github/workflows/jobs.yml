@@ -2,7 +2,8 @@
 # private repository out and runs one of its own scripts there. The log shows step results only: every command's
 # output goes to a file on the runner that is neither printed nor uploaded. Nothing here runs for pull requests.
 name: jobs
-run-name: "jobs ${{ inputs.job }} ${{ inputs.command }}"
+# the title is public: it names the command only for the clock's three, never free text (a module's arguments)
+run-name: "jobs ${{ inputs.job }} ${{ (inputs.command == 'daily' || inputs.command == 'digest' || inputs.command == 'sync') && inputs.command || '' }}"
 on:
   # the daily runs are started by the clock (clock.yml, tools/clock.py), which dispatches them on time
   workflow_dispatch:

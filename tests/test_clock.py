@@ -1,4 +1,5 @@
 import datetime as dt
+import pathlib
 
 from tools import clock
 
@@ -26,10 +27,15 @@ def test_grace_drops_stale_slots_and_wraps_midnight():
 
 
 def test_every_slot_has_a_title_the_workflows_produce():
+    wfs = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    assert "run-name: \"crawl ${{ inputs.command || 'crawl' }}\"" in (wfs / "crawl.yml").read_text()
+    assert ("run-name: \"jobs ${{ inputs.job }} ${{ (inputs.command == 'daily' || inputs.command == 'digest' || "
+            "inputs.command == 'sync') && inputs.command || '' }}\"") in (wfs / "jobs.yml").read_text()
     for hm, wf, title, inputs, grace in clock.SLOTS:
         dt.time.fromisoformat(hm)
         assert grace > 0
         if wf == "crawl.yml":
             assert title == f"crawl {inputs['command']}"
         else:
-            assert title == f"jobs {inputs['job']} {inputs.get('command', '')}"
+            shown = inputs.get("command", "") if inputs.get("command") in ("daily", "digest", "sync") else ""
+            assert title == f"jobs {inputs['job']} {shown}"
