@@ -9,7 +9,7 @@ reads Jev's answers reads the encoder's the same way; relevance comes from the c
 
 Input contract:
     encoder = load(store, workdir)          # raises when there is no model, or it was trained on other questions
-    result = encoder.ask(excerpt)           # blocking, CPU-bound: call it in a thread, one at a time
+    result = encoder.ask(excerpt)           # blocking, CPU-bound: call it in encoder.pool (low priority), one at a time
 onnxruntime and tokenizers are imported by load(), so a crawl without them runs as before.
 """
 
@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -26,6 +28,14 @@ from frontier_crawler.judge.jev import Answer, JevResult
 
 MODELS = "models/judge"
 BATCH_TOKENS = 8192  # PROVISIONAL: padded tokens per forward pass, as the bake-off embedded
+NICE = 10  # PROVISIONAL: the scoring threads' niceness (Linux), so fetching, parsing and the browser come first
+
+
+def _lower_priority() -> None:
+    # Linux niceness is per thread, and onnxruntime's pool threads, started by this one, inherit it. Elsewhere it would be
+    # the whole process's, so it is left alone.
+    if sys.platform == "linux":
+        os.nice(NICE)
 
 
 def windows(ids: List[int], head: List[int], prefix: List[int], tail: List[int], window: int, max_windows: int) -> List[List[int]]:
@@ -114,7 +124,16 @@ def load(store: Any, workdir: Path) -> Encoder:
     folder = Path(workdir) / "model" / stamps[-1]
     for remote in store.list(f"{MODELS}/{stamps[-1]}"):
         store.get(remote, folder / remote.split(f"{stamps[-1]}/", 1)[1])
-    return Encoder(folder, json.loads((folder / "manifest.json").read_text(encoding="utf-8")))
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    # One low-priority thread builds the session (its pool threads inherit the priority) and runs every ask().
+    pool = ThreadPoolExecutor(1, thread_name_prefix="encoder", initializer=_lower_priority)
+    try:
+        encoder = pool.submit(Encoder, folder, manifest).result()
+    except BaseException:
+        pool.shutdown(wait=False)
+        raise
+    encoder.pool = pool
+    return encoder
 
 
 def spearman(pairs: Sequence[Any]) -> Any:

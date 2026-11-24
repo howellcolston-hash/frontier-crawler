@@ -390,10 +390,11 @@ class Engine:
         # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
         return judgeable(row) and _in_share(row["sha256"], self._sample_rate)
 
-    async def judge(self, row: Dict[str, Any]) -> Optional[JevResult]:
-        """Jev's answers about a row from fetch(), or the encoder's where Jev does not judge it; None: neither did."""
+    async def judge(self, row: Dict[str, Any], jev_slots: Any = None) -> Optional[JevResult]:
+        """Jev's answers about a row from fetch(), or the encoder's where Jev does not judge it; None: neither did.
+        jev_slots, if given, bounds the Jev call alone (see _judge)."""
         if self.sampled(row):
-            return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+            return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document", jev_slots)
         if self._encoder is not None and judgeable(row):
             return await self._encode(row["fetch_id"], row["sha256"], row["text"], self._day, None)
         return None
@@ -510,10 +511,12 @@ class Engine:
 
     # ------------------------------------------------------------ judging
 
-    async def _judge(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str) -> Optional[JevResult]:
+    async def _judge(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str, jev_slots: Any = None) -> Optional[JevResult]:
         """Jev's answers about one document; the encoder's when Jev gives none, if it is on. The encoder also scores the audit
-        slice of what Jev judged. None when neither judged it."""
-        result = await self._ask_jev(fetch_id, sha256, text, day, reason)
+        slice of what Jev judged. None when neither judged it. jev_slots (a semaphore) is held for the Jev call only: a page
+        waiting in the encoder's queue must not keep Jev's other pages waiting."""
+        async with jev_slots or contextlib.nullcontext():
+            result = await self._ask_jev(fetch_id, sha256, text, day, reason)
         if self._encoder is not None and (result is None or _in_share(sha256, self._sample_rate * ENCODER_AUDIT_SHARE)):
             scored = await self._encode(fetch_id, sha256, text, day, result)
             return result or scored
@@ -529,7 +532,8 @@ class Engine:
                 if self._encoder is None:   # stopped while this one waited
                     return None
                 with timed(took, "seconds"):
-                    result = await asyncio.to_thread(self._encoder.ask, excerpt)
+                    # Its own low-priority thread when it has one (encoder.load), so fetching keeps its CPU.
+                    result = await asyncio.get_running_loop().run_in_executor(getattr(self._encoder, "pool", None), self._encoder.ask, excerpt)
         except Exception as exc:   # counts only: the message could quote the page
             self._encoder = None
             self.stats["encoder"]["stopped"] = f"{type(exc).__name__}; the encoder is off for the rest of this run"

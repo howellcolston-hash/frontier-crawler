@@ -2106,9 +2106,8 @@ async def crawl(
         """Phase 2, in its own task: the page's relevance and its links' scores."""
         answers = None
         try:
-            # JEV_SLOTS bounds Jev calls; the encoder takes one page at a time on its own, so its pages wait outside them.
-            async with jev_slots if engine.sampled(row) else contextlib.nullcontext():
-                answers = await engine.judge(row)
+            # JEV_SLOTS bounds Jev calls alone; the encoder takes one page at a time on its own, so its pages wait outside them.
+            answers = await engine.judge(row, jev_slots)
             if answers is not None:
                 tally["judged"] += 1
                 tally["relevance"] += judged_yield(answers)

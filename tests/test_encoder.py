@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -16,6 +19,7 @@ from frontier_crawler import frontier as frontier_module
 from frontier_crawler.__main__ import open_encoder
 from frontier_crawler.frontier import Seed, crawl
 from frontier_crawler.judge import questions as judging
+from frontier_crawler.judge import encoder as encoder_module
 from frontier_crawler.judge.encoder import Encoder, spearman, windows
 from frontier_crawler.judge.jev import Answer, JevClient, JevResult
 from frontier_crawler.pipeline import ENCODER_AUDIT_SHARE, Engine
@@ -97,6 +101,41 @@ def test_an_encoder_failure_turns_it_off_and_leaves_pages_as_before(tmp_path: Pa
     assert stub.calls == 1 and stats["stored"] == 5 and stats["encoder"]["scored"] == 0
     assert stats["encoder"]["stopped"].startswith("RuntimeError;") and "went wrong" not in stats["encoder"]["stopped"]
     assert _rows(tmp_path / "store", "encoder_scores") == []
+
+
+def test_a_page_waiting_for_the_encoder_holds_no_jev_slot(tmp_path: Path) -> None:
+    jev = _jev(lambda request: httpx.Response(200, json=_jev_body()))
+    engine = Engine(LocalStore(tmp_path / "store"), FakeCascade({}), workdir=tmp_path / "w", now=lambda: NOW, run_id="r1", jev=jev,
+                    monthly_usd=8, encoder=StubEncoder(), encoder_status="on")
+    sha = "0" * 64   # inside every share: Jev's sample and the audit slice
+
+    async def go() -> Any:
+        await engine.start()
+        slots = asyncio.Semaphore(1)
+        async with engine._encoder_lock:   # the encoder busy with other pages
+            task = asyncio.create_task(engine._judge("f1", sha, "some words here " * 50, NOW.date(), "new_document", slots))
+            for _ in range(500):
+                if engine._jev_calls:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            # Jev has answered; the audit waits for the encoder without the slot, so Jev's next page can go.
+            assert engine._jev_calls == 1 and not task.done() and not slots.locked()
+        return await task
+
+    result = asyncio.run(go())
+    assert result is not None and not result.model.startswith("encoder-") and engine.stats["encoder"]["audited"] == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="niceness is per thread on Linux only")
+def test_the_scoring_thread_runs_below_the_crawl(tmp_path: Path) -> None:
+    pool = ThreadPoolExecutor(1, initializer=encoder_module._lower_priority)
+    try:
+        mine = os.getpriority(os.PRIO_PROCESS, 0)
+        assert pool.submit(os.getpriority, os.PRIO_PROCESS, 0).result() == min(19, mine + encoder_module.NICE)
+        assert os.getpriority(os.PRIO_PROCESS, 0) == mine   # this thread, the event loop's, is untouched
+    finally:
+        pool.shutdown()
 
 
 def test_in_a_crawl_the_encoders_answers_move_the_lines_and_its_queue_waits_until_the_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
