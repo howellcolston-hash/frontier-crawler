@@ -10,10 +10,13 @@ A document Jev was not asked about (no key, the monthly ceiling reached, Jev una
 stays pending. When the budget cannot cover a run, run judges a sample of its documents, chosen
 by content hash, so the allowance is spread over the whole run; the rest are counted not_sampled.
 The questions' jev_sample, when set, caps that share for every document, backlog and scans included.
+With a judge encoder (judge/encoder.py) given, every judgeable document Jev does not judge (outside the sample, or left
+pending) is scored by the encoder instead, and so is an ENCODER_AUDIT_SHARE slice of those Jev does judge, so the two can be
+compared each run. Its answers come back as a JevResult, so callers read them as Jev's; rows go to encoder_scores.
 Judging can be re-run; fetching is never repeated for it.
 
 Input contract:
-    engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=...)
+    engine = Engine(store, fetcher, workdir=..., jev=..., monthly_usd=..., encoder=...)   # encoder: optional
     await engine.start()
     row = await engine.fetch(target)         # fetched, buffered and counted (row["links"]: see fetch); or, a batch at a time:
     answers = await engine.judge(row)        #   await engine.run(targets), which does both
@@ -46,10 +49,11 @@ from frontier_crawler.judge.excerpt import DEFAULT_MAX_WORDS, build_excerpt
 from frontier_crawler.judge.jev import PRICE_PER_MTOK_USD, JevClient, JevRejected, JevResult, JevUnavailable
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.questions import relevance
+from frontier_crawler.judge.encoder import spearman
 from frontier_crawler import ocr
 from frontier_crawler.joinkeys import join_keys
 from frontier_crawler.storage.shards import (
-    ANSWER_SCHEMA, BODY_SCHEMA, CALL_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, HEAVY_LEVEL, LINK_SCHEMA, OCR_SCHEMA, ShardWriter, bodies_of, day_folder,
+    ANSWER_SCHEMA, BODY_SCHEMA, CALL_SCHEMA, ENCODER_SCHEMA, ENGINE_VERSION, FETCH_SCHEMA, HEAVY_LEVEL, LINK_SCHEMA, OCR_SCHEMA, ShardWriter, bodies_of, day_folder,
 )
 from frontier_crawler.storage.state import BodyHashes, UrlState, load_spend, save_spend
 from frontier_crawler.storage.store import Store
@@ -85,6 +89,8 @@ _UPLOAD_EVERY_S = 600.0
 # What is kept of a stored PDF. text_only: a PDF whose text was read in full keeps its text in fetches and writes no body;
 # a scan (under ocr.SCAN_MAX_WORDS words) a PDF cut short by the reader's time limit or one with no text on many of its pages keeps its bytes. keep: every PDF keeps them.
 PDF_BODIES = ("text_only", "keep")
+# PROVISIONAL: the share of Jev's sample the encoder scores too, so its agreement with Jev is measured every run.
+ENCODER_AUDIT_SHARE = 0.1
 
 class Fetcher(Protocol):
     async def fetch(self, url: str) -> ScrapeResult: ...
@@ -155,6 +161,8 @@ class Engine:
         now: Callable[[], dt.datetime] = utc_now,
         run_id: Optional[str] = None,
         pdf_bodies: str = "text_only",
+        encoder: Any = None,
+        encoder_status: str = "off",
     ) -> None:
         if pdf_bodies not in PDF_BODIES:
             raise ValueError(f"pdf_bodies must be one of {PDF_BODIES}")
@@ -163,6 +171,9 @@ class Engine:
         self._fetcher = fetcher
         self._workdir = Path(workdir)
         self._jev = jev
+        self._encoder = encoder   # judge/encoder.Encoder, or None: pages Jev does not judge stay unjudged
+        self._encoder_lock = asyncio.Lock()   # one scoring at a time: each uses every core
+        self._audit: List[Tuple[float, float]] = []   # (Jev's relevance, the encoder's) on the audit slice
         self.concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._now = now
@@ -206,6 +217,10 @@ class Engine:
             "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
             "links_written": 0, "reader_crashes": 0, "reader_timeouts": 0,
             "pdf_bodies": pdf_bodies, "pdf_text_only": 0, "pdf_text_only_bytes": 0,
+            # The judge encoder: its model, or why it is off; pages it judged in Jev's place; pages both judged (the audit)
+            # and how well they agreed (filled in by finish()); the CPU seconds it took.
+            "encoder": {"status": encoder_status, "model": getattr(encoder, "stamp", None), "scored": 0, "audited": 0,
+                        "seconds_total": 0.0, "stopped": None},
         }
 
     async def start(self) -> None:
@@ -232,7 +247,7 @@ class Engine:
         key = (table, day)
         if key not in self._writers:
             schema = {"fetches": FETCH_SCHEMA, "bodies": BODY_SCHEMA, "links": LINK_SCHEMA, "judgement_calls": CALL_SCHEMA,
-                      "judgements": ANSWER_SCHEMA, "ocr_text": OCR_SCHEMA}[table]
+                      "judgements": ANSWER_SCHEMA, "ocr_text": OCR_SCHEMA, "encoder_scores": ENCODER_SCHEMA}[table]
             level = HEAVY_LEVEL if table in ("bodies", "links") else None
             self._writers[key] = ShardWriter(table, schema, self.run_id, day, self._workdir, level=level)
         return self._writers[key]
@@ -294,6 +309,8 @@ class Engine:
         counts = getattr(self._fetcher, "counts", {})
         calls, seconds = self._jev_calls, self._jev_spent["seconds"]
         slot = {**self._slot, **getattr(self._fetcher, "timings", {})}
+        enc = self.stats["encoder"]
+        pages = enc["scored"] + enc["audited"]
         self.stats.update(
             {
                 "slot_seconds": {key: round(value, 1) for key, value in sorted(slot.items())},
@@ -303,6 +320,10 @@ class Engine:
                 **{key: counts.get(key, 0) for key in ("browser_launches", "browser_pages", "browser_relaunches", "decoded_non_utf8")},
                 # Pages whose reader process died or hung: the fetcher's, and the OCR command's own.
                 **{key: self.stats[key] + counts.get(key, 0) for key in ("reader_crashes", "reader_timeouts")},
+                "encoder": {**enc, "seconds_total": round(enc["seconds_total"], 1),
+                            "seconds_mean": round(enc["seconds_total"] / pages, 3) if pages else None,
+                            "audit_mean_abs_diff": round(sum(abs(a - b) for a, b in self._audit) / len(self._audit), 4) if self._audit else None,
+                            "audit_spearman": spearman(self._audit)},
                 "jev": {"ceiling_usd_today": round(self._ceiling_tokens * PRICE_PER_MTOK_USD / 1_000_000, 4), "calls": calls,
                         "seconds_total": round(seconds, 1), "seconds_mean": round(seconds / calls, 3) if calls else 0.0},
                 # shortcut: ru_maxrss is KB on Linux only; macOS reports bytes
@@ -360,16 +381,22 @@ class Engine:
             return {**row, "links": links, "timed_out": True}
         return {**row, "links": links}
 
+    def will_judge(self, row: Dict[str, Any]) -> bool:
+        """Whether judge() will answer for this row: Jev's sample, or any judgeable row when the encoder is on."""
+        return self.sampled(row) or (self._encoder is not None and judgeable(row))
+
     def sampled(self, row: Dict[str, Any]) -> bool:
         """Whether judge() will ask Jev about this row: new readable content within the run's sample."""
         # Uniform by content hash: every line gets the same share of its pages read, and a rerun picks the same ones.
         return judgeable(row) and _in_share(row["sha256"], self._sample_rate)
 
     async def judge(self, row: Dict[str, Any]) -> Optional[JevResult]:
-        """Jev's answers about a row from fetch(), or None: not sampled, or left pending."""
-        if not self.sampled(row):
-            return None
-        return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+        """Jev's answers about a row from fetch(), or the encoder's where Jev does not judge it; None: neither did."""
+        if self.sampled(row):
+            return await self._judge(row["fetch_id"], row["sha256"], row["text"], self._day, "new_document")
+        if self._encoder is not None and judgeable(row):
+            return await self._encode(row["fetch_id"], row["sha256"], row["text"], self._day, None)
+        return None
 
     async def _fetch_row(self, target: Target, limits: Dict[str, float]) -> Tuple[Dict[str, Any], Optional[ScrapeResult], Any]:
         """(the row, what the fetcher returned: None when it raised, the page's links: see fetch)."""
@@ -484,6 +511,50 @@ class Engine:
     # ------------------------------------------------------------ judging
 
     async def _judge(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str) -> Optional[JevResult]:
+        """Jev's answers about one document; the encoder's when Jev gives none, if it is on. The encoder also scores the audit
+        slice of what Jev judged. None when neither judged it."""
+        result = await self._ask_jev(fetch_id, sha256, text, day, reason)
+        if self._encoder is not None and (result is None or _in_share(sha256, self._sample_rate * ENCODER_AUDIT_SHARE)):
+            scored = await self._encode(fetch_id, sha256, text, day, result)
+            return result or scored
+        return result
+
+    async def _encode(self, fetch_id: str, sha256: str, text: str, day: dt.date, jev: Optional[JevResult]) -> Optional[JevResult]:
+        """Score one document with the encoder on the excerpt Jev would read, and write the row. With jev given (the audit),
+        the pair is kept for the run's agreement figures. A failure turns the encoder off for the rest of the run."""
+        excerpt, _, words = build_excerpt(text, DEFAULT_MAX_WORDS)
+        took: Dict[str, float] = {}
+        try:
+            async with self._encoder_lock:
+                if self._encoder is None:   # stopped while this one waited
+                    return None
+                with timed(took, "seconds"):
+                    result = await asyncio.to_thread(self._encoder.ask, excerpt)
+        except Exception as exc:   # counts only: the message could quote the page
+            self._encoder = None
+            self.stats["encoder"]["stopped"] = f"{type(exc).__name__}; the encoder is off for the rest of this run"
+            logger.error("judge encoder failed (%s); off for the rest of this run", type(exc).__name__)
+            return None
+        mine = self.stats["encoder"]
+        mine["seconds_total"] += took["seconds"]
+        score = relevance(result.nouls())
+        theirs = relevance(jev.nouls()) if jev is not None else None
+        if jev is None:
+            mine["scored"] += 1
+        else:
+            mine["audited"] += 1
+            if score is not None and theirs is not None:
+                self._audit.append((theirs, score))
+        answers = {qid: a.value_number if a.question.type == "noul" else {"value": a.value_text, "probabilities": a.probabilities}
+                   for qid, a in result.answers.items()}
+        self._writer("encoder_scores", day).add({
+            "fetch_id": fetch_id, "sha256": sha256, "run_id": self.run_id, "scored_at": self._now(), "model": result.model,
+            "excerpt_words": words, "answers": json.dumps(answers, sort_keys=True), "relevance": score,
+            "relevance_version": judging.relevance_version(), "jev_relevance": theirs,
+        })
+        return result
+
+    async def _ask_jev(self, fetch_id: str, sha256: str, text: str, day: dt.date, reason: str) -> Optional[JevResult]:
         """Ask Jev about one document and write the call and its answers. None when it stays pending."""
         cap = judging.jev_sample()
         if cap is not None and not _in_share(sha256, cap):   # backlog and scans too; a crawl's sampled() already applied it

@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,6 +45,7 @@ from frontier_crawler.frontier import RANKING_MODES, SCOPES, Frontier, crawl, cr
 from frontier_crawler.harvester.readers import normalise
 from frontier_crawler.harvester.cascade import USER_AGENT, HarvesterCascade, _guard_request
 from frontier_crawler.harvester.throttle import HostThrottle
+from frontier_crawler.judge import encoder as judge_encoder
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
 from frontier_crawler.pipeline import PDF_BODIES, Engine, utc_now
@@ -75,6 +77,20 @@ def open_jev(http: httpx.AsyncClient) -> Optional[JevClient]:
         print("notice: JEV_API_KEY is not set; documents are stored and left pending judgement", file=sys.stderr)
         return None
     return JevClient(key, http)
+
+
+def open_encoder(store: Store, workdir: Path) -> Tuple[Any, str]:
+    """(the judge encoder, "on"), or (None, why not): no model in the store, or one that would not load. Either way the
+    run goes on, as before the encoder, with only Jev judging. Call it after the questions are configured."""
+    began = time.monotonic()
+    try:
+        encoder = judge_encoder.load(store, workdir)
+    except FileNotFoundError:
+        return None, "off: no model"
+    except Exception as exc:
+        print(f"notice: the judge encoder did not load ({type(exc).__name__}); only Jev judges", file=sys.stderr)
+        return None, f"off: load failed: {type(exc).__name__}: {exc}"[:300]
+    return encoder, f"on: loaded in {time.monotonic() - began:.0f} s"
 
 
 def _config(store: Store, workdir: Path, remote: str) -> Optional[Path]:
@@ -174,8 +190,9 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         ranking, scope, ranking_ignored = _ranking(store, Path(workdir))
         throttle = HostThrottle(args.min_interval)
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=throttle) as cascade:
+            encoder, encoder_status = open_encoder(store, Path(workdir))
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency,
-                            pdf_bodies=pdf_bodies())
+                            pdf_bodies=pdf_bodies(), encoder=encoder, encoder_status=encoder_status)
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
                                 sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle,
                                 scope=scope)
@@ -201,7 +218,10 @@ async def _judge(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             return
         with tempfile.TemporaryDirectory(prefix="crawler-judge-") as workdir:
             _configure_questions(store, Path(workdir))
-            engine = Engine(store, workdir=Path(workdir), jev=jev, monthly_usd=monthly, concurrency=args.concurrency)
+            # The encoder scores new scans; not the judge backlog, which would score the same unsampled pages every run.
+            encoder, encoder_status = open_encoder(store, Path(workdir)) if args.command == "ocr" else (None, "off")
+            engine = Engine(store, workdir=Path(workdir), jev=jev, monthly_usd=monthly, concurrency=args.concurrency,
+                            encoder=encoder, encoder_status=encoder_status)
             await engine.start()
             days = [start + dt.timedelta(days=n) for n in range((end - start).days + 1)]
             try:

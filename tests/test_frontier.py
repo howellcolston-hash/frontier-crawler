@@ -9,6 +9,7 @@ import heapq
 import json
 import math
 import random
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -1575,3 +1576,27 @@ def test_an_active_seed_claims_its_own_starts_host_from_an_inactive_seeds_line()
     frontier.add_links(page, _page_row(page["url"], '<a href="/x">x</a>'), None, NOW)
     x = frontier.entry("https://www.example.com/x")
     assert (x["seed_id"], x["line_id"], x["hops"], x["crossing"]) == ("s", "s", 1, False)   # its own site, not a crossing
+
+
+def test_a_retired_seeds_queued_entries_join_the_active_seed_covering_their_host(tmp_path: Path) -> None:
+    pages = [f"https://a.test/p{i}" for i in range(5)]
+    site = FakeSite({"https://a.test/": "".join(f'<a href="{p}">p</a>' for p in pages),
+                     "https://a.test/new": "".join(f'<a href="{p}">p</a>' for p in pages), **{p: "" for p in pages}})
+    store = LocalStore(tmp_path / "store")
+
+    def go(run: str, seeds: List[Seed], max_fetches: int) -> Dict[str, Any]:
+        engine = Engine(store, site, workdir=tmp_path / run, now=lambda: NOW, run_id=run)
+        return asyncio.run(crawl(store, engine, seeds, workdir=tmp_path / run, max_fetches=max_fetches, now=lambda: NOW, scope="source", run_share=None))
+
+    assert go("r1", [_seed("old", "https://a.test/")], 1)["stored_by_seed"] == {"old": 1}   # its links wait on disk
+    # The old seed is replaced by one starting elsewhere on its site: before, its links there were known and never taken.
+    seeds = [_seed("old", "https://a.test/", until=NOW.date() - dt.timedelta(days=1)), _seed("new", "https://a.test/new", deny=(re.compile("p4$"),))]
+    second = go("r2", seeds, 20)
+    assert second["stored_by_seed"] == {"old": 0, "new": 5} and sorted(site.fetched[1:]) == sorted(["https://a.test/new", *pages[:4]])
+    assert second["seed_entries_reowned"] == 4   # p4 is outside the new seed's patterns: it stays the old seed's
+    assert second["queued_by_seed"] == {"new": 0}
+    after = Frontier.load(store, tmp_path / "check2")
+    after.bound(seeds, "source")
+    after.add_seeds(seeds, NOW)
+    p4 = after.entry(pages[4]) or {}
+    assert after.line("new")["content"] == 5 and p4.get("seed_id", "old") == "old"

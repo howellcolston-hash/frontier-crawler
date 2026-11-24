@@ -8,7 +8,8 @@ URL is fetched as its start even if another line queued or fetched it before: on
 (not unchanged) so its links start the seed's line; then as any starting URL (seed_urls_reread).
 An inactive seed (past its until, or weight 0) owns nothing: an active seed listing one of its starting URLs takes it over,
 and a host its lines cover counts as covered by no line, so an active seed's links and sitemap URLs there start or join
-the active seed's own lines instead of waiting, never taken, under the inactive one.
+the active seed's own lines instead of waiting, never taken, under the inactive one. Its entries still queued on a host an
+active seed's line covers join that line at the start of each run (add_seeds), so the active seed takes them.
 
 Branching. A link to a site that no line covers (a crossing) is queued under the line that found
 it. If fetching it yields content, that site becomes a new line and the parent line carries on.
@@ -20,7 +21,8 @@ yield and earns its own yield from there; the generation factor in priority keep
 for good, so a line many sites from its seed stays discounted
 however well its own pages pay.
 
-Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged, 0 for
+Sinking and recovery. Every line keeps a running yield: Jev's relevance for new content it judged (or the judge
+encoder's, for content Jev does not judge, when the encoder is on: pipeline.Engine), 0 for
 a dead link, a duplicate, an unchanged page, a refusal or a thin page (HTML with under THIN_WORDS words:
 an outage notice, an empty shell). New content Jev does not judge counts at
 the line's relevance: the running mean of the relevance of its judged pages. That covers content Jev
@@ -586,6 +588,7 @@ class Frontier:
         self.spawned = 0
         self.seed_urls_requeued = 0
         self.seed_urls_reread = 0   # starting URLs known from another line, taken over as their seed's start
+        self.seed_entries_reowned = 0   # queued entries of inactive seeds moved to the active seed covering their host
         self.lifts = 0
         self._linked: set = set()      # (from line, into line) pairs that have had their one link in this run
         self.lines_lifted: set = set()
@@ -1049,7 +1052,49 @@ class Frontier:
                 if self._cover(host) is None:
                     self._host_line[host] = seed.id
                 self.seed_urls_reread += 1
+        self.seed_entries_reowned += self._reown()
         return added
+
+    def _heir(self, host: str, seed_id: str) -> Optional[Dict[str, Any]]:
+        """For an inactive seed's entries on host: the active seed's line now covering host, if any."""
+        if self._active is None or seed_id in self._active:
+            return None
+        line = self._lines.get(self._host_line.get(host) or "")
+        return line if line is not None and line["seed_id"] in self._active else None
+
+    def _reown(self) -> int:
+        """Queued entries of an inactive seed on a host an active seed's line covers join that line, so the active seed takes
+        them. Before, they waited under the retired seed, never taken, held the host's MAX_QUEUED_PER_HOST, and made the
+        active seed's own links to them known (links_known). A crossing joins as a link one step from the line's start, as
+        _spawn moves one, and nothing stays a start; an entry the active seed's fence or patterns would not queue stays. Returns
+        how many moved."""
+        cold = []
+        for bucket, rows in enumerate(self._files.rows if self._loc else ()):
+            if rows:
+                first, _, _ = self._files.runs(bucket, ("line_id", "host", "seed_id", "crossing"))
+                for line, host, seed, crossing in zip(first["line_id"], first["host"], first["seed_id"], first["crossing"]):
+                    if self._heir(host, seed) is not None:
+                        cold.append(self._group({"line_id": line, "host": host, "seed_id": seed, "crossing": crossing}))
+        self._heat([(group, group.disk) for group in cold])
+        moved = 0
+        for group in [g for g in self._groups.values() if self._heir(g.host, g.seed) is not None]:
+            while group.disk:   # a group already loaded in part: the rest of its rows
+                self._take_rows(group, self._files.read(group.bucket, [(group.start + group.taken, group.disk)])[0])
+            heir = self._heir(group.host, group.seed)
+            limits = self._limits.get(heir["seed_id"])  # type: ignore[index]
+            for entry in list(group.members):
+                if (entry["url"] in self._in_flight or self._fenced(heir["seed_id"], entry["host"])  # type: ignore[index]
+                        or (limits is not None and not limits.admits(entry["url"]))):
+                    continue
+                self._dequeue(entry)
+                if entry.get("crossing"):
+                    self._crossing[entry["host"]] = [other for other in self._crossing.get(entry["host"], ()) if other is not entry]
+                # At least one step from the line's start: a retired seed's own unfetched start is a page here, not a start.
+                entry.update(seed_id=heir["seed_id"], line_id=heir["line_id"], hops=1 if entry.get("crossing") else max(1, entry["hops"]),  # type: ignore[index]
+                             crossing=False)
+                self._enqueue(entry)
+                moved += 1
+        return moved
 
     def sitemap_sites(self, seeds: Sequence[Seed], today: dt.date, now: dt.datetime) -> Dict[str, str]:
         """host -> origin of each site whose sitemaps are due: an active seed's starting sites and the sites with a line on a
@@ -1966,7 +2011,9 @@ async def crawl(
     one worker and not a round. A page to be judged is judged in its own task, at most JEV_SLOTS at once; its line's
     yield and the score of the links found on it follow when the judgement arrives. A background task uploads rows
     every FLUSH_EVERY_SECONDS. At the time limit no new URL is taken; pages in flight finish, and judgements still
-    running get JUDGE_GRACE_SECONDS, after which they are abandoned and their pages stay unjudged.
+    running get JUDGE_GRACE_SECONDS, or the time left before max_minutes if longer, after which they are abandoned and
+    their pages stay unjudged. With the judge encoder on (pipeline.Engine), every judgeable page is judged: by Jev within
+    its sample, by the encoder otherwise; its answers move the line and its links as Jev's do.
 
     The queue is uploaded once, in the engine's final commit. A run that dies before then
     keeps its fetched rows (the engine uploads them as it goes) and loses its queue updates,
@@ -2059,7 +2106,8 @@ async def crawl(
         """Phase 2, in its own task: the page's relevance and its links' scores."""
         answers = None
         try:
-            async with jev_slots:
+            # JEV_SLOTS bounds Jev calls; the encoder takes one page at a time on its own, so its pages wait outside them.
+            async with jev_slots if engine.sampled(row) else contextlib.nullcontext():
                 answers = await engine.judge(row)
             if answers is not None:
                 tally["judged"] += 1
@@ -2088,7 +2136,7 @@ async def crawl(
                             is_start(entry) and entry["fetched_at"] is None)
             limits = {"timeout": RETRY_TIMEOUT_SECONDS, "connect": RETRY_CONNECT_SECONDS} if retry else {}
             row = await engine.fetch(target, **limits)
-            if engine.sampled(row):
+            if engine.will_judge(row):
                 fetch_id = row["fetch_id"]
             with engine.slot_timer("observe"):
                 record(entry, row, fetch_id is not None)
@@ -2135,7 +2183,7 @@ async def crawl(
                         k["changes"] += content and (queued is None or queued > 0)
                         k["hours"] += (now() - k["seen"]).total_seconds() / 3600
                     k["seen"] = now()
-            if engine.sampled(row):
+            if engine.will_judge(row):
                 spawn_judge(row, watch_tally)
         except Exception:
             logger.exception("a watched page failed")
@@ -2238,7 +2286,9 @@ async def crawl(
             await asyncio.gather(*workers)
         with timed(seconds, "judge_wait"):
             if judging:
-                _, unfinished = await asyncio.wait(list(judging), timeout=JUDGE_GRACE_SECONDS)
+                # The time left before the deadline is spent too: the encoder's queue of pages can outlast the fetching.
+                grace = max(JUDGE_GRACE_SECONDS, deadline - clock()) if deadline is not None else JUDGE_GRACE_SECONDS
+                _, unfinished = await asyncio.wait(list(judging), timeout=grace)
                 for task in unfinished:
                     task.cancel()
                 await asyncio.gather(*unfinished, return_exceptions=True)
@@ -2274,7 +2324,8 @@ async def crawl(
             "documents_off_site": frontier.documents_off_site, "links_known": frontier.links_known,
             "seed_patterns_ignored": sum(seed.patterns_ignored for seed in seeds),
             "seeds_at_allowance": sorted(seed.id for seed in seeds if seed.allowance is not None and frontier.stored(seed.id) >= seed.allowance),
-            "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread, **read,
+            "seed_urls_requeued": frontier.seed_urls_requeued, "seed_urls_reread": frontier.seed_urls_reread,
+            "seed_entries_reowned": frontier.seed_entries_reowned, **read,
             "watch_entries": len(watch), "watch_due": len(due), **watched, **watch_report(),
             **{name: {"taken": k["taken"], "stored": k["stored"], "judged": k["judged"],
                       "mean_relevance": round(k["relevance"] / k["judged"], 4) if k["judged"] else None} for name, k in kinds.items()},
