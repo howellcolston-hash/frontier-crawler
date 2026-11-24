@@ -160,7 +160,7 @@ def test_the_encoder_windows_pools_and_applies_its_head_as_the_bake_off_does() -
     enc._questions, enc._choice = {q.id: q for q in NOULS}, CHOICE
     rng = np.random.default_rng(0)
     w = {"w1": rng.normal(size=(2, 4)), "b1": rng.normal(size=4), "w2": rng.normal(size=(4, len(NOULS))), "b2": rng.normal(size=len(NOULS)),
-         "w3": rng.normal(size=(4, 3)), "b3": rng.normal(size=3)}
+         "w3": rng.normal(size=(4, len(enc._choices))), "b3": rng.normal(size=len(enc._choices))}
     enc._head_w = w
     text = "a bb ccc dddd eeeee f gg hhh iiii jjjjj"   # ten tokens: three windows of four
     vectors = [np.array([np.mean([9, *ids, 9]), 6.0]) for ids in ([1, 2, 3, 4], [4, 5, 1, 2], [2, 3, 4, 5])]
