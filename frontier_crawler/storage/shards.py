@@ -4,7 +4,9 @@ Seven tables, each partitioned by the UTC day on which the fetching run started:
     fetches/           one row per fetch attempt, with where it came from, the content hash, the text, the title and join keys
                        (no title column before engine 0.4.0, no join_keys before 0.5.0: read columns by name)
     bodies/            the bytes served, one row per content hash, stored once across runs (read them with bodies_of); from engine
-                       0.7.0 a PDF whose text was read in full has no body by default (pipeline.PDF_BODIES)
+                       0.7.0 a PDF whose text was read in full has no body by default (pipeline.PDF_BODIES), from 0.11.0 nor does
+                       a larger page whose text was (pipeline.RAW_MAX_BYTES), and with a raw remote the shards live there
+                       (storage/cold.py), listed in cold/*.jsonl
     links/             one row per distinct link on a stored HTML page, in page order
     ocr_text/          one row per scanned PDF read with Tesseract
     judgement_calls/   one row per Jev call about a fetched document
@@ -17,19 +19,22 @@ was asked, so "which documents of day D are still unjudged" needs only day D's f
 Input contract: writer.add(row); batch = writer.take(); local, remote = writer.write(batch).
 take() is cheap and runs on the event loop. write() makes the Parquet file on disk, blocks, and
 belongs in a thread. The caller uploads it, so several tables can go up in one commit.
-for row, body in bodies_of(store, workdir, fetch_rows, day): the bytes of each fetch row.
+for row, body in bodies_of(store, workdir, fetch_rows, day, cold): the bytes of each fetch row (cold: storage/cold.ColdTier or None).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ENGINE_VERSION = "0.10.0"  # 0.10.0: the judge encoder scores what Jev does not read; a retired seed's queued entries join the active seed covering their host; 0.9.0: an inactive seed owns no starting URL and no host, so an active seed fetches and follows them; 0.8.0: a derived client's JSON text read in its declared charset, a malformed Jev reply recorded as rejected; 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+ENGINE_VERSION = "0.11.0"  # 0.11.0: a page over 2 MB whose text was read in full is kept as text only; bodies shards on an rclone remote when CRAWLER_RAW_REMOTE is set, read through the cold tier; 0.10.0: the judge encoder scores what Jev does not read; a retired seed's queued entries join the active seed covering their host; 0.9.0: an inactive seed owns no starting URL and no host, so an active seed fetches and follows them; 0.8.0: a derived client's JSON text read in its declared charset, a malformed Jev reply recorded as rejected; 0.7.0: PDFs with text kept as text only (no body), etag and last_modified; 0.6.0: text leaves out hidden elements, tier HTTP_IMPERSONATE; 0.5.0: join_keys; 0.4.0: title; 0.3.0: bytes in bodies, not inline in fetches
+
+logger = logging.getLogger("frontier_crawler.shards")
 
 _TS = pa.timestamp("us", tz="UTC")
 
@@ -234,13 +239,15 @@ class ShardWriter:
         return local, remote
 
 
-def bodies_of(store: Any, workdir: Path, rows: Iterable[Dict[str, Any]], day: Optional[dt.date] = None) -> Iterator[Tuple[Dict[str, Any], Optional[bytes]]]:
+def bodies_of(store: Any, workdir: Path, rows: Iterable[Dict[str, Any]], day: Optional[dt.date] = None,
+              cold: Any = None) -> Iterator[Tuple[Dict[str, Any], Optional[bytes]]]:
     """(row, its bytes) for each fetch row: the row's own body when it has one (rows from engine 0.2.0 and earlier),
     else the body with the row's sha256 from the bodies table, or None when no shard holds it.
 
-    The bodies shards of `day` are searched first, then every other day's, newest first, until every hash is found.
+    The store's bodies shards are searched first, then, with a cold tier (storage/cold.py), the shards its manifests list:
+    each in the order `day`'s first, then every other day's newest first, until every hash is found.
     shortcut: a shard is downloaded whole to be searched, so one call costs at most one download of each bodies shard,
-    the whole table when a hash is missing; keep a hash -> shard index once reading bytes back is routine.
+    the whole table and cold tier when a hash is missing; keep a hash -> shard index once reading bytes back is routine.
     """
     wanted: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -250,21 +257,31 @@ def bodies_of(store: Any, workdir: Path, rows: Iterable[Dict[str, Any]], day: Op
             wanted.setdefault(row["sha256"], []).append(row)
     if not wanted:
         return
-    remotes = list(reversed(store.list("bodies")))
-    if day is not None:
-        own = day_folder("bodies", day) + "/"
-        remotes.sort(key=lambda remote: not remote.startswith(own))
-    for remote in remotes:
-        if not wanted:
-            break
-        local = Path(workdir) / "in" / remote
-        if not store.get(remote, local):
-            continue
-        found = pq.read_table(local, columns=["sha256", "body"], filters=[("sha256", "in", list(wanted))]).to_pylist()
-        local.unlink(missing_ok=True)
-        for hit in found:
-            for row in wanted.pop(hit["sha256"], []):
-                yield row, hit["body"]
+
+    def search(paths: List[str], fetch: Any) -> Iterator[Tuple[Dict[str, Any], Optional[bytes]]]:
+        paths = sorted(paths, reverse=True)
+        if day is not None:
+            own = day_folder("bodies", day) + "/"
+            paths.sort(key=lambda path: not path.startswith(own))
+        for path in paths:
+            if not wanted:
+                return
+            local = Path(workdir) / "in" / path
+            if not fetch(path, local):
+                continue
+            found = pq.read_table(local, columns=["sha256", "body"], filters=[("sha256", "in", list(wanted))]).to_pylist()
+            local.unlink(missing_ok=True)
+            for hit in found:
+                for row in wanted.pop(hit["sha256"], []):
+                    yield row, hit["body"]
+
+    held = store.list("bodies")
+    yield from search(held, store.get)
+    if wanted and cold is not None:
+        lines = cold.lines(store, workdir)
+        yield from search(sorted(set(lines) - set(held)), lambda path, local: cold.get(lines[path], local))
+    elif wanted:
+        logger.info("%d bodies not in the store; without rclone the cold tier is not searched", len(wanted))
     for missing in wanted.values():
         for row in missing:
             yield row, None
