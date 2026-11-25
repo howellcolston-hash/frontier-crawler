@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import os
 import stat
@@ -96,12 +97,14 @@ def test_a_large_page_whose_text_was_read_keeps_text_only_and_a_lossy_one_keeps_
     pages = {"https://a.test/big": _html("https://a.test/big", 5000),
              "https://a.test/thin": _html("https://a.test/thin", 5000, text="Loading " * 20),          # a shell: data in scripts
              "https://a.test/noted": _html("https://a.test/noted", 5000, text="noted " + WORDS, note="html not read: timeout"),
-             "https://a.test/small": _html("https://a.test/small", 2000)}
+             "https://a.test/small": _html("https://a.test/small", 2000),
+             "https://a.test/feed.xml": _html("https://a.test/feed.xml", 5000, text="xml " + WORDS)}   # markup that is data
+    pages["https://a.test/feed.xml"].content_type = "application/xml"
     stats = _run(tmp_path, pages, "r1")
     rows, kept = _fetches(tmp_path), _hashes(tmp_path / "store")
     assert rows["https://a.test/big"]["sha256"] not in kept and rows["https://a.test/big"]["text"] == WORDS
-    assert {rows[u]["sha256"] for u in ("https://a.test/thin", "https://a.test/noted", "https://a.test/small")} == kept
-    assert (stats["large_text_only"], stats["large_text_only_bytes"], stats["bodies_written"]) == (1, 5000, 3)
+    assert {rows[u]["sha256"] for u in ("https://a.test/thin", "https://a.test/noted", "https://a.test/small", "https://a.test/feed.xml")} == kept
+    assert (stats["large_text_only"], stats["large_text_only_bytes"], stats["bodies_written"]) == (1, 5000, 4)
 
 
 def test_the_size_rule_leaves_pdfs_to_pdf_bodies(tmp_path: Path, monkeypatch: Any) -> None:
@@ -220,6 +223,17 @@ def test_from_env_needs_rclone_and_a_remote_path(tmp_path: Path, monkeypatch: An
     assert ColdTier.from_env().root is None   # reads only
     with pytest.raises(ValueError):
         ColdTier("no-colon")
+
+
+def test_after_three_failed_reads_the_cold_tier_stops_asking_the_remote(tmp_path: Path, rclone: str, monkeypatch: Any) -> None:
+    (tmp_path / "drive" / "raw" / "bodies").mkdir(parents=True)
+    (tmp_path / "drive" / "raw" / "bodies" / "x.parquet").write_bytes(b"x")
+    line = {"remote": "fake:raw", "path": "bodies/x.parquet", "sha256": hashlib.sha256(b"x").hexdigest()}
+    cold = ColdTier(rclone=rclone)
+    monkeypatch.setenv("FAKE_RCLONE_FAIL", "copyto")
+    assert not any(cold.get(line, tmp_path / "w" / "x") for _ in range(3))
+    monkeypatch.delenv("FAKE_RCLONE_FAIL")
+    assert not cold.get(line, tmp_path / "w" / "x") and ColdTier(rclone=rclone).get(line, tmp_path / "w" / "x")
 
 
 def test_a_read_that_does_not_match_its_line_is_refused(tmp_path: Path, rclone: str) -> None:

@@ -10,7 +10,8 @@ path is the shard's store path (bodies/year=.../<run>-000.parquet), kept unchang
 Input contract:
     cold = ColdTier.from_env()                      None when rclone is not on PATH; root (where put writes) from CRAWLER_RAW_REMOTE
     line = cold.put(local, path, run, now)          copy, then check size and every hash the remote reports; None if it failed
-    cold.get(line, local) -> bool                   False when the copy is absent, unreadable or not the bytes listed
+    cold.get(line, local) -> bool                   False when the copy is absent, unreadable or not the bytes listed, and for
+                                                    every read after MAX_FAILED_READS failed ones
     cold.lines(store, workdir) -> {path: line}      every manifest line in the store, the later manifest winning
 The remote's credentials stay with rclone: its config file, or RCLONE_CONFIG_<NAME>_* environment variables. Nothing here
 logs a path, a remote or rclone's output: counts and exit codes only.
@@ -34,7 +35,10 @@ logger = logging.getLogger("frontier_crawler.cold")
 
 MANIFESTS = "cold"
 HASHES = ("sha256", "sha1", "md5")
-RCLONE_TIMEOUT_S = 900.0   # PROVISIONAL: one copy of a shard (up to about 64 MB); rclone retries inside it
+# PROVISIONAL: one copy of a shard (up to about 64 MB); rclone retries inside it. Three failed writes (the engine's limit) must
+# fit in the crawl job's margin past its fetching minutes (crawl.yml: 120 minutes for an 85-minute crawl).
+RCLONE_TIMEOUT_S = 300.0
+MAX_FAILED_READS = 3       # PROVISIONAL: after this many failed reads, later reads fail at once (an unreachable or hanging remote)
 
 
 def sums(path: Path) -> Tuple[int, Dict[str, str]]:
@@ -55,6 +59,7 @@ class ColdTier:
         self.root = root.rstrip("/") if root else None
         self._rclone = rclone
         self._lines: Optional[Dict[str, Dict[str, Any]]] = None
+        self.failed_reads = 0
 
     @classmethod
     def from_env(cls) -> Optional["ColdTier"]:
@@ -93,6 +98,8 @@ class ColdTier:
     def get(self, line: Dict[str, Any], local: Path) -> bool:
         # shortcut: reads go to the remote each line names; moving the files to another home needs the lines rewritten.
         local = Path(local)
+        if self.failed_reads >= MAX_FAILED_READS:
+            return False
         local.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._run("copyto", f"{str(line['remote']).rstrip('/')}/{_check(line['path'])}", str(local))
@@ -101,6 +108,7 @@ class ColdTier:
             logger.warning("cold tier: read failed (%s)", getattr(exc, "returncode", type(exc).__name__))
             ok = False
         if not ok:
+            self.failed_reads += 1
             local.unlink(missing_ok=True)
         return ok
 

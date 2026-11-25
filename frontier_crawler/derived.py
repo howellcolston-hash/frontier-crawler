@@ -258,24 +258,31 @@ class DerivedFetcher:
         if spec.reply == "html":
             final = str(response.url)
             try:
-                text, _, links, title = await self._readers.run(HTML_SECONDS, read_html, content, content_type, final)
+                text, encoding, links, title = await self._readers.run(HTML_SECONDS, read_html, content, content_type, final)
             except Exception:  # a page no reader can read, or one that crashed or hung its reader, is still stored
-                text, links, title = None, None, None
+                text, encoding, links, title = None, None, None, None
             if spec.follow:
                 try:
                     found = (await self._readers.run(HTML_SECONDS, extract_links, content, final, FOLLOW_LINKS_PER_PAGE))[0]
                 except Exception:
                     found = []
                 self.links[key] = [link for link, _ in found if re.search(spec.follow, link)]
-            return ScrapeResult(key, response.status_code, content, text, word_count(text or ""), "API", None, content_type, links=links, title=title)
+            return ScrapeResult(key, response.status_code, content, text, word_count(text or ""), "API", undecoded(encoding), content_type,
+                                links=links, title=title)
         try:
             text, encoding = await self._readers.run(HTML_SECONDS, decode, content, content_type)
         except ReaderFailed:   # the reader crashed or hung: read as before charsets were honoured
             text, encoding = content.decode("utf-8", errors="replace"), None
         if encoding not in (None, "utf-8"):
             self.counts["decoded_non_utf8"] += 1
-        return ScrapeResult(key, response.status_code, content, text, len(text.split()), "API", None, content_type)
+        return ScrapeResult(key, response.status_code, content, text, len(text.split()), "API", undecoded(encoding), content_type)
 
+
+
+def undecoded(encoding: Optional[str]) -> Optional[str]:
+    """The note on a reply no encoding fit (read as UTF-8 with replacement characters), as the cascade notes one: its text
+    is not the reply, so the size rule keeps its bytes (pipeline.text_read)."""
+    return None if encoding else "text encoding not detected"
 
 async def run_derived(
     engine: Any, specs: List[Spec], fetcher: DerivedFetcher, frontier: Any = None,

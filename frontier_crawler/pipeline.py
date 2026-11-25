@@ -140,11 +140,12 @@ def text_only_pdf(row: Dict[str, Any]) -> bool:
 
 
 def text_read(row: Dict[str, Any]) -> bool:
-    """A page other than a PDF whose text was read in full: no note from the reader (decoding, a failed or crashed read),
-    not a block or error page, and not a shell (fewer words than the cascade's own bar for rendering, as when the data
-    sits in scripts)."""
-    return (row.get("tier_used") != "PDF" and row.get("tier_note") is None and row.get("block_marker") is None
-            and (row.get("word_count") or 0) >= THIN_HTML_WORDS)
+    """A page other than a PDF whose text was read in full: HTML or an API reply (other markup, such as XML or a feed, is
+    read as HTML and loses its tags and attributes), no note from the reader (decoding, a failed or crashed read), not a
+    block or error page, and not a shell (fewer words than the cascade's own bar for rendering, as when the data sits in
+    scripts)."""
+    return (row.get("tier_used") != "PDF" and (row.get("tier_used") == "API" or "html" in (row.get("content_type") or "").lower())
+            and row.get("tier_note") is None and row.get("block_marker") is None and (row.get("word_count") or 0) >= THIN_HTML_WORDS)
 
 
 def _spread(seconds: List[float]) -> Dict[str, Any]:

@@ -42,10 +42,8 @@ concurrency:
 env:
   JOB: ${{ inputs.job }}
   # The collection and module jobs read raw bodies from Google Drive (docs/cold-storage.md in the private repository) when the
-  # Drive token secret exists: rclone reads the remote horizon_drive from these variables. Read only: nothing here writes raw.
-  RCLONE_CONFIG_HORIZON_DRIVE_TYPE: drive
-  RCLONE_CONFIG_HORIZON_DRIVE_SCOPE: drive.file
-  RCLONE_CONFIG_HORIZON_DRIVE_TOKEN: ${{ secrets.RCLONE_CONFIG_HORIZON_DRIVE_TOKEN }}
+  # Drive token secret exists. Only whether it exists is set here; the token goes to the Run step alone, like the other secrets.
+  HAS_DRIVE: ${{ secrets.RCLONE_CONFIG_HORIZON_DRIVE_TOKEN != '' }}
 jobs:
   collect:
     if: ${{ inputs.job == 'collect-daily' }}
@@ -68,7 +66,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install rclone
-        if: ${{ env.RCLONE_CONFIG_HORIZON_DRIVE_TOKEN != '' && (env.JOB == 'collection' || env.JOB == 'module') }}
+        if: ${{ env.HAS_DRIVE == 'true' && (env.JOB == 'collection' || env.JOB == 'module') }}
         run: |
           # Pinned and checked as in crawl.yml.
           curl -fsSL -o "$RUNNER_TEMP/rclone.zip" https://downloads.rclone.org/v1.76.0/rclone-v1.76.0-linux-amd64.zip
@@ -80,6 +78,10 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          # rclone reads the remote horizon_drive from these variables. Read only: nothing here writes raw.
+          RCLONE_CONFIG_HORIZON_DRIVE_TYPE: drive
+          RCLONE_CONFIG_HORIZON_DRIVE_SCOPE: drive.file
+          RCLONE_CONFIG_HORIZON_DRIVE_TOKEN: ${{ secrets.RCLONE_CONFIG_HORIZON_DRIVE_TOKEN }}
           INDEX: ${{ matrix.i }}
         working-directory: hd
         run: bash scripts/bridge.sh "$JOB" $INDEX >"$RUNNER_TEMP/out.log" 2>&1
