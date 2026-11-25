@@ -5,7 +5,7 @@
     python -m frontier_crawler ocr [--start D --end D]      read stored scanned PDFs with Tesseract, then judge them (default: last 7 days)
     python -m frontier_crawler capture URL [--click TEXT]   record the data requests a page makes, to write a derived client from
     python -m frontier_crawler derived [--check ID]         run the derived API clients, or test one without storing
-    python -m frontier_crawler body SHA256 [--out FILE]     write one stored body from the bodies table (to stdout without --out)
+    python -m frontier_crawler body SHA256 [--out FILE]     write one stored body from the bodies table or cold tier (to stdout without --out)
 
 Environment:
     HF_TOKEN, CRAWLER_HF_REPO    Hugging Face dataset repo that holds everything: tables, crawl state, configuration, run records.
@@ -13,6 +13,9 @@ Environment:
     JEV_API_KEY                  Jev key. Without it documents are stored and left pending.
     CRAWLER_JEV_MONTHLY_USD      safety ceiling on Jev spend per month in USD (default 10).
     CRAWLER_PDF_BODIES           text_only (default): a PDF whose text was read in full is stored without its bytes; keep: with them.
+    CRAWLER_RAW_REMOTE           an rclone remote path (name:folder): crawl and derived write their bodies shards there instead of
+                                 the store, listed in cold/raw-<run id>.jsonl. Needs rclone; its credentials stay with rclone.
+                                 With rclone installed, every command also reads bodies from the cold tier (storage/cold.py).
     CRAWLER_VERBOSE              set to log fetch failures and other detail. Off by default: see below.
 
 Configuration is read from the store: config/seeds.jsonl, config/questions.json (optional),
@@ -49,6 +52,7 @@ from frontier_crawler.judge import encoder as judge_encoder
 from frontier_crawler.judge import questions as judging
 from frontier_crawler.judge.jev import JevClient
 from frontier_crawler.pipeline import PDF_BODIES, Engine, utc_now
+from frontier_crawler.storage.cold import ColdTier
 from frontier_crawler.storage.shards import bodies_of
 from frontier_crawler.storage.store import HubStore, LocalStore, Store
 
@@ -192,7 +196,7 @@ async def _crawl(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
         async with httpx.AsyncClient() as http, HarvesterCascade(throttle=throttle) as cascade:
             encoder, encoder_status = open_encoder(store, Path(workdir))
             engine = Engine(store, cascade, workdir=Path(workdir), jev=open_jev(http), monthly_usd=monthly, concurrency=args.concurrency,
-                            pdf_bodies=pdf_bodies(), encoder=encoder, encoder_status=encoder_status)
+                            pdf_bodies=pdf_bodies(), encoder=encoder, encoder_status=encoder_status, cold=ColdTier.from_env())
             stats = await crawl(store, engine, seeds, workdir=Path(workdir), max_fetches=args.max_fetches, max_minutes=args.max_minutes, steer=steer,
                                 sitemaps=cascade.sitemap_entries, watch=watch, ranking=ranking, throttle=throttle,
                                 scope=scope)
@@ -221,7 +225,7 @@ async def _judge(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             # The encoder scores new scans; not the judge backlog, which would score the same unsampled pages every run.
             encoder, encoder_status = open_encoder(store, Path(workdir)) if args.command == "ocr" else (None, "off")
             engine = Engine(store, workdir=Path(workdir), jev=jev, monthly_usd=monthly, concurrency=args.concurrency,
-                            encoder=encoder, encoder_status=encoder_status)
+                            encoder=encoder, encoder_status=encoder_status, cold=ColdTier.from_env())
             await engine.start()
             days = [start + dt.timedelta(days=n) for n in range((end - start).days + 1)]
             try:
@@ -268,7 +272,7 @@ async def _derived(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
             # The crawl's Crawl-delays apply here too; the queue is loaded only for a client that follows links.
             fetcher = derived_module.DerivedFetcher(http, HostThrottle(args.min_interval, intervals=crawl_delays(store, Path(workdir))))
             frontier = Frontier.load(store, Path(workdir)) if any(spec.follow for spec in specs) else None
-            engine = Engine(store, fetcher, workdir=Path(workdir), concurrency=1, pdf_bodies=pdf_bodies())
+            engine = Engine(store, fetcher, workdir=Path(workdir), concurrency=1, pdf_bodies=pdf_bodies(), cold=ColdTier.from_env())
             await engine.start()
             try:
                 results = await derived_module.run_derived(engine, specs, fetcher, frontier)
@@ -287,10 +291,13 @@ def _body(args: argparse.Namespace) -> None:
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise SystemExit("SHA256 must be 64 hex digits")
     with tempfile.TemporaryDirectory(prefix="crawler-body-") as workdir:
-        ((_, body),) = bodies_of(open_store(), Path(workdir), [{"sha256": sha256}])
+        cold = ColdTier.from_env()
+        ((_, body),) = bodies_of(open_store(), Path(workdir), [{"sha256": sha256}], cold=cold)
     if body is None:
         # Bodies stored before the bodies table are inline in their fetch rows; a PDF kept as text only has none.
-        raise SystemExit("no stored body has that hash in the bodies table (from engine 0.7.0 a PDF whose text was read is kept as text only)")
+        raise SystemExit("no stored body has that hash in the bodies table (from engine 0.7.0 a PDF whose text was read is kept as text only, "
+                         "from 0.11.0 a large page whose text was read too)"
+                         + ("" if cold else "; rclone is not installed, so the cold tier was not searched"))
     if args.out:
         Path(args.out).write_bytes(body)
     else:

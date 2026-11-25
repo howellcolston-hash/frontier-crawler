@@ -12,7 +12,7 @@ import httpx
 import pyarrow.parquet as pq
 import pytest
 
-from frontier_crawler import derived
+from frontier_crawler import derived, pipeline
 from frontier_crawler.capture import is_first_party, is_noise, json_shape, kept_headers
 from frontier_crawler.derived import DerivedFetcher, check, health, load_spec, page_request, records_of, run_derived, shared_keys
 from frontier_crawler.pipeline import Engine
@@ -155,6 +155,23 @@ def test_a_list_page_whose_reader_fails_is_stored_without_text(tmp_path: Path, m
     stats = _run(tmp_path, _spec(tmp_path, **{**LIST, "paginate": {"in": "form", "field": "page", "start": 1, "step": 1, "max_pages": 2}}), _list_site())
     rows = _fetch_rows(tmp_path)
     assert stats["clients"]["notices"]["status"] == "ok" and rows[0]["outcome"] == "stored" and rows[0]["text"] is None
+
+
+def test_a_reply_read_in_no_known_encoding_is_noted_so_the_size_rule_keeps_its_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class CrashingReaders:   # the reader dies, so the reply is read as UTF-8 with replacement characters
+        def __init__(self, counts: Dict[str, Any]) -> None:
+            pass
+
+        async def run(self, limit: float, fn: Any, *args: Any) -> Any:
+            raise derived.ReaderFailed("reader crashed")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(derived, "ReaderPool", CrashingReaders)
+    _run(tmp_path, _spec(tmp_path), _site(pages=1))
+    row = _fetch_rows(tmp_path)[0]
+    assert row["tier_note"] == "text encoding not detected" and not pipeline.text_read(row)
 
 
 def test_a_second_run_keeps_no_second_copy_of_unchanged_pages(tmp_path: Path) -> None:

@@ -2,7 +2,8 @@
 
 Fetching (Engine.fetch): fetch a target and write one row per attempt to the fetches table,
 with where it came from; new bytes go to the bodies table, once per content hash across runs (a PDF
-whose text was read in full keeps only its text by default: PDF_BODIES), and a stored HTML page's links to the links table. Nothing here waits on a model: a document is
+whose text was read in full keeps only its text by default: PDF_BODIES; so does any page over RAW_MAX_BYTES whose text was
+read in full; with a raw remote the bodies shards go there: storage/cold.py), and a stored HTML page's links to the links table. Nothing here waits on a model: a document is
 stored before anything judges it.
 Judging (Engine.judge when a Jev client is given, or later through Engine.judge_days): ask Jev
 the configured questions (judge/questions.py) about each new document and store every answer.
@@ -89,6 +90,11 @@ _UPLOAD_EVERY_S = 600.0
 # What is kept of a stored PDF. text_only: a PDF whose text was read in full keeps its text in fetches and writes no body;
 # a scan (under ocr.SCAN_MAX_WORDS words) a PDF cut short by the reader's time limit or one with no text on many of its pages keeps its bytes. keep: every PDF keeps them.
 PDF_BODIES = ("text_only", "keep")
+# PROVISIONAL: the size rule. A page other than a PDF (those follow PDF_BODIES) larger than this whose text was read in full
+# (text_read) keeps its text in fetches and writes no body. A large page whose text may be lossy keeps its bytes.
+RAW_MAX_BYTES = 2_000_000
+# PROVISIONAL: after this many failed copies to the raw remote in one run, the rest of its bodies shards go to the store.
+RAW_REMOTE_MAX_FAILURES = 3
 # PROVISIONAL: the share of Jev's sample the encoder scores too, so its agreement with Jev is measured every run.
 ENCODER_AUDIT_SHARE = 0.1
 
@@ -133,6 +139,15 @@ def text_only_pdf(row: Dict[str, Any]) -> bool:
     return row.get("tier_used") == "PDF" and (row.get("word_count") or 0) >= ocr.SCAN_MAX_WORDS and row.get("tier_note") is None
 
 
+def text_read(row: Dict[str, Any]) -> bool:
+    """A page other than a PDF whose text was read in full: HTML or an API reply (other markup, such as XML or a feed, is
+    read as HTML and loses its tags and attributes), no note from the reader (decoding, a failed or crashed read), not a
+    block or error page, and not a shell (fewer words than the cascade's own bar for rendering, as when the data sits in
+    scripts)."""
+    return (row.get("tier_used") != "PDF" and (row.get("tier_used") == "API" or "html" in (row.get("content_type") or "").lower())
+            and row.get("tier_note") is None and row.get("block_marker") is None and (row.get("word_count") or 0) >= THIN_HTML_WORDS)
+
+
 def _spread(seconds: List[float]) -> Dict[str, Any]:
     """n, mean, median, 90th percentile (nearest rank) and max of a list of durations."""
     s = sorted(seconds)
@@ -163,10 +178,15 @@ class Engine:
         pdf_bodies: str = "text_only",
         encoder: Any = None,
         encoder_status: str = "off",
+        cold: Any = None,
     ) -> None:
         if pdf_bodies not in PDF_BODIES:
             raise ValueError(f"pdf_bodies must be one of {PDF_BODIES}")
         self._pdf_bodies = pdf_bodies
+        # storage/cold.ColdTier or None: bodies are read through it, and with a root this run's bodies shards go there.
+        self._cold = cold
+        self._raw_lines: Dict[str, Dict[str, Any]] = {}   # bodies shards on the raw remote, by store path
+        self._raw_committed = 0                            # how many of those the store's manifest lists
         self._store = store
         self._fetcher = fetcher
         self._workdir = Path(workdir)
@@ -217,6 +237,10 @@ class Engine:
             "bodies_written": 0, "bodies_written_bytes": 0, "bodies_already_stored": 0, "bodies_already_stored_bytes": 0,
             "links_written": 0, "reader_crashes": 0, "reader_timeouts": 0,
             "pdf_bodies": pdf_bodies, "pdf_text_only": 0, "pdf_text_only_bytes": 0,
+            "large_text_only": 0, "large_text_only_bytes": 0,
+            # Bodies shards copied to the raw remote and checked, and those it failed to take (sent to the store instead).
+            "raw_remote": {"status": "on" if cold is not None and cold.root else "off", "shards": 0, "bytes": 0,
+                           "failed": 0, "failed_bytes": 0},
             # The judge encoder: its model, or why it is off; pages it judged in Jev's place; pages both judged (the audit)
             # and how well they agreed (filled in by finish()); the CPU seconds it took.
             "encoder": {"status": encoder_status, "model": getattr(encoder, "stamp", None), "scored": 0, "audited": 0,
@@ -275,8 +299,10 @@ class Engine:
             files = self._unsent
             if not files and not extra:
                 return
+            sent, listed = (await asyncio.to_thread(self._to_raw_remote, files)) if self.stats["raw_remote"]["status"] != "off" else (files, 0)
             # A failed upload leaves the shards in _unsent, so the next flush sends them: no row is lost.
-            await asyncio.to_thread(self._store.put_many, files + list(extra), f"engine {self.run_id}: {len(files) + len(extra)} file(s)")
+            await asyncio.to_thread(self._store.put_many, sent + list(extra), f"engine {self.run_id}: {len(sent) + len(extra)} file(s)")
+            self._raw_committed = max(self._raw_committed, listed)
             self._unsent = []
             self._hashes.add(self._unsent_bodies)
             self._unsent_bodies = []
@@ -284,6 +310,37 @@ class Engine:
             self._last_upload = time.monotonic()
             self._uploads += 1
             self._upload_seconds += self._last_upload - began
+
+    def _to_raw_remote(self, files: List[Tuple[Path, str]]) -> Tuple[List[Tuple[Path, str]], int]:
+        """Copy the bodies shards among files to the raw remote. Returns what goes to the store (the other files, the shards
+        the remote did not take, and this run's manifest when it lists new shards) and how many shards that manifest lists.
+        The manifest goes up in the same commit as the fetch rows whose bytes it locates, so a reader never meets a row
+        whose shard is in neither place."""
+        out: List[Tuple[Path, str]] = []
+        raw = self.stats["raw_remote"]
+        for local, remote in files:
+            if remote in self._raw_lines:
+                continue   # on the remote since an earlier flush whose store commit failed
+            line = None
+            if remote.startswith("bodies/") and raw["status"] == "on":
+                line = self._cold.put(local, remote, self.run_id, self._now())
+                if line is None:
+                    raw["failed"] += 1
+                    raw["failed_bytes"] += _size(local)
+                    if raw["failed"] >= RAW_REMOTE_MAX_FAILURES:
+                        raw["status"] = "stopped"
+            if line is None:
+                out.append((local, remote))   # never lose a body: the store takes what the remote did not
+                continue
+            self._raw_lines[remote] = line
+            raw["shards"] += 1
+            raw["bytes"] += line["size"]
+        if len(self._raw_lines) > self._raw_committed:
+            manifest = self._workdir / "cold" / f"raw-{self.run_id}.jsonl"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("".join(json.dumps(line, sort_keys=True) + "\n" for line in self._raw_lines.values()), encoding="utf-8")
+            out.append((manifest, f"cold/raw-{self.run_id}.jsonl"))
+        return out, len(self._raw_lines)
 
     async def finish(self, extra: Sequence[Tuple[Path, str]] = ()) -> Dict[str, Any]:
         """The final upload. State goes up with the last rows, so a URL is never marked fetched without its row,
@@ -481,7 +538,7 @@ class Engine:
 
     def _keep_body(self, row: Dict[str, Any], body: bytes) -> None:
         """Buffer the bytes for the bodies table, unless a body with their hash is stored already, in this run or before,
-        or the row is a PDF kept as text only (PDF_BODIES)."""
+        or the row is a PDF kept as text only (PDF_BODIES), or a large page whose text was read in full (RAW_MAX_BYTES)."""
         digest = row["sha256"]
         if digest in self._bodies_written or digest in self._hashes:
             self.stats["bodies_already_stored"] += 1
@@ -490,6 +547,10 @@ class Engine:
         if self._pdf_bodies == "text_only" and text_only_pdf(row):
             self.stats["pdf_text_only"] += 1
             self.stats["pdf_text_only_bytes"] += len(body)
+            return
+        if len(body) > RAW_MAX_BYTES and text_read(row):
+            self.stats["large_text_only"] += 1
+            self.stats["large_text_only_bytes"] += len(body)
             return
         self._bodies_written.add(digest)
         self._writer("bodies", self._day).add({
@@ -680,7 +741,7 @@ class Engine:
             scans = [row for row in await self._read_day("fetches", day, columns)
                      if row["outcome"] == "stored" and row["tier_used"] == "PDF" and row["fetch_id"] not in done
                      and (row["word_count"] or 0) < ocr.SCAN_MAX_WORDS]
-            found = bodies_of(self._store, self._workdir, scans, day)
+            found = bodies_of(self._store, self._workdir, scans, day, self._cold)
             while (item := await asyncio.to_thread(next, found, None)) is not None:
                 if deadline is not None and time.monotonic() >= deadline:
                     self.stats["stopped_by"] = "max_minutes"
